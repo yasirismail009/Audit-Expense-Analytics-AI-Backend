@@ -1,0 +1,4 @@
+INFO 2025-07-07 12:19:46,871 autoreload 4692 6220 Watching for file changes with StatReloader
+INFO 2025-07-07 12:20:00,333 autoreload 4692 6220 D:\Office\analytics\core\views.py changed, reloading.
+INFO 2025-07-07 12:20:00,888 autoreload 20760 712 Watching for file changes with StatReloader
+INFO 2025-07-07 12:20:30,629 autoreload 20760 712 D:\Office\analytics\analytics\settings.py changed, reloading.
