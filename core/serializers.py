@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import SAPGLPosting, DataFile, AnalysisSession, TransactionAnalysis, SystemMetrics, GLAccount
+from .models import SAPGLPosting, DataFile, AnalysisSession, TransactionAnalysis, SystemMetrics, GLAccount, FileProcessingJob, MLModelTraining
 from decimal import Decimal
 import uuid
 
@@ -561,4 +561,181 @@ class DuplicateAnomalyComprehensiveSerializer(serializers.Serializer):
     training_data = DuplicateTrainingDataSerializer(help_text='Machine learning training data')
     
     # Optional message for POST requests
-    message = serializers.CharField(required=False, help_text='Analysis completion message') 
+    message = serializers.CharField(required=False, help_text='Analysis completion message')
+
+class TargetedAnomalyUploadSerializer(serializers.Serializer):
+    """Serializer for file upload with targeted anomaly detection"""
+    
+    # File upload
+    file = serializers.FileField(help_text='CSV file containing SAP GL posting data')
+    
+    # Standard file metadata
+    engagement_id = serializers.CharField(max_length=100, help_text='Engagement ID for the audit')
+    client_name = serializers.CharField(max_length=255, help_text='Client name')
+    company_name = serializers.CharField(max_length=255, help_text='Company name')
+    fiscal_year = serializers.IntegerField(help_text='Fiscal year for the audit')
+    audit_start_date = serializers.DateField(help_text='Audit start date')
+    audit_end_date = serializers.DateField(help_text='Audit end date')
+    description = serializers.CharField(max_length=500, required=False, help_text='Optional description of the file')
+    
+    # Anomaly detection configuration
+    run_anomalies = serializers.BooleanField(default=False, help_text='Whether to run anomaly detection')
+    anomalies = serializers.ListField(
+        child=serializers.ChoiceField(choices=[
+            ('duplicate', 'Duplicate Detection'),
+            ('backdated', 'Backdated Entries'),
+            ('closing', 'Closing Entries'),
+            ('unusual_days', 'Unusual Days'),
+            ('holiday', 'Holiday Entries'),
+            ('user_anomalies', 'User Anomalies'),
+        ]),
+        required=False,
+        default=list,
+        help_text='List of specific anomaly types to run'
+    )
+
+class FileProcessingJobSerializer(serializers.ModelSerializer):
+    """Serializer for FileProcessingJob model"""
+    
+    data_file = DataFileSerializer(read_only=True)
+    processing_summary = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = FileProcessingJob
+        fields = '__all__'
+        read_only_fields = ['id', 'created_at', 'updated_at', 'started_at', 'completed_at']
+    
+    def get_processing_summary(self, obj):
+        """Get processing summary"""
+        return obj.get_processing_summary()
+
+class FileProcessingJobListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for listing FileProcessingJob"""
+    
+    file_name = serializers.CharField(source='data_file.file_name', read_only=True)
+    file_size = serializers.IntegerField(source='data_file.file_size', read_only=True)
+    client_name = serializers.CharField(source='data_file.client_name', read_only=True)
+    engagement_id = serializers.CharField(source='data_file.engagement_id', read_only=True)
+    
+    class Meta:
+        model = FileProcessingJob
+        fields = [
+            'id', 'file_name', 'file_size', 'client_name', 'engagement_id',
+            'run_anomalies', 'requested_anomalies', 'status', 'processing_duration',
+            'created_at', 'started_at', 'completed_at'
+        ]
+
+class TargetedAnomalyResponseSerializer(serializers.Serializer):
+    """Serializer for targeted anomaly detection response"""
+    
+    # Job information
+    job_id = serializers.UUIDField(help_text='Processing job ID')
+    status = serializers.CharField(help_text='Current processing status')
+    
+    # File information
+    file_info = DataFileSerializer(help_text='Uploaded file information')
+    
+    # Processing results
+    analytics_results = serializers.DictField(help_text='Default analytics results (TB, TE, GL summaries)')
+    anomaly_results = serializers.DictField(help_text='Results from requested anomaly tests')
+    
+    # Processing metadata
+    processing_duration = serializers.FloatField(allow_null=True, help_text='Processing duration in seconds')
+    is_duplicate_content = serializers.BooleanField(help_text='Whether this is duplicate content')
+    existing_job_id = serializers.UUIDField(allow_null=True, help_text='Reference to existing job if duplicate')
+    
+    # Timestamps
+    created_at = serializers.DateTimeField(help_text='Job creation timestamp')
+    started_at = serializers.DateTimeField(allow_null=True, help_text='Processing start timestamp')
+    completed_at = serializers.DateTimeField(allow_null=True, help_text='Processing completion timestamp')
+    
+    # Optional message
+    message = serializers.CharField(required=False, help_text='Processing completion message')
+
+class MLModelTrainingSerializer(serializers.ModelSerializer):
+    """Serializer for ML Model Training"""
+    
+    training_summary = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = MLModelTraining
+        fields = '__all__'
+        read_only_fields = ['id', 'created_at', 'updated_at', 'started_at', 'completed_at']
+    
+    def get_training_summary(self, obj):
+        """Get training summary"""
+        return obj.get_training_summary()
+
+class MLModelTrainingListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for listing ML Model Training sessions"""
+    
+    class Meta:
+        model = MLModelTraining
+        fields = [
+            'id', 'session_name', 'model_type', 'status', 'training_data_size',
+            'feature_count', 'performance_metrics', 'training_duration',
+            'model_version', 'is_latest_model', 'created_at', 'started_at', 'completed_at'
+        ]
+
+class MLModelTrainingRequestSerializer(serializers.Serializer):
+    """Serializer for ML model training requests"""
+    
+    session_name = serializers.CharField(max_length=255, help_text='Training session name')
+    description = serializers.CharField(max_length=1000, required=False, help_text='Training session description')
+    
+    # Model configuration
+    model_type = serializers.ChoiceField(choices=[
+        ('isolation_forest', 'Isolation Forest'),
+        ('random_forest', 'Random Forest'),
+        ('dbscan', 'DBSCAN'),
+        ('ensemble', 'Ensemble'),
+        ('all', 'All Models'),
+    ], help_text='Type of ML model to train')
+    
+    # Training data filters
+    date_from = serializers.DateField(required=False, help_text='Start date for training data')
+    date_to = serializers.DateField(required=False, help_text='End date for training data')
+    min_transactions = serializers.IntegerField(default=100, help_text='Minimum number of transactions required')
+    
+    # Model parameters
+    training_parameters = serializers.DictField(required=False, default=dict, help_text='Model-specific training parameters')
+
+class MLModelInfoSerializer(serializers.Serializer):
+    """Serializer for ML model information"""
+    
+    is_trained = serializers.BooleanField(help_text='Whether models are trained')
+    models_dir = serializers.CharField(help_text='Directory where models are stored')
+    feature_count = serializers.IntegerField(help_text='Number of features used')
+    models_available = serializers.ListField(help_text='List of available models')
+    label_encoders = serializers.ListField(help_text='List of label encoders')
+    
+    # Performance information
+    latest_performance = serializers.DictField(required=False, help_text='Latest model performance metrics')
+    training_history = serializers.ListField(required=False, help_text='Training history')
+
+class MLPredictionSerializer(serializers.Serializer):
+    """Serializer for ML prediction results"""
+    
+    transaction_id = serializers.CharField(help_text='Transaction ID')
+    anomaly_score = serializers.FloatField(help_text='Anomaly score (0-1)')
+    confidence = serializers.FloatField(help_text='Prediction confidence (0-100)')
+    model = serializers.CharField(help_text='Model that made the prediction')
+    ensemble_prediction = serializers.BooleanField(required=False, help_text='Whether this is an ensemble prediction')
+    models_agreed = serializers.ListField(required=False, help_text='Models that agreed on this prediction')
+    model_count = serializers.IntegerField(required=False, help_text='Number of models that predicted this as anomaly')
+
+class MLAnomalyResultsSerializer(serializers.Serializer):
+    """Serializer for ML anomaly detection results"""
+    
+    # Individual model predictions
+    isolation_forest = MLPredictionSerializer(many=True, required=False)
+    random_forest = MLPredictionSerializer(many=True, required=False)
+    dbscan = MLPredictionSerializer(many=True, required=False)
+    
+    # Ensemble predictions
+    ensemble_predictions = MLPredictionSerializer(many=True, required=False)
+    
+    # Summary statistics
+    total_anomalies = serializers.IntegerField(help_text='Total anomalies detected')
+    model_performance = serializers.DictField(help_text='Performance metrics for each model')
+    processing_time = serializers.FloatField(help_text='Processing time in seconds') 
