@@ -13,11 +13,7 @@ class Command(BaseCommand):
             type=int,
             help='Analyze specific expense sheet by ID',
         )
-        parser.add_argument(
-            '--output',
-            type=str,
-            help='Output file path for detailed results (JSON)',
-        )
+        # Removed --output argument
         parser.add_argument(
             '--verbose',
             action='store_true',
@@ -86,15 +82,7 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.ERROR(f"Error analyzing sheet {sheet.id}: {str(e)}"))
                 continue
         
-        # Save results to file if requested
-        if options['output']:
-            try:
-                with open(options['output'], 'w') as f:
-                    json.dump(results, f, indent=2, default=str)
-                self.stdout.write(self.style.SUCCESS(f"Results saved to {options['output']}"))
-            except Exception as e:
-                self.stdout.write(self.style.ERROR(f"Error saving results: {str(e)}"))
-        
+        # Removed file saving block
         # Print overall summary
         if results:
             self._print_overall_summary(results)

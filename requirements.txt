@@ -1,20 +1,18 @@
-Django>=5.2.4
+Django>=4.2.0
 djangorestframework>=3.14.0
 django-cors-headers>=4.3.1
-
-# Data Science and ML Libraries
 pandas>=2.0.0
 numpy>=1.24.0
-scikit-learn>=1.3.0
-xgboost>=1.7.0
+celery>=5.3.0
+redis>=4.6.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
-joblib>=1.3.2
 python-dateutil>=2.8.2
 Pillow>=10.1.0
-openpyxl>=3.1.2
-xlrd>=2.0.1 
-holidays>=0.30
-# Optional: Advanced Analytics
-# prophet>=1.1.0  # Uncomment if you want time series analysis
-# shap>=0.42.0   # Uncomment if you want model interpretability 
+
+# Optional ML dependencies (for enhanced anomaly detection)
+# scikit-learn>=1.3.0  # Uncomment if you want to use scikit-learn models
+# joblib>=1.3.0        # Uncomment if you want to use joblib for model persistence
+
+# Celery SQLite broker dependencies
+sqlalchemy>=2.0.0 

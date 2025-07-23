@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,12 +21,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-@0v4c+2kr01+&@_eump+(hpk1z2lp^atru7+1wul-2-+xohk_h'
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-@0v4c+2kr01+&@_eump+(hpk1z2lp^atru7+1wul-2-+xohk_h')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DJANGO_DEBUG', 'True').lower() == 'true'
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
 
 # Application definition
@@ -78,8 +79,15 @@ WSGI_APPLICATION = 'analytics.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.getenv('DB_NAME', 'analytics-db'),
+        'USER': os.getenv('DB_USER', 'postgres'),
+        'PASSWORD': os.getenv('DB_PASSWORD', 'Malik@0900'),
+        'HOST': os.getenv('DB_HOST', 'localhost'),
+        'PORT': os.getenv('DB_PORT', '5432'),
+        'OPTIONS': {
+            'client_encoding': 'UTF8',
+        },
     }
 }
 
@@ -164,3 +172,145 @@ CORS_ALLOW_HEADERS = [
     'x-csrftoken',
     'x-requested-with',
 ]
+
+# Celery Configuration
+# https://docs.celeryproject.org/en/stable/django/first-steps-with-django.html
+
+# Celery broker settings - Using Redis for better performance
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+
+# Celery task settings
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_ENABLE_UTC = True
+
+# Celery task routing
+CELERY_TASK_ROUTES = {
+    'core.tasks.process_file_with_anomalies': {'queue': 'analytics'},
+    'core.tasks.train_ml_models': {'queue': 'ml_training'},
+    'core.tasks.retrain_ml_models': {'queue': 'ml_training'},
+    'core.tasks.train_enhanced_ml_models': {'queue': 'ml_training'},
+    'core.tasks.monitor_processing_jobs': {'queue': 'maintenance'},
+    'core.tasks.monitor_ml_model_performance': {'queue': 'maintenance'},
+}
+
+# Celery task default settings
+CELERY_TASK_DEFAULT_QUEUE = 'analytics'
+CELERY_TASK_DEFAULT_EXCHANGE = 'analytics'
+CELERY_TASK_DEFAULT_ROUTING_KEY = 'analytics'
+
+# Celery worker settings
+CELERY_WORKER_CONCURRENCY = 4
+CELERY_WORKER_MAX_TASKS_PER_CHILD = 1000
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+
+# Celery beat settings (for periodic tasks)
+CELERY_BEAT_SCHEDULE = {
+    'monitor-processing-jobs': {
+        'task': 'core.tasks.monitor_processing_jobs',
+        'schedule': 300.0,  # Run every 5 minutes
+    },
+    'process-queued-jobs': {
+        'task': 'core.tasks.process_queued_jobs',
+        'schedule': 60.0,  # Run every minute
+    },
+}
+
+# File upload settings
+FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB
+
+# Create a temporary directory for file uploads that works on all platforms
+import os
+import tempfile
+
+# Use system temp directory or create one in the project
+TEMP_DIR = os.path.join(BASE_DIR, 'temp_uploads')
+os.makedirs(TEMP_DIR, exist_ok=True)
+FILE_UPLOAD_TEMP_DIR = TEMP_DIR
+
+# Processing settings
+BACKGROUND_PROCESSING_TIMEOUT = 300  # 5 minutes
+
+# Celery fallback settings
+ENABLE_SYNC_FALLBACK = True  # Enable synchronous processing when Celery is not available
+CELERY_CONNECTION_TIMEOUT = 5  # Timeout for Celery connection test (seconds)
+
+# Celery task timeout and retry settings
+CELERY_TASK_TIME_LIMIT = 300  # 5 minutes
+CELERY_TASK_SOFT_TIME_LIMIT = 240  # 4 minutes
+CELERY_TASK_MAX_RETRIES = 3
+CELERY_TASK_RETRY_DELAY = 60  # 1 minute
+
+# REST Framework Settings
+REST_FRAMEWORK = {
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 100,
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ],
+    'DEFAULT_PARSER_CLASSES': [
+        'rest_framework.parsers.JSONParser',
+        'rest_framework.parsers.MultiPartParser',
+        'rest_framework.parsers.FormParser',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',  # Change to IsAuthenticated for production
+    ],
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+        'rest_framework.authentication.BasicAuthentication',
+    ],
+}
+
+# Logging Configuration
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
+            'style': '{',
+        },
+        'simple': {
+            'format': '{levelname} {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'file': {
+            'level': 'INFO',
+            'class': 'logging.FileHandler',
+            'filename': BASE_DIR / 'debug.log',
+            'formatter': 'verbose',
+        },
+        'console': {
+            'level': 'DEBUG',
+            'class': 'logging.StreamHandler',
+            'formatter': 'simple',
+        },
+    },
+    'root': {
+        'handlers': ['console', 'file'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['console', 'file'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'core': {
+            'handlers': ['console', 'file'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'celery': {
+            'handlers': ['console', 'file'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}

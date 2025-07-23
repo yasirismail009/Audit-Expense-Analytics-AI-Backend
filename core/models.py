@@ -2,6 +2,7 @@ from django.db import models
 from django.core.validators import MinValueValidator, MaxValueValidator
 from decimal import Decimal
 import uuid
+from django.utils import timezone
 
 class GLAccount(models.Model):
     """Model to track GL Account details and categorization"""
@@ -125,8 +126,8 @@ class SAPGLPosting(models.Model):
     
     @property
     def is_high_value(self):
-        """Check if this is a high-value transaction (> 1M SAR)"""
-        return self.amount_local_currency > 1000000
+        """Check if this is a high-value transaction (> 5M SAR)"""
+        return self.amount_local_currency > 5000000
     
     @property
     def is_cleared(self):
@@ -318,3 +319,659 @@ class SystemMetrics(models.Model):
     
     def __str__(self):
         return f"Metrics for {self.metric_date}"
+
+class FileProcessingJob(models.Model):
+    """Model to track file processing jobs with anomaly detection requests"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File information
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='processing_jobs', help_text='Reference to the uploaded data file')
+    file_hash = models.CharField(max_length=64, db_index=True, help_text='SHA256 hash of file content for duplicate detection')
+    
+    # Anomaly detection configuration
+    run_anomalies = models.BooleanField(default=False, help_text='Whether to run anomaly detection')
+    requested_anomalies = models.JSONField(default=list, help_text='List of requested anomaly types to run')
+    
+    # Processing status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('QUEUED', 'Queued for Processing'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+        ('CELERY_ERROR', 'Celery Connection Error'),
+        ('SKIPPED', 'Skipped - Duplicate Content'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    
+    # Processing results
+    analytics_results = models.JSONField(default=dict, help_text='Results from default analytics (TB, TE, GL summaries)')
+    anomaly_results = models.JSONField(default=dict, help_text='Results from requested anomaly tests')
+    ml_training_results = models.JSONField(default=dict, help_text='Results from ML model training')
+    
+    # Processing metadata
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    error_message = models.TextField(blank=True, null=True)
+    
+    # Reference to existing results (for duplicate content)
+    existing_job = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='duplicate_jobs', help_text='Reference to existing job if content is duplicate')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'file_processing_jobs'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['file_hash', 'status']),
+            models.Index(fields=['run_anomalies', 'status']),
+            models.Index(fields=['created_at']),
+        ]
+    
+    def __str__(self):
+        return f"Job {self.id} - {self.data_file.file_name} ({self.status})"
+    
+    @property
+    def is_duplicate_content(self):
+        """Check if this job has duplicate content with an existing completed job"""
+        return FileProcessingJob.objects.filter(
+            file_hash=self.file_hash,
+            status='COMPLETED'
+        ).exclude(id=self.id).exists()
+    
+    @property
+    def duplicate_job(self):
+        """Get the existing job with duplicate content if any"""
+        return FileProcessingJob.objects.filter(
+            file_hash=self.file_hash,
+            status='COMPLETED'
+        ).exclude(id=self.id).first()
+    
+    def get_processing_summary(self):
+        """Get a summary of processing results"""
+        return {
+            'job_id': str(self.id),
+            'file_name': self.data_file.file_name,
+            'status': self.status,
+            'run_anomalies': self.run_anomalies,
+            'requested_anomalies': self.requested_anomalies,
+            'processing_duration': self.processing_duration,
+            'analytics_results': self.analytics_results,
+            'anomaly_results': self.anomaly_results,
+            'is_duplicate_content': self.is_duplicate_content,
+            'existing_job_id': str(self.existing_job.id) if self.existing_job else None,
+            'created_at': self.created_at,
+            'started_at': self.started_at,
+            'completed_at': self.completed_at,
+        }
+
+class DuplicateAnalysisResult(models.Model):
+    """Model to store enhanced duplicate analysis results for files"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='duplicate_analyses', help_text='Reference to the data file')
+    
+    # Analysis metadata
+    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
+    analysis_type = models.CharField(max_length=50, default='enhanced_duplicate', help_text='Type of analysis performed')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
+    
+    # Analysis results - stored as JSON for flexibility
+    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total transactions, duplicates, etc.)')
+    duplicate_list = models.JSONField(default=list, help_text='List of duplicate transactions found')
+    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
+    breakdowns = models.JSONField(default=dict, help_text='Various breakdowns (by type, user, account, etc.)')
+    slicer_filters = models.JSONField(default=dict, help_text='Slicer filters for dynamic filtering')
+    summary_table = models.JSONField(default=list, help_text='Summary table data')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    detailed_insights = models.JSONField(default=dict, help_text='Detailed insights and recommendations')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='duplicate_results', help_text='Reference to the processing job that generated this analysis')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Analysis status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'duplicate_analysis_results'
+        ordering = ['-analysis_date']
+        indexes = [
+            models.Index(fields=['data_file', 'analysis_date']),
+            models.Index(fields=['status', 'analysis_date']),
+            models.Index(fields=['analysis_type']),
+        ]
+    
+    def __str__(self):
+        return f"Duplicate Analysis for {self.data_file.file_name} ({self.analysis_date.strftime('%Y-%m-%d %H:%M')})"
+    
+    def get_analysis_summary(self):
+        """Get a summary of the analysis results"""
+        return {
+            'analysis_id': str(self.id),
+            'file_name': self.data_file.file_name,
+            'file_id': str(self.data_file.id),
+            'analysis_date': self.analysis_date.isoformat(),
+            'analysis_type': self.analysis_type,
+            'status': self.status,
+            'total_duplicates': len(self.duplicate_list),
+            'total_amount': sum(item.get('amount', 0) for item in self.duplicate_list),
+            'processing_duration': self.processing_duration,
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat(),
+        }
+    
+    def get_duplicate_count(self):
+        """Get the total number of duplicates found"""
+        return len(self.duplicate_list)
+    
+    def get_total_amount(self):
+        """Get the total amount involved in duplicates"""
+        return sum(item.get('amount', 0) for item in self.duplicate_list)
+    
+    def get_risk_distribution(self):
+        """Get risk level distribution"""
+        risk_counts = {}
+        for item in self.duplicate_list:
+            risk_score = item.get('risk_score', 0)
+            if risk_score >= 90:
+                risk_level = 'Critical'
+            elif risk_score >= 70:
+                risk_level = 'High'
+            elif risk_score >= 40:
+                risk_level = 'Medium'
+            else:
+                risk_level = 'Low'
+            
+            risk_counts[risk_level] = risk_counts.get(risk_level, 0) + 1
+        
+        return risk_counts
+
+class AnalyticsResult(models.Model):
+    """Model to store analytics results for files"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='analytics_results', help_text='Reference to the data file')
+    
+    # Analysis metadata
+    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
+    analysis_type = models.CharField(max_length=50, default='comprehensive_analytics', help_text='Type of analysis performed')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
+    
+    # Analytics results - stored as JSON for flexibility
+    trial_balance = models.JSONField(default=dict, help_text='Trial balance analysis results')
+    general_ledger_summary = models.JSONField(default=dict, help_text='General ledger summary results')
+    account_analysis = models.JSONField(default=dict, help_text='Account-level analysis results')
+    transaction_summary = models.JSONField(default=dict, help_text='Transaction summary statistics')
+    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
+    breakdowns = models.JSONField(default=dict, help_text='Various breakdowns and summaries')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='analytics_result_objects', help_text='Reference to the processing job that generated this analysis')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Analysis status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'analytics_results'
+        ordering = ['-analysis_date']
+        indexes = [
+            models.Index(fields=['data_file', 'analysis_date']),
+            models.Index(fields=['status', 'analysis_date']),
+            models.Index(fields=['analysis_type']),
+        ]
+    
+    def __str__(self):
+        return f"Analytics for {self.data_file.file_name} ({self.analysis_date.strftime('%Y-%m-%d %H:%M')})"
+    
+    def get_analysis_summary(self):
+        """Get a summary of the analysis results"""
+        return {
+            'analysis_id': str(self.id),
+            'file_name': self.data_file.file_name,
+            'file_id': str(self.data_file.id),
+            'analysis_date': self.analysis_date.isoformat(),
+            'analysis_type': self.analysis_type,
+            'status': self.status,
+            'processing_duration': self.processing_duration,
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat(),
+        }
+
+class MLModelTraining(models.Model):
+    """Model to track ML model training sessions and performance"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Training session name')
+    description = models.TextField(blank=True, null=True, help_text='Training session description')
+    
+    # Model configuration
+    model_type = models.CharField(max_length=50, choices=[
+        ('isolation_forest', 'Isolation Forest'),
+        ('random_forest', 'Random Forest'),
+        ('dbscan', 'DBSCAN'),
+        ('ensemble', 'Ensemble'),
+        ('all', 'All Models'),
+    ], help_text='Type of ML model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    feature_count = models.IntegerField(help_text='Number of features used for training')
+    
+    # Training parameters
+    training_parameters = models.JSONField(default=dict, help_text='Model training parameters')
+    
+    # Performance metrics
+    performance_metrics = models.JSONField(default=dict, help_text='Model performance metrics (AUC, accuracy, etc.)')
+    validation_metrics = models.JSONField(default=dict, help_text='Cross-validation metrics')
+    
+    # Training status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    
+    # Training metadata
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    training_duration = models.FloatField(null=True, blank=True, help_text='Training duration in seconds')
+    error_message = models.TextField(blank=True, null=True)
+    
+    # Model file information
+    model_file_path = models.CharField(max_length=500, blank=True, null=True, help_text='Path to saved model files')
+    model_version = models.CharField(max_length=20, default='1.0.0', help_text='Model version')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'ml_model_training'
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.model_type} ({self.status})"
+    
+    @property
+    def is_latest_model(self):
+        """Check if this is the latest trained model of its type"""
+        return MLModelTraining.objects.filter(
+            model_type=self.model_type,
+            status='COMPLETED'
+        ).order_by('-created_at').first() == self
+    
+    def get_training_summary(self):
+        """Get a summary of training results"""
+        return {
+            'training_id': str(self.id),
+            'session_name': self.session_name,
+            'model_type': self.model_type,
+            'status': self.status,
+            'training_data_size': self.training_data_size,
+            'feature_count': self.feature_count,
+            'performance_metrics': self.performance_metrics,
+            'training_duration': self.training_duration,
+            'model_version': self.model_version,
+            'is_latest_model': self.is_latest_model,
+            'created_at': self.created_at,
+            'started_at': self.started_at,
+            'completed_at': self.completed_at,
+        }
+
+class MLModelProcessingResult(models.Model):
+    """Model to store ML model processing results for individual files"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File and job references
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='ml_processing_results', help_text='Reference to the data file')
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='ml_processing_results', help_text='Reference to the processing job')
+    
+    # ML Model information
+    model_type = models.CharField(max_length=50, choices=[
+        ('isolation_forest', 'Isolation Forest'),
+        ('random_forest', 'Random Forest'),
+        ('dbscan', 'DBSCAN'),
+        ('ensemble', 'Ensemble'),
+        ('duplicate_detection', 'Duplicate Detection'),
+        ('anomaly_detection', 'Anomaly Detection'),
+        ('all', 'All Models'),
+    ], help_text='Type of ML model used')
+    
+    # Processing results
+    processing_status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ], default='PENDING')
+    
+    # Results data
+    anomalies_detected = models.IntegerField(default=0, help_text='Number of anomalies detected')
+    duplicates_found = models.IntegerField(default=0, help_text='Number of duplicates found')
+    risk_score = models.FloatField(default=0.0, help_text='Overall risk score')
+    confidence_score = models.FloatField(default=0.0, help_text='Model confidence score')
+    
+    # Detailed results stored as JSON
+    detailed_results = models.JSONField(default=dict, help_text='Detailed ML processing results')
+    model_metrics = models.JSONField(default=dict, help_text='Model performance metrics')
+    feature_importance = models.JSONField(default=dict, help_text='Feature importance scores')
+    
+    # Processing metadata
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    data_size = models.IntegerField(default=0, help_text='Number of records processed')
+    model_version = models.CharField(max_length=20, default='1.0.0', help_text='Model version used')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if processing failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    processed_at = models.DateTimeField(null=True, blank=True, help_text='When processing was completed')
+    
+    class Meta:
+        db_table = 'ml_model_processing_results'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['data_file', 'model_type']),
+            models.Index(fields=['processing_status', 'created_at']),
+            models.Index(fields=['model_type', 'processing_status']),
+        ]
+    
+    def __str__(self):
+        return f"ML Processing for {self.data_file.file_name} - {self.model_type} ({self.processing_status})"
+    
+    def get_summary(self):
+        """Get a summary of the ML processing results"""
+        return {
+            'id': str(self.id),
+            'file_name': self.data_file.file_name,
+            'file_id': str(self.data_file.id),
+            'model_type': self.model_type,
+            'processing_status': self.processing_status,
+            'anomalies_detected': self.anomalies_detected,
+            'duplicates_found': self.duplicates_found,
+            'risk_score': self.risk_score,
+            'confidence_score': self.confidence_score,
+            'processing_duration': self.processing_duration,
+            'data_size': self.data_size,
+            'created_at': self.created_at.isoformat(),
+            'processed_at': self.processed_at.isoformat() if self.processed_at else None,
+        }
+
+class AnalyticsProcessingResult(models.Model):
+    """Model to store comprehensive analytics processing results"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File and job references
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='analytics_processing_results', help_text='Reference to the data file')
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='analytics_processing_results', help_text='Reference to the processing job')
+    
+    # Analytics type
+    analytics_type = models.CharField(max_length=50, choices=[
+        ('default_analytics', 'Default Analytics'),
+        ('comprehensive_expense', 'Comprehensive Expense Analytics'),
+        ('duplicate_analysis', 'Duplicate Analysis'),
+        ('anomaly_detection', 'Anomaly Detection'),
+        ('risk_assessment', 'Risk Assessment'),
+        ('user_patterns', 'User Patterns'),
+        ('account_patterns', 'Account Patterns'),
+        ('temporal_patterns', 'Temporal Patterns'),
+        ('all', 'All Analytics'),
+    ], help_text='Type of analytics performed')
+    
+    # Processing status
+    processing_status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ], default='PENDING')
+    
+    # Results summary
+    total_transactions = models.IntegerField(default=0, help_text='Total transactions analyzed')
+    total_amount = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'), help_text='Total amount analyzed')
+    unique_users = models.IntegerField(default=0, help_text='Number of unique users')
+    unique_accounts = models.IntegerField(default=0, help_text='Number of unique accounts')
+    
+    # Key metrics
+    flagged_transactions = models.IntegerField(default=0, help_text='Number of flagged transactions')
+    high_risk_transactions = models.IntegerField(default=0, help_text='Number of high-risk transactions')
+    anomalies_found = models.IntegerField(default=0, help_text='Number of anomalies found')
+    duplicates_found = models.IntegerField(default=0, help_text='Number of duplicates found')
+    
+    # Detailed results stored as JSON
+    trial_balance_data = models.JSONField(default=dict, help_text='Trial balance analysis results')
+    expense_breakdown = models.JSONField(default=dict, help_text='Expense breakdown analysis')
+    user_patterns = models.JSONField(default=dict, help_text='User pattern analysis')
+    account_patterns = models.JSONField(default=dict, help_text='Account pattern analysis')
+    temporal_patterns = models.JSONField(default=dict, help_text='Temporal pattern analysis')
+    risk_assessment = models.JSONField(default=dict, help_text='Risk assessment results')
+    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    
+    # Processing metadata
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Analysis algorithm version')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if processing failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    processed_at = models.DateTimeField(null=True, blank=True, help_text='When processing was completed')
+    
+    class Meta:
+        db_table = 'analytics_processing_results'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['data_file', 'analytics_type']),
+            models.Index(fields=['processing_status', 'created_at']),
+            models.Index(fields=['analytics_type', 'processing_status']),
+        ]
+    
+    def __str__(self):
+        return f"Analytics for {self.data_file.file_name} - {self.analytics_type} ({self.processing_status})"
+    
+    def get_summary(self):
+        """Get a summary of the analytics processing results"""
+        return {
+            'id': str(self.id),
+            'file_name': self.data_file.file_name,
+            'file_id': str(self.data_file.id),
+            'analytics_type': self.analytics_type,
+            'processing_status': self.processing_status,
+            'total_transactions': self.total_transactions,
+            'total_amount': float(self.total_amount),
+            'unique_users': self.unique_users,
+            'unique_accounts': self.unique_accounts,
+            'flagged_transactions': self.flagged_transactions,
+            'high_risk_transactions': self.high_risk_transactions,
+            'anomalies_found': self.anomalies_found,
+            'duplicates_found': self.duplicates_found,
+            'processing_duration': self.processing_duration,
+            'created_at': self.created_at.isoformat(),
+            'processed_at': self.processed_at.isoformat() if self.processed_at else None,
+        }
+
+class ProcessingJobTracker(models.Model):
+    """Model to track overall processing job progress and status"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Job references
+    processing_job = models.OneToOneField(FileProcessingJob, on_delete=models.CASCADE, related_name='job_tracker', help_text='Reference to the processing job')
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='job_trackers', help_text='Reference to the data file')
+    
+    # Overall progress tracking
+    total_steps = models.IntegerField(default=0, help_text='Total number of processing steps')
+    completed_steps = models.IntegerField(default=0, help_text='Number of completed steps')
+    current_step = models.CharField(max_length=100, blank=True, null=True, help_text='Current processing step')
+    
+    # Step status tracking
+    file_processing_status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ], default='PENDING')
+    
+    analytics_status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ], default='PENDING')
+    
+    ml_processing_status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ], default='PENDING')
+    
+    anomaly_detection_status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ], default='PENDING')
+    
+    # Progress percentages
+    overall_progress = models.FloatField(default=0.0, help_text='Overall progress percentage (0-100)')
+    file_processing_progress = models.FloatField(default=0.0, help_text='File processing progress percentage')
+    analytics_progress = models.FloatField(default=0.0, help_text='Analytics progress percentage')
+    ml_progress = models.FloatField(default=0.0, help_text='ML processing progress percentage')
+    anomaly_progress = models.FloatField(default=0.0, help_text='Anomaly detection progress percentage')
+    
+    # Detailed tracking
+    step_details = models.JSONField(default=list, help_text='Detailed step-by-step progress')
+    error_log = models.JSONField(default=list, help_text='Error log for failed steps')
+    
+    # Performance metrics
+    total_processing_time = models.FloatField(null=True, blank=True, help_text='Total processing time in seconds')
+    memory_usage_mb = models.FloatField(null=True, blank=True, help_text='Peak memory usage in MB')
+    cpu_usage_percent = models.FloatField(null=True, blank=True, help_text='Peak CPU usage percentage')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    started_at = models.DateTimeField(null=True, blank=True, help_text='When processing started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When processing completed')
+    
+    class Meta:
+        db_table = 'processing_job_trackers'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['processing_job']),
+            models.Index(fields=['data_file', 'created_at']),
+            models.Index(fields=['overall_progress', 'created_at']),
+        ]
+    
+    def __str__(self):
+        return f"Tracker for {self.processing_job.id} - {self.overall_progress}% complete"
+    
+    def get_progress_summary(self):
+        """Get a summary of the processing progress"""
+        return {
+            'id': str(self.id),
+            'job_id': str(self.processing_job.id),
+            'file_name': self.data_file.file_name,
+            'overall_progress': self.overall_progress,
+            'current_step': self.current_step,
+            'completed_steps': self.completed_steps,
+            'total_steps': self.total_steps,
+            'status_breakdown': {
+                'file_processing': self.file_processing_status,
+                'analytics': self.analytics_status,
+                'ml_processing': self.ml_processing_status,
+                'anomaly_detection': self.anomaly_detection_status,
+            },
+            'progress_breakdown': {
+                'file_processing': self.file_processing_progress,
+                'analytics': self.analytics_progress,
+                'ml_processing': self.ml_progress,
+                'anomaly_detection': self.anomaly_progress,
+            },
+            'performance': {
+                'total_time': self.total_processing_time,
+                'memory_usage': self.memory_usage_mb,
+                'cpu_usage': self.cpu_usage_percent,
+            },
+            'timestamps': {
+                'created': self.created_at.isoformat(),
+                'started': self.started_at.isoformat() if self.started_at else None,
+                'completed': self.completed_at.isoformat() if self.completed_at else None,
+            }
+        }
+    
+    def update_progress(self, step_name, progress_percentage, status='PROCESSING'):
+        """Update progress for a specific step"""
+        self.current_step = step_name
+        self.overall_progress = progress_percentage
+        
+        # Update specific step progress based on step name
+        if 'file' in step_name.lower():
+            self.file_processing_progress = progress_percentage
+            self.file_processing_status = status
+        elif 'analytics' in step_name.lower():
+            self.analytics_progress = progress_percentage
+            self.analytics_status = status
+        elif 'ml' in step_name.lower() or 'model' in step_name.lower():
+            self.ml_progress = progress_percentage
+            self.ml_processing_status = status
+        elif 'anomaly' in step_name.lower():
+            self.anomaly_progress = progress_percentage
+            self.anomaly_detection_status = status
+        
+        # Add step to details
+        step_detail = {
+            'step': step_name,
+            'progress': progress_percentage,
+            'status': status,
+            'timestamp': timezone.now().isoformat()
+        }
+        self.step_details.append(step_detail)
+        
+        self.save()

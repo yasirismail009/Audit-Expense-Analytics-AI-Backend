@@ -34,13 +34,41 @@ class SAPGLAnalyzer:
             if gl_account == 'UNKNOWN':
                 gl_account = 'MISSING'  # Show 'MISSING' instead of 'UNKNOWN' in results
             
+            # Handle date serialization safely
+            posting_date = None
+            document_date = None
+            
+            try:
+                if pd.notna(row['posting_date']):
+                    if hasattr(row['posting_date'], 'isoformat'):
+                        posting_date = row['posting_date'].isoformat()
+                    elif hasattr(row['posting_date'], 'strftime'):
+                        posting_date = row['posting_date'].strftime('%Y-%m-%d')
+                    else:
+                        posting_date = str(row['posting_date'])
+            except Exception as e:
+                print(f"🔍 DEBUG: Error serializing posting_date: {e}")
+                posting_date = None
+            
+            try:
+                if pd.notna(row['document_date']):
+                    if hasattr(row['document_date'], 'isoformat'):
+                        document_date = row['document_date'].isoformat()
+                    elif hasattr(row['document_date'], 'strftime'):
+                        document_date = row['document_date'].strftime('%Y-%m-%d')
+                    else:
+                        document_date = str(row['document_date'])
+            except Exception as e:
+                print(f"🔍 DEBUG: Error serializing document_date: {e}")
+                document_date = None
+            
             record = {
                 'id': str(row['id']),
                 'gl_account': gl_account,
                 'amount': float(row['amount']),
                 'user_name': row['user_name'],
-                'posting_date': row['posting_date'].isoformat() if pd.notna(row['posting_date']) else None,
-                'document_date': row['document_date'].isoformat() if pd.notna(row['document_date']) else None,
+                'posting_date': posting_date,
+                'document_date': document_date,
                 'document_number': row['document_number'],
                 'document_type': row['document_type'],
                 'source': row['source']
@@ -49,142 +77,430 @@ class SAPGLAnalyzer:
         return serialized_records
     
     def detect_duplicate_entries(self, transactions):
-        """Detect duplicate entries based on different criteria"""
+        """
+        Enhanced duplicate detection with comprehensive output and drilldown capabilities.
+        
+        This test identifies Journal Lines which has the identical characteristics. The classification for Duplicates are categorized as below:
+        Type 1 Duplicate - Account Number + Amount
+        Type 2 Duplicate - Account Number + Source + Amount
+        Type 3 Duplicate - Account Number + User + Amount
+        Type 4 Duplicate - Account Number + Posted Date + Amount
+        Type 5 Duplicate - Account Number + Effective Date + Amount
+        Type 6 Duplicate - Account Number + Effective Date + Posted Date + User + Source + Amount
+        
+        Returns comprehensive analysis including:
+        - Breakdown of Duplicate Flags
+        - Debit, Credit Amts and Journal Line Count per Duplicate and Month
+        - Breakdown of Duplicates per Impacted User
+        - Breakdown of Duplicates per Impacted FS Line
+        - Final Selection Drilldown for CSV export
+        """
+        print(f"🔍 DEBUG: ===== Enhanced detect_duplicate_entries STARTED =====")
+        print(f"🔍 DEBUG: Transactions count: {len(transactions)}")
+        print(f"🔍 DEBUG: Duplicate threshold: {self.analysis_config['duplicate_threshold']}")
+        
         if not transactions:
-            return []
+            print(f"🔍 DEBUG: No transactions provided, returning empty list")
+            return {
+                'duplicates': [],
+                'summary': {
+                    'total_duplicate_groups': 0,
+                    'total_duplicate_transactions': 0,
+                    'total_amount_involved': 0.0,
+                    'type_breakdown': {},
+                    'monthly_breakdown': {},
+                    'user_breakdown': {},
+                    'fs_line_breakdown': {},
+                    'debit_credit_breakdown': {'debit': 0, 'credit': 0}
+                },
+                'drilldown_data': [],
+                'export_data': []
+            }
         
         duplicates = []
         
         # Convert to DataFrame for easier analysis
-        df = pd.DataFrame([{
-            'id': str(t.id),
-            'gl_account': t.gl_account or 'UNKNOWN',  # Use 'UNKNOWN' for empty GL accounts
-            'amount': float(t.amount_local_currency),
-            'user_name': t.user_name,
-            'posting_date': t.posting_date,
-            'document_date': t.document_date,
-            'document_number': t.document_number,
-            'document_type': t.document_type,
-            'source': t.document_type  # Using document_type as source
-        } for t in transactions])
+        print(f"🔍 DEBUG: Converting transactions to DataFrame...")
+        try:
+            df = pd.DataFrame([{
+                'id': str(t.id),
+                'gl_account': t.gl_account or 'UNKNOWN',
+                'amount': float(t.amount_local_currency),
+                'user_name': t.user_name,
+                'posting_date': t.posting_date,
+                'document_date': t.document_date,
+                'document_number': t.document_number,
+                'document_type': t.document_type,
+                'source': t.document_type,
+                'transaction_type': t.transaction_type,
+                'text': t.text or '',
+                'fiscal_year': t.fiscal_year,
+                'posting_period': t.posting_period,
+                'profit_center': t.profit_center or '',
+                'cost_center': t.cost_center or '',
+                'local_currency': t.local_currency or 'SAR'
+            } for t in transactions])
+            print(f"🔍 DEBUG: DataFrame created successfully with {len(df)} rows")
+        except Exception as df_error:
+            print(f"🔍 DEBUG: Error creating DataFrame: {df_error}")
+            return {
+                'duplicates': [],
+                'summary': {},
+                'drilldown_data': [],
+                'export_data': []
+            }
         
-        # Type 1: Account Number + Amount
-        type1_duplicates = df.groupby(['gl_account', 'amount']).filter(lambda x: len(x) >= self.analysis_config['duplicate_threshold'])
-        for _, group in type1_duplicates.groupby(['gl_account', 'amount']):
-            if len(group) >= self.analysis_config['duplicate_threshold']:
-                gl_account_display = group.iloc[0]['gl_account']
-                if gl_account_display == 'UNKNOWN':
-                    gl_account_display = 'MISSING'  # Show 'MISSING' instead of 'UNKNOWN' in results
+        # Enhanced duplicate detection with detailed categorization
+        duplicate_types = [
+            {
+                'type': 'Type 1 Duplicate',
+                'criteria': 'Account Number + Amount',
+                'groupby_cols': ['gl_account', 'amount'],
+                'risk_multiplier': 10
+            },
+            {
+                'type': 'Type 2 Duplicate', 
+                'criteria': 'Account Number + Source + Amount',
+                'groupby_cols': ['gl_account', 'source', 'amount'],
+                'risk_multiplier': 12
+            },
+            {
+                'type': 'Type 3 Duplicate',
+                'criteria': 'Account Number + User + Amount', 
+                'groupby_cols': ['gl_account', 'user_name', 'amount'],
+                'risk_multiplier': 15
+            },
+            {
+                'type': 'Type 4 Duplicate',
+                'criteria': 'Account Number + Posted Date + Amount',
+                'groupby_cols': ['gl_account', 'posting_date', 'amount'],
+                'risk_multiplier': 18
+            },
+            {
+                'type': 'Type 5 Duplicate',
+                'criteria': 'Account Number + Effective Date + Amount',
+                'groupby_cols': ['gl_account', 'document_date', 'amount'],
+                'risk_multiplier': 20
+            },
+            {
+                'type': 'Type 6 Duplicate',
+                'criteria': 'Account Number + Effective Date + Posted Date + User + Source + Amount',
+                'groupby_cols': ['gl_account', 'document_date', 'posting_date', 'user_name', 'source', 'amount'],
+                'risk_multiplier': 25
+            }
+        ]
+        
+        # Process each duplicate type
+        for dup_type in duplicate_types:
+            print(f"🔍 DEBUG: Checking {dup_type['type']}...")
+            try:
+                # Handle date columns properly for grouping
+                groupby_cols = []
+                for col in dup_type['groupby_cols']:
+                    if col in ['posting_date', 'document_date']:
+                        # Convert dates to string for grouping - handle safely
+                        try:
+                            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                                df[f'{col}_str'] = df[col].dt.strftime('%Y-%m-%d')
+                            else:
+                                # Convert to datetime first if needed
+                                df[col] = pd.to_datetime(df[col], errors='coerce')
+                                df[f'{col}_str'] = df[col].dt.strftime('%Y-%m-%d')
+                        except Exception as e:
+                            print(f"🔍 DEBUG: Error handling date column {col}: {e}")
+                            df[f'{col}_str'] = 'UNKNOWN'
+                        groupby_cols.append(f'{col}_str')
+                    else:
+                        groupby_cols.append(col)
                 
-                duplicates.append({
-                    'type': 'Type 1 Duplicate',
-                    'criteria': 'Account Number + Amount',
-                    'gl_account': gl_account_display,
-                    'amount': group.iloc[0]['amount'],
-                    'count': len(group),
-                    'transactions': self._serialize_transaction_data(group),
-                    'risk_score': min(len(group) * 10, 100)
-                })
-        
-        # Type 2: Account Number + Source + Amount
-        type2_duplicates = df.groupby(['gl_account', 'source', 'amount']).filter(lambda x: len(x) >= self.analysis_config['duplicate_threshold'])
-        for _, group in type2_duplicates.groupby(['gl_account', 'source', 'amount']):
-            if len(group) >= self.analysis_config['duplicate_threshold']:
-                gl_account_display = group.iloc[0]['gl_account']
-                if gl_account_display == 'UNKNOWN':
-                    gl_account_display = 'MISSING'
+                type_duplicates = df.groupby(groupby_cols).filter(lambda x: len(x) >= self.analysis_config['duplicate_threshold'])
                 
-                duplicates.append({
-                    'type': 'Type 2 Duplicate',
-                    'criteria': 'Account Number + Source + Amount',
-                    'gl_account': gl_account_display,
-                    'source': group.iloc[0]['source'],
-                    'amount': group.iloc[0]['amount'],
-                    'count': len(group),
-                    'transactions': self._serialize_transaction_data(group),
-                    'risk_score': min(len(group) * 12, 100)
-                })
+                for _, group in type_duplicates.groupby(groupby_cols):
+                    if len(group) >= self.analysis_config['duplicate_threshold']:
+                        gl_account_display = group.iloc[0]['gl_account']
+                        if gl_account_display == 'UNKNOWN':
+                            gl_account_display = 'MISSING'
+                        
+                        duplicate_entry = {
+                            'type': dup_type['type'],
+                            'criteria': dup_type['criteria'],
+                            'gl_account': gl_account_display,
+                            'amount': group.iloc[0]['amount'],
+                            'count': len(group),
+                            'transactions': self._serialize_transaction_data(group),
+                            'risk_score': min(len(group) * dup_type['risk_multiplier'], 100),
+                            'debit_count': len(group[group['transaction_type'] == 'DEBIT']),
+                            'credit_count': len(group[group['transaction_type'] == 'CREDIT']),
+                            'debit_amount': float(group[group['transaction_type'] == 'DEBIT']['amount'].sum()),
+                            'credit_amount': float(group[group['transaction_type'] == 'CREDIT']['amount'].sum()),
+                            'unique_users': group['user_name'].nunique(),
+                            'unique_documents': group['document_number'].nunique(),
+                            'date_range': {
+                                'min_date': group['posting_date'].min().isoformat() if pd.notna(group['posting_date'].min()) else None,
+                                'max_date': group['posting_date'].max().isoformat() if pd.notna(group['posting_date'].max()) else None
+                            }
+                        }
+                        
+                        # Add specific fields based on duplicate type
+                        if 'user_name' in dup_type['groupby_cols']:
+                            duplicate_entry['user_name'] = group.iloc[0]['user_name']
+                        if 'source' in dup_type['groupby_cols']:
+                            duplicate_entry['source'] = group.iloc[0]['source']
+                        if 'posting_date' in dup_type['groupby_cols']:
+                            duplicate_entry['posting_date'] = group.iloc[0]['posting_date'].isoformat() if pd.notna(group.iloc[0]['posting_date']) else None
+                        if 'document_date' in dup_type['groupby_cols']:
+                            duplicate_entry['document_date'] = group.iloc[0]['document_date'].isoformat() if pd.notna(group.iloc[0]['document_date']) else None
+                        
+                        duplicates.append(duplicate_entry)
+                        
+            except Exception as e:
+                print(f"🔍 DEBUG: Error in {dup_type['type']} detection: {e}")
         
-        # Type 3: Account Number + User + Amount
-        type3_duplicates = df.groupby(['gl_account', 'user_name', 'amount']).filter(lambda x: len(x) >= self.analysis_config['duplicate_threshold'])
-        for _, group in type3_duplicates.groupby(['gl_account', 'user_name', 'amount']):
-            if len(group) >= self.analysis_config['duplicate_threshold']:
-                gl_account_display = group.iloc[0]['gl_account']
-                if gl_account_display == 'UNKNOWN':
-                    gl_account_display = 'MISSING'
-                
-                duplicates.append({
-                    'type': 'Type 3 Duplicate',
-                    'criteria': 'Account Number + User + Amount',
-                    'gl_account': gl_account_display,
-                    'user_name': group.iloc[0]['user_name'],
-                    'amount': group.iloc[0]['amount'],
-                    'count': len(group),
-                    'transactions': self._serialize_transaction_data(group),
-                    'risk_score': min(len(group) * 15, 100)
-                })
+        # Generate comprehensive summary and breakdowns
+        summary = self._generate_duplicate_summary(duplicates, df)
         
-        # Type 4: Account Number + Posted Date + Amount
-        type4_duplicates = df.groupby(['gl_account', 'posting_date', 'amount']).filter(lambda x: len(x) >= self.analysis_config['duplicate_threshold'])
-        for _, group in type4_duplicates.groupby(['gl_account', 'posting_date', 'amount']):
-            if len(group) >= self.analysis_config['duplicate_threshold']:
-                gl_account_display = group.iloc[0]['gl_account']
-                if gl_account_display == 'UNKNOWN':
-                    gl_account_display = 'MISSING'
-                
-                duplicates.append({
-                    'type': 'Type 4 Duplicate',
-                    'criteria': 'Account Number + Posted Date + Amount',
-                    'gl_account': gl_account_display,
-                    'posting_date': group.iloc[0]['posting_date'].isoformat() if pd.notna(group.iloc[0]['posting_date']) else None,
-                    'amount': group.iloc[0]['amount'],
-                    'count': len(group),
-                    'transactions': self._serialize_transaction_data(group),
-                    'risk_score': min(len(group) * 18, 100)
-                })
+        # Generate drilldown data for final selection
+        drilldown_data = self._generate_duplicate_drilldown(duplicates, df)
         
-        # Type 5: Account Number + Effective Date + Amount
-        type5_duplicates = df.groupby(['gl_account', 'document_date', 'amount']).filter(lambda x: len(x) >= self.analysis_config['duplicate_threshold'])
-        for _, group in type5_duplicates.groupby(['gl_account', 'document_date', 'amount']):
-            if len(group) >= self.analysis_config['duplicate_threshold']:
-                gl_account_display = group.iloc[0]['gl_account']
-                if gl_account_display == 'UNKNOWN':
-                    gl_account_display = 'MISSING'
-                
-                duplicates.append({
-                    'type': 'Type 5 Duplicate',
-                    'criteria': 'Account Number + Effective Date + Amount',
-                    'gl_account': gl_account_display,
-                    'document_date': group.iloc[0]['document_date'].isoformat() if pd.notna(group.iloc[0]['document_date']) else None,
-                    'amount': group.iloc[0]['amount'],
-                    'count': len(group),
-                    'transactions': self._serialize_transaction_data(group),
-                    'risk_score': min(len(group) * 20, 100)
-                })
+        # Generate export-ready data for CSV
+        export_data = self._generate_duplicate_export_data(duplicates, df)
         
-        # Type 6: Account Number + Effective Date + Posted Date + User + Source + Amount
-        type6_duplicates = df.groupby(['gl_account', 'document_date', 'posting_date', 'user_name', 'source', 'amount']).filter(lambda x: len(x) >= self.analysis_config['duplicate_threshold'])
-        for _, group in type6_duplicates.groupby(['gl_account', 'document_date', 'posting_date', 'user_name', 'source', 'amount']):
-            if len(group) >= self.analysis_config['duplicate_threshold']:
-                gl_account_display = group.iloc[0]['gl_account']
-                if gl_account_display == 'UNKNOWN':
-                    gl_account_display = 'MISSING'
-                
-                duplicates.append({
-                    'type': 'Type 6 Duplicate',
-                    'criteria': 'Account Number + Effective Date + Posted Date + User + Source + Amount',
-                    'gl_account': gl_account_display,
-                    'document_date': group.iloc[0]['document_date'].isoformat() if pd.notna(group.iloc[0]['document_date']) else None,
-                    'posting_date': group.iloc[0]['posting_date'].isoformat() if pd.notna(group.iloc[0]['posting_date']) else None,
-                    'user_name': group.iloc[0]['user_name'],
-                    'source': group.iloc[0]['source'],
-                    'amount': group.iloc[0]['amount'],
-                    'count': len(group),
-                    'transactions': self._serialize_transaction_data(group),
-                    'risk_score': min(len(group) * 25, 100)
-                        })
+        print(f"🔍 DEBUG: Total duplicates found: {len(duplicates)}")
         
-        return duplicates
+        return {
+            'duplicates': duplicates,
+            'summary': summary,
+            'drilldown_data': drilldown_data,
+            'export_data': export_data
+        }
+    
+    def _generate_duplicate_summary(self, duplicates, df):
+        """Generate comprehensive summary of duplicate analysis"""
+        if not duplicates:
+            return {
+                'total_duplicate_groups': 0,
+                'total_duplicate_transactions': 0,
+                'total_amount_involved': 0.0,
+                'type_breakdown': {},
+                'monthly_breakdown': {},
+                'user_breakdown': {},
+                'fs_line_breakdown': {},
+                'debit_credit_breakdown': {'debit': 0, 'credit': 0}
+            }
+        
+        # Basic counts
+        total_duplicate_groups = len(duplicates)
+        total_duplicate_transactions = sum(dup['count'] for dup in duplicates)
+        total_amount_involved = sum(dup['amount'] * dup['count'] for dup in duplicates)
+        
+        # Type breakdown
+        type_breakdown = {}
+        for dup in duplicates:
+            dup_type = dup['type']
+            if dup_type not in type_breakdown:
+                type_breakdown[dup_type] = {
+                    'count': 0,
+                    'transactions': 0,
+                    'amount': 0.0,
+                    'debit_count': 0,
+                    'credit_count': 0,
+                    'debit_amount': 0.0,
+                    'credit_amount': 0.0
+                }
+            type_breakdown[dup_type]['count'] += 1
+            type_breakdown[dup_type]['transactions'] += dup['count']
+            type_breakdown[dup_type]['amount'] += dup['amount'] * dup['count']
+            type_breakdown[dup_type]['debit_count'] += dup['debit_count']
+            type_breakdown[dup_type]['credit_count'] += dup['credit_count']
+            type_breakdown[dup_type]['debit_amount'] += dup['debit_amount']
+            type_breakdown[dup_type]['credit_amount'] += dup['credit_amount']
+        
+        # Monthly breakdown
+        monthly_breakdown = {}
+        for dup in duplicates:
+            for transaction in dup['transactions']:
+                if transaction.get('posting_date'):
+                    try:
+                        month_key = pd.to_datetime(transaction['posting_date']).strftime('%Y-%m')
+                        if month_key not in monthly_breakdown:
+                            monthly_breakdown[month_key] = {
+                                'duplicate_groups': 0,
+                                'transactions': 0,
+                                'amount': 0.0,
+                                'debit_count': 0,
+                                'credit_count': 0,
+                                'debit_amount': 0.0,
+                                'credit_amount': 0.0
+                            }
+                        monthly_breakdown[month_key]['transactions'] += 1
+                        monthly_breakdown[month_key]['amount'] += transaction['amount']
+                        if transaction.get('transaction_type') == 'DEBIT':
+                            monthly_breakdown[month_key]['debit_count'] += 1
+                            monthly_breakdown[month_key]['debit_amount'] += transaction['amount']
+                        else:
+                            monthly_breakdown[month_key]['credit_count'] += 1
+                            monthly_breakdown[month_key]['credit_amount'] += transaction['amount']
+                    except:
+                        pass
+        
+        # Count unique groups per month
+        for dup in duplicates:
+            for transaction in dup['transactions']:
+                if transaction.get('posting_date'):
+                    try:
+                        month_key = pd.to_datetime(transaction['posting_date']).strftime('%Y-%m')
+                        if month_key in monthly_breakdown:
+                            monthly_breakdown[month_key]['duplicate_groups'] += 1
+                            break  # Count each group only once per month
+                    except:
+                        pass
+        
+        # User breakdown
+        user_breakdown = {}
+        for dup in duplicates:
+            for transaction in dup['transactions']:
+                user = transaction.get('user_name', 'UNKNOWN')
+                if user not in user_breakdown:
+                    user_breakdown[user] = {
+                        'duplicate_groups': 0,
+                        'transactions': 0,
+                        'amount': 0.0,
+                        'debit_count': 0,
+                        'credit_count': 0,
+                        'debit_amount': 0.0,
+                        'credit_amount': 0.0
+                    }
+                user_breakdown[user]['transactions'] += 1
+                user_breakdown[user]['amount'] += transaction['amount']
+                if transaction.get('transaction_type') == 'DEBIT':
+                    user_breakdown[user]['debit_count'] += 1
+                    user_breakdown[user]['debit_amount'] += transaction['amount']
+                else:
+                    user_breakdown[user]['credit_count'] += 1
+                    user_breakdown[user]['credit_amount'] += transaction['amount']
+        
+        # Count unique groups per user
+        for dup in duplicates:
+            users_in_group = set()
+            for transaction in dup['transactions']:
+                users_in_group.add(transaction.get('user_name', 'UNKNOWN'))
+            for user in users_in_group:
+                if user in user_breakdown:
+                    user_breakdown[user]['duplicate_groups'] += 1
+        
+        # FS Line (GL Account) breakdown
+        fs_line_breakdown = {}
+        for dup in duplicates:
+            gl_account = dup['gl_account']
+            if gl_account not in fs_line_breakdown:
+                fs_line_breakdown[gl_account] = {
+                    'duplicate_groups': 0,
+                    'transactions': 0,
+                    'amount': 0.0,
+                    'debit_count': 0,
+                    'credit_count': 0,
+                    'debit_amount': 0.0,
+                    'credit_amount': 0.0
+                }
+            fs_line_breakdown[gl_account]['duplicate_groups'] += 1
+            fs_line_breakdown[gl_account]['transactions'] += dup['count']
+            fs_line_breakdown[gl_account]['amount'] += dup['amount'] * dup['count']
+            fs_line_breakdown[gl_account]['debit_count'] += dup['debit_count']
+            fs_line_breakdown[gl_account]['credit_count'] += dup['credit_count']
+            fs_line_breakdown[gl_account]['debit_amount'] += dup['debit_amount']
+            fs_line_breakdown[gl_account]['credit_amount'] += dup['credit_amount']
+        
+        # Debit/Credit breakdown
+        total_debit_count = sum(dup['debit_count'] for dup in duplicates)
+        total_credit_count = sum(dup['credit_count'] for dup in duplicates)
+        total_debit_amount = sum(dup['debit_amount'] for dup in duplicates)
+        total_credit_amount = sum(dup['credit_amount'] for dup in duplicates)
+        
+        return {
+            'total_duplicate_groups': total_duplicate_groups,
+            'total_duplicate_transactions': total_duplicate_transactions,
+            'total_amount_involved': total_amount_involved,
+            'type_breakdown': type_breakdown,
+            'monthly_breakdown': monthly_breakdown,
+            'user_breakdown': user_breakdown,
+            'fs_line_breakdown': fs_line_breakdown,
+            'debit_credit_breakdown': {
+                'debit_count': total_debit_count,
+                'credit_count': total_credit_count,
+                'debit_amount': total_debit_amount,
+                'credit_amount': total_credit_amount
+            }
+        }
+    
+    def _generate_duplicate_drilldown(self, duplicates, df):
+        """Generate drilldown data for final selection"""
+        drilldown_data = []
+        
+        for dup in duplicates:
+            for transaction in dup['transactions']:
+                drilldown_entry = {
+                    'duplicate_type': dup['type'],
+                    'duplicate_criteria': dup['criteria'],
+                    'gl_account': dup['gl_account'],
+                    'amount': dup['amount'],
+                    'duplicate_count': dup['count'],
+                    'risk_score': dup['risk_score'],
+                    'transaction_id': transaction['id'],
+                    'document_number': transaction.get('document_number', ''),
+                    'posting_date': transaction.get('posting_date', ''),
+                    'document_date': transaction.get('document_date', ''),
+                    'user_name': transaction.get('user_name', ''),
+                    'document_type': transaction.get('document_type', ''),
+                    'transaction_type': transaction.get('transaction_type', ''),
+                    'text': transaction.get('text', ''),
+                    'fiscal_year': transaction.get('fiscal_year', ''),
+                    'posting_period': transaction.get('posting_period', ''),
+                    'profit_center': transaction.get('profit_center', ''),
+                    'cost_center': transaction.get('cost_center', ''),
+                    'local_currency': transaction.get('local_currency', 'SAR'),
+                    'debit_count': dup['debit_count'],
+                    'credit_count': dup['credit_count'],
+                    'debit_amount': dup['debit_amount'],
+                    'credit_amount': dup['credit_amount']
+                }
+                drilldown_data.append(drilldown_entry)
+        
+        return drilldown_data
+    
+    def _generate_duplicate_export_data(self, duplicates, df):
+        """Generate export-ready data for CSV format"""
+        export_data = []
+        
+        for dup in duplicates:
+            for transaction in dup['transactions']:
+                export_entry = {
+                    'Duplicate_Type': dup['type'],
+                    'Duplicate_Criteria': dup['criteria'],
+                    'GL_Account': dup['gl_account'],
+                    'Amount': dup['amount'],
+                    'Duplicate_Count': dup['count'],
+                    'Risk_Score': dup['risk_score'],
+                    'Transaction_ID': transaction['id'],
+                    'Document_Number': transaction.get('document_number', ''),
+                    'Posting_Date': transaction.get('posting_date', ''),
+                    'Document_Date': transaction.get('document_date', ''),
+                    'User_Name': transaction.get('user_name', ''),
+                    'Document_Type': transaction.get('document_type', ''),
+                    'Transaction_Type': transaction.get('transaction_type', ''),
+                    'Text': transaction.get('text', ''),
+                    'Fiscal_Year': transaction.get('fiscal_year', ''),
+                    'Posting_Period': transaction.get('posting_period', ''),
+                    'Profit_Center': transaction.get('profit_center', ''),
+                    'Cost_Center': transaction.get('cost_center', ''),
+                    'Local_Currency': transaction.get('local_currency', 'SAR'),
+                    'Debit_Count': dup['debit_count'],
+                    'Credit_Count': dup['credit_count'],
+                    'Debit_Amount': dup['debit_amount'],
+                    'Credit_Amount': dup['credit_amount']
+                }
+                export_data.append(export_entry)
+        
+        return export_data
     
     def detect_user_anomalies(self, transactions):
         """Detect user-related anomalies"""
@@ -220,24 +536,24 @@ class SAPGLAnalyzer:
             risk_score = 0
             risk_factors = []
             
-            # High activity user
-            if stats['count'] > 100:
-                risk_score += 20
-                risk_factors.append('High transaction volume')
+            # High activity user (increased threshold)
+            if stats['count'] > 500:
+                risk_score += 15
+                risk_factors.append('Very high transaction volume')
             
-            # High value transactions
-            if stats['high_value_count'] > 10:
-                risk_score += 25
+            # High value transactions (increased threshold)
+            if stats['high_value_count'] > 25:
+                risk_score += 20
                 risk_factors.append('Multiple high-value transactions')
             
-            # Multiple accounts
-            if len(stats['accounts']) > 20:
-                risk_score += 15
-                risk_factors.append('Multiple account usage')
-            
-            # Multiple document types
-            if len(stats['document_types']) > 10:
+            # Multiple accounts (increased threshold)
+            if len(stats['accounts']) > 50:
                 risk_score += 10
+                risk_factors.append('Very wide account usage')
+            
+            # Multiple document types (increased threshold)
+            if len(stats['document_types']) > 20:
+                risk_score += 8
                 risk_factors.append('Multiple document types')
             
             # User of interest
@@ -478,16 +794,15 @@ class SAPGLAnalyzer:
                 risk_score = self.calculate_risk_score(transaction, all_anomalies)
                 risk_level = self.determine_risk_level(risk_score)
                 
-                # Determine which anomaly flags to set
+                # Determine which anomaly flags to set (more conservative thresholds)
                 amount_anomaly = (
                     any(anomaly['type'] in ['Duplicate Entry'] for anomaly in transaction_anomalies) or
-                    transaction.is_high_value or
-                    float(transaction.amount_local_currency) > 1000000  # High value threshold
+                    (transaction.is_high_value and float(transaction.amount_local_currency) > 10000000)  # Only flag very high value (>10M)
                 )
                 timing_anomaly = any(anomaly['type'] in ['Backdated Entry', 'Closing Entry', 'Unusual Day', 'Holiday Entry'] for anomaly in transaction_anomalies)
                 user_anomaly = any(anomaly['type'] == 'User Anomaly' for anomaly in transaction_anomalies)
                 account_anomaly = any(anomaly['type'] in ['Duplicate Entry'] for anomaly in transaction_anomalies)  # Could be expanded
-                pattern_anomaly = len(transaction_anomalies) > 1  # Multiple anomalies indicate pattern
+                pattern_anomaly = len(transaction_anomalies) > 2  # Only flag if 3+ anomalies (more conservative)
                 
                 # Create analysis record
                 TransactionAnalysis.objects.create(  # type: ignore
@@ -584,9 +899,9 @@ class SAPGLAnalyzer:
         """Calculate risk score for a transaction"""
         base_score = 0.0
         
-        # High value transaction
+        # High value transaction (reduced score)
         if transaction.is_high_value:
-            base_score += 20.0
+            base_score += 10.0
         
         # Check for anomalies
         transaction_anomalies = self.get_transaction_anomalies(transaction, all_anomalies)
@@ -599,12 +914,12 @@ class SAPGLAnalyzer:
         return risk_score
     
     def determine_risk_level(self, risk_score):
-        """Determine risk level based on score"""
-        if risk_score >= 80:
+        """Determine risk level based on score (more conservative thresholds)"""
+        if risk_score >= 90:
             return 'CRITICAL'
-        elif risk_score >= 60:
+        elif risk_score >= 70:
             return 'HIGH'
-        elif risk_score >= 30:
+        elif risk_score >= 40:
             return 'MEDIUM'
         else:
             return 'LOW'
