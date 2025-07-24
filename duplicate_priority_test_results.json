@@ -1,0 +1,62 @@
+[
+  {
+    "type": "Type 6 Duplicate",
+    "criteria": "Account Number + Effective Date + Posted Date + User + Source + Amount",
+    "count": 3,
+    "transaction_ids": [
+      "TXN002",
+      "TXN001",
+      "TXN003"
+    ]
+  },
+  {
+    "type": "Type 6 Duplicate",
+    "criteria": "Account Number + Effective Date + Posted Date + User + Source + Amount",
+    "count": 3,
+    "transaction_ids": [
+      "TXN004",
+      "TXN005",
+      "TXN006"
+    ]
+  },
+  {
+    "type": "Type 6 Duplicate",
+    "criteria": "Account Number + Effective Date + Posted Date + User + Source + Amount",
+    "count": 3,
+    "transaction_ids": [
+      "TXN007",
+      "TXN009",
+      "TXN008"
+    ]
+  },
+  {
+    "type": "Type 6 Duplicate",
+    "criteria": "Account Number + Effective Date + Posted Date + User + Source + Amount",
+    "count": 3,
+    "transaction_ids": [
+      "TXN012",
+      "TXN011",
+      "TXN010"
+    ]
+  },
+  {
+    "type": "Type 2 Duplicate",
+    "criteria": "Account Number + Amount + User",
+    "count": 3,
+    "transaction_ids": [
+      "TXN014",
+      "TXN013",
+      "TXN015"
+    ]
+  },
+  {
+    "type": "Type 1 Duplicate",
+    "criteria": "Account Number + Amount",
+    "count": 3,
+    "transaction_ids": [
+      "TXN018",
+      "TXN017",
+      "TXN016"
+    ]
+  }
+]

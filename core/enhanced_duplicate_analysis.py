@@ -189,9 +189,11 @@ class EnhancedDuplicateAnalyzer:
         return df
     
     def _detect_duplicate_groups(self, df):
-        """Detect duplicate groups by type"""
+        """Detect duplicate groups by type - each transaction only in highest priority type"""
         duplicate_groups = []
+        processed_transactions = set()  # Track which transactions have been processed
         
+        # Process duplicate types from most specific (Type 6) to least specific (Type 1)
         for dup_type in self.duplicate_types:
             groupby_cols = []
             for col in dup_type['groupby_cols']:
@@ -200,11 +202,20 @@ class EnhancedDuplicateAnalyzer:
                 else:
                     groupby_cols.append(col)
             
-            # Find groups with duplicates
-            grouped = df.groupby(groupby_cols).filter(lambda x: len(x) >= self.duplicate_threshold)
+            # Find groups with duplicates, excluding already processed transactions
+            available_df = df[~df['id'].isin(processed_transactions)]
+            
+            if len(available_df) < self.duplicate_threshold:
+                break  # Not enough transactions left to form duplicates
+            
+            grouped = available_df.groupby(groupby_cols).filter(lambda x: len(x) >= self.duplicate_threshold)
             
             for _, group in grouped.groupby(groupby_cols):
                 if len(group) >= self.duplicate_threshold:
+                    # Mark these transactions as processed
+                    group_transaction_ids = set(group['id'].tolist())
+                    processed_transactions.update(group_transaction_ids)
+                    
                     duplicate_group = {
                         'type': dup_type['type'],
                         'criteria': dup_type['criteria'],
