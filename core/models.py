@@ -504,6 +504,98 @@ class DuplicateAnalysisResult(models.Model):
         
         return risk_counts
 
+class BackdatedAnalysisResult(models.Model):
+    """Model to store enhanced backdated analysis results for files"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='backdated_analyses', help_text='Reference to the data file')
+    
+    # Analysis metadata
+    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
+    analysis_type = models.CharField(max_length=50, default='enhanced_backdated', help_text='Type of analysis performed')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
+    
+    # Analysis results - stored as JSON for flexibility
+    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total backdated entries, amounts, etc.)')
+    backdated_entries = models.JSONField(default=list, help_text='List of backdated transactions found')
+    backdated_by_document = models.JSONField(default=list, help_text='Backdated entries grouped by document number')
+    backdated_by_account = models.JSONField(default=list, help_text='Backdated entries grouped by account')
+    backdated_by_user = models.JSONField(default=list, help_text='Backdated entries grouped by user')
+    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
+    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
+    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
+    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='backdated_results', help_text='Reference to the processing job that generated this analysis')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Analysis status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'backdated_analysis_results'
+        ordering = ['-analysis_date']
+        indexes = [
+            models.Index(fields=['data_file', 'analysis_date']),
+            models.Index(fields=['analysis_type', 'status']),
+            models.Index(fields=['processing_job']),
+        ]
+    
+    def __str__(self):
+        return f"Backdated Analysis for {self.data_file.file_name} - {self.analysis_date}"
+    
+    def get_analysis_summary(self):
+        """Get summary of backdated analysis"""
+        summary = self.analysis_info.copy()
+        summary.update({
+            'analysis_date': self.analysis_date.isoformat(),
+            'analysis_type': self.analysis_type,
+            'analysis_version': self.analysis_version,
+            'status': self.status,
+            'processing_duration': self.processing_duration,
+        })
+        return summary
+    
+    def get_backdated_count(self):
+        """Get total number of backdated entries"""
+        return self.analysis_info.get('total_backdated_entries', 0)
+    
+    def get_total_amount(self):
+        """Get total amount of backdated entries"""
+        return self.analysis_info.get('total_amount', 0)
+    
+    def get_risk_distribution(self):
+        """Get risk distribution of backdated entries"""
+        return {
+            'high_risk': self.analysis_info.get('high_risk_entries', 0),
+            'medium_risk': self.analysis_info.get('medium_risk_entries', 0),
+            'low_risk': self.analysis_info.get('low_risk_entries', 0),
+        }
+    
+    def get_high_priority_recommendations(self):
+        """Get high priority audit recommendations"""
+        return self.audit_recommendations.get('high_priority', [])
+    
+    def get_compliance_issues(self):
+        """Get compliance issues identified"""
+        return self.compliance_assessment.get('compliance_issues', [])
+
+
 class AnalyticsResult(models.Model):
     """Model to store analytics results for files"""
     

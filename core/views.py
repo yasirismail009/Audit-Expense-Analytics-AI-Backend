@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     AnalysisSessionManager = Manager
     TransactionAnalysisManager = Manager
 
-from .models import SAPGLPosting, DataFile, AnalysisSession, TransactionAnalysis, SystemMetrics, GLAccount, FileProcessingJob, MLModelTraining, MLModelProcessingResult, AnalyticsProcessingResult, ProcessingJobTracker
+from .models import SAPGLPosting, DataFile, AnalysisSession, TransactionAnalysis, SystemMetrics, GLAccount, FileProcessingJob, MLModelTraining, MLModelProcessingResult, AnalyticsProcessingResult, ProcessingJobTracker, BackdatedAnalysisResult
 from .serializers import (
     SAPGLPostingSerializer, SAPGLPostingListSerializer,
     DataFileSerializer, DataFileUploadSerializer,
@@ -8289,6 +8289,10 @@ class TargetedAnomalyUploadView(generics.CreateAPIView):
                 status='PENDING'
             )
             print(f"🔍 DEBUG: FileProcessingJob created with ID: {processing_job.id}")
+
+            # Backdated analysis is now included in the main processing flow
+            # No need to trigger it separately here
+            print(f"🔍 DEBUG: Backdated analysis will be included in main processing flow")
             
             # Start background processing using Celery task - NON-BLOCKING
             print(f"🔍 DEBUG: Starting NON-BLOCKING Celery task for job {processing_job.id}")
@@ -8321,7 +8325,9 @@ class TargetedAnomalyUploadView(generics.CreateAPIView):
                 'estimated_completion': 'Job will be processed when worker becomes available',
                 'status_endpoint': f'/api/file-processing-jobs/{processing_job.id}/status/',
                 'analytics_endpoint': f'/api/analysis/file/{data_file.id}/',
-                'duplicate_analysis_endpoint': f'/api/duplicate-anomalies/?sheet_id={data_file.id}'
+                'duplicate_analysis_endpoint': f'/api/duplicate-anomalies/?sheet_id={data_file.id}',
+                'backdated_analysis_included': True,
+                'backdated_analysis_note': 'Backdated analysis is now included in main processing flow'
             }, status=status.HTTP_202_ACCEPTED)
             
         except Exception as e:
@@ -14668,7 +14674,13 @@ class DatabaseStoredComprehensiveAnalyticsView(generics.GenericAPIView):
             # Get risk data from ML processing results
             risk_data = self._get_risk_data_from_db(data_file)
             
-            # Prepare analytics data in the same pattern as existing endpoint
+            # Get backdated analysis data
+            backdated_data = self._get_backdated_data_from_db(data_file)
+            
+            # Get duplicate analysis data
+            duplicate_data = self._get_duplicate_data_from_db(data_file)
+            
+            # Prepare analytics data with simplified duplicate and backdated sections
             analytics_data = {
                 'file_info': {
                     'id': str(data_file.id),
@@ -14683,10 +14695,13 @@ class DatabaseStoredComprehensiveAnalyticsView(generics.GenericAPIView):
                     'uploaded_at': data_file.uploaded_at.isoformat() if data_file.uploaded_at else None,
                     'processed_at': data_file.processed_at.isoformat() if data_file.processed_at else None
                 },
-                'general_stats': self._get_general_stats_from_db(comprehensive_result),
+                'general_stats': self._get_general_stats_from_db(comprehensive_result, data_file),
                 'charts': self._get_charts_from_db(comprehensive_result),
-                'summary': self._get_summary_from_db(comprehensive_result),
+                'summary': self._get_summary_from_db(comprehensive_result, data_file),
                 'risk_data': risk_data,
+                'duplicate_summary': self._get_duplicate_summary_stats(duplicate_data),
+                'backdated_summary': self._get_backdated_summary_stats(backdated_data),
+                'combined_risk_assessment': self._calculate_combined_risk(duplicate_data, backdated_data),
                 'processing_info': {
                     'analytics_id': str(comprehensive_result.id),
                     'processing_status': comprehensive_result.processing_status,
@@ -14706,10 +14721,255 @@ class DatabaseStoredComprehensiveAnalyticsView(generics.GenericAPIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
-    def _get_general_stats_from_db(self, analytics_result):
-        """Get general statistics from database-stored analytics"""
+    def _get_duplicate_summary_stats(self, duplicate_data):
+        """Get summary statistics for duplicate analysis with risk calculation"""
         try:
+            duplicate_stats = duplicate_data.get('duplicate_stats', {})
+            
+            # Calculate risk score based on duplicate metrics
+            total_duplicates = duplicate_stats.get('total_duplicate_transactions', 0)
+            total_transactions = duplicate_stats.get('total_transactions', 1)
+            duplicate_percentage = duplicate_stats.get('duplicate_percentage', 0)
+            total_amount = duplicate_stats.get('total_amount_involved', 0)
+            duplicate_groups = duplicate_stats.get('total_duplicate_groups', 0)
+            
+            # Risk calculation factors
+            percentage_risk = min(duplicate_percentage * 2, 100)  # Higher percentage = higher risk
+            amount_risk = min((total_amount / 1000000) * 10, 100) if total_amount > 0 else 0  # Higher amount = higher risk
+            group_risk = min(duplicate_groups * 5, 100)  # More groups = higher risk
+            
+            # Combined risk score (weighted average)
+            risk_score = (percentage_risk * 0.4 + amount_risk * 0.4 + group_risk * 0.2)
+            
+            # Risk level classification
+            if risk_score >= 80:
+                risk_level = 'CRITICAL'
+            elif risk_score >= 60:
+                risk_level = 'HIGH'
+            elif risk_score >= 40:
+                risk_level = 'MEDIUM'
+            elif risk_score >= 20:
+                risk_level = 'LOW'
+            else:
+                risk_level = 'MINIMAL'
+            
             return {
+                'total_transactions': total_transactions,
+                'total_duplicate_transactions': total_duplicates,
+                'total_duplicate_groups': duplicate_groups,
+                'total_amount_involved': total_amount,
+                'duplicate_percentage': duplicate_percentage,
+                'risk_score': round(risk_score, 2),
+                'risk_level': risk_level,
+                'risk_factors': {
+                    'percentage_risk': round(percentage_risk, 2),
+                    'amount_risk': round(amount_risk, 2),
+                    'group_risk': round(group_risk, 2)
+                },
+                'has_duplicate_data': duplicate_data.get('has_duplicate_data', False),
+                'data_source': 'database'
+            }
+        except Exception as e:
+            logger.error(f"Error getting duplicate summary stats: {e}")
+            return {
+                'total_transactions': 0,
+                'total_duplicate_transactions': 0,
+                'total_duplicate_groups': 0,
+                'total_amount_involved': 0,
+                'duplicate_percentage': 0,
+                'risk_score': 0,
+                'risk_level': 'MINIMAL',
+                'risk_factors': {'percentage_risk': 0, 'amount_risk': 0, 'group_risk': 0},
+                'has_duplicate_data': False,
+                'error': str(e)
+            }
+    
+    def _get_backdated_summary_stats(self, backdated_data):
+        """Get summary statistics for backdated analysis with risk calculation"""
+        try:
+            backdated_stats = backdated_data.get('backdated_stats', {})
+            
+            # Calculate risk score based on backdated metrics
+            total_backdated = backdated_stats.get('total_backdated_entries', 0)
+            total_transactions = backdated_stats.get('total_transactions', 1)
+            backdated_percentage = (total_backdated / total_transactions * 100) if total_transactions > 0 else 0
+            total_amount = backdated_stats.get('total_amount', 0)
+            high_risk_entries = backdated_stats.get('high_risk_entries', 0)
+            medium_risk_entries = backdated_stats.get('medium_risk_entries', 0)
+            
+            # Risk calculation factors
+            percentage_risk = min(backdated_percentage * 3, 100)  # Higher percentage = higher risk
+            amount_risk = min((total_amount / 1000000) * 15, 100) if total_amount > 0 else 0  # Higher amount = higher risk
+            severity_risk = min((high_risk_entries * 10 + medium_risk_entries * 5), 100)  # More high/medium risk = higher risk
+            
+            # Combined risk score (weighted average)
+            risk_score = (percentage_risk * 0.3 + amount_risk * 0.4 + severity_risk * 0.3)
+            
+            # Risk level classification
+            if risk_score >= 80:
+                risk_level = 'CRITICAL'
+            elif risk_score >= 60:
+                risk_level = 'HIGH'
+            elif risk_score >= 40:
+                risk_level = 'MEDIUM'
+            elif risk_score >= 20:
+                risk_level = 'LOW'
+            else:
+                risk_level = 'MINIMAL'
+            
+            return {
+                'total_transactions': total_transactions,
+                'total_backdated_entries': total_backdated,
+                'total_amount': total_amount,
+                'backdated_percentage': round(backdated_percentage, 2),
+                'high_risk_entries': high_risk_entries,
+                'medium_risk_entries': medium_risk_entries,
+                'low_risk_entries': backdated_stats.get('low_risk_entries', 0),
+                'risk_score': round(risk_score, 2),
+                'risk_level': risk_level,
+                'risk_factors': {
+                    'percentage_risk': round(percentage_risk, 2),
+                    'amount_risk': round(amount_risk, 2),
+                    'severity_risk': round(severity_risk, 2)
+                },
+                'has_backdated_data': backdated_data.get('has_backdated_data', False),
+                'data_source': 'database'
+            }
+        except Exception as e:
+            logger.error(f"Error getting backdated summary stats: {e}")
+            return {
+                'total_transactions': 0,
+                'total_backdated_entries': 0,
+                'total_amount': 0,
+                'backdated_percentage': 0,
+                'high_risk_entries': 0,
+                'medium_risk_entries': 0,
+                'low_risk_entries': 0,
+                'risk_score': 0,
+                'risk_level': 'MINIMAL',
+                'risk_factors': {'percentage_risk': 0, 'amount_risk': 0, 'severity_risk': 0},
+                'has_backdated_data': False,
+                'error': str(e)
+            }
+    
+    def _calculate_combined_risk(self, duplicate_data, backdated_data):
+        """Calculate combined risk assessment from both duplicate and backdated analysis"""
+        try:
+            # Get individual risk scores from summary stats
+            duplicate_summary = self._get_duplicate_summary_stats(duplicate_data)
+            backdated_summary = self._get_backdated_summary_stats(backdated_data)
+            
+            duplicate_risk = duplicate_summary.get('risk_score', 0)
+            backdated_risk = backdated_summary.get('risk_score', 0)
+            
+            # Calculate combined risk score (weighted average)
+            # Give more weight to the higher risk score
+            if duplicate_risk > backdated_risk:
+                combined_risk = (duplicate_risk * 0.6) + (backdated_risk * 0.4)
+            else:
+                combined_risk = (backdated_risk * 0.6) + (duplicate_risk * 0.4)
+            
+            # Risk level classification
+            if combined_risk >= 80:
+                risk_level = 'CRITICAL'
+            elif combined_risk >= 60:
+                risk_level = 'HIGH'
+            elif combined_risk >= 40:
+                risk_level = 'MEDIUM'
+            elif combined_risk >= 20:
+                risk_level = 'LOW'
+            else:
+                risk_level = 'MINIMAL'
+            
+            # Risk assessment summary
+            risk_assessment = {
+                'combined_risk_score': round(combined_risk, 2),
+                'risk_level': risk_level,
+                'duplicate_risk_score': round(duplicate_risk, 2),
+                'backdated_risk_score': round(backdated_risk, 2),
+                'risk_factors': {
+                    'duplicate_analysis': {
+                        'has_data': duplicate_data.get('has_duplicate_data', False),
+                        'risk_score': round(duplicate_risk, 2),
+                        'risk_level': self._get_risk_level(duplicate_risk)
+                    },
+                    'backdated_analysis': {
+                        'has_data': backdated_data.get('has_backdated_data', False),
+                        'risk_score': round(backdated_risk, 2),
+                        'risk_level': self._get_risk_level(backdated_risk)
+                    }
+                },
+                'recommendations': self._generate_risk_recommendations(combined_risk, duplicate_risk, backdated_risk)
+            }
+            
+            return risk_assessment
+            
+        except Exception as e:
+            logger.error(f"Error calculating combined risk: {e}")
+            return {
+                'combined_risk_score': 0,
+                'risk_level': 'MINIMAL',
+                'duplicate_risk_score': 0,
+                'backdated_risk_score': 0,
+                'risk_factors': {
+                    'duplicate_analysis': {'has_data': False, 'risk_score': 0, 'risk_level': 'MINIMAL'},
+                    'backdated_analysis': {'has_data': False, 'risk_score': 0, 'risk_level': 'MINIMAL'}
+                },
+                'recommendations': ['Unable to calculate risk assessment due to error'],
+                'error': str(e)
+            }
+    
+    def _get_risk_level(self, risk_score):
+        """Helper method to get risk level from risk score"""
+        if risk_score >= 80:
+            return 'CRITICAL'
+        elif risk_score >= 60:
+            return 'HIGH'
+        elif risk_score >= 40:
+            return 'MEDIUM'
+        elif risk_score >= 20:
+            return 'LOW'
+        else:
+            return 'MINIMAL'
+    
+    def _generate_risk_recommendations(self, combined_risk, duplicate_risk, backdated_risk):
+        """Generate risk-based recommendations"""
+        recommendations = []
+        
+        if combined_risk >= 80:
+            recommendations.append("CRITICAL: Immediate attention required. High risk of financial misstatement.")
+            recommendations.append("Recommend detailed audit procedures for both duplicate and backdated entries.")
+        elif combined_risk >= 60:
+            recommendations.append("HIGH: Significant risk detected. Enhanced audit procedures recommended.")
+            recommendations.append("Focus on high-value transactions and unusual patterns.")
+        elif combined_risk >= 40:
+            recommendations.append("MEDIUM: Moderate risk level. Standard audit procedures should be sufficient.")
+            recommendations.append("Monitor for any changes in risk patterns.")
+        elif combined_risk >= 20:
+            recommendations.append("LOW: Minimal risk detected. Routine monitoring recommended.")
+        else:
+            recommendations.append("MINIMAL: Very low risk. Standard procedures adequate.")
+        
+        # Specific recommendations based on individual risk scores
+        if duplicate_risk >= 60:
+            recommendations.append("High duplicate risk: Investigate duplicate transaction patterns.")
+        if backdated_risk >= 60:
+            recommendations.append("High backdated risk: Review posting date vs document date discrepancies.")
+        
+        return recommendations
+    
+    def _get_general_stats_from_db(self, analytics_result, data_file):
+        """Get general statistics from database-stored analytics with backdated data integration"""
+        try:
+            # Get backdated analysis data
+            backdated_results = BackdatedAnalysisResult.objects.filter(
+                data_file=data_file,
+                analysis_type='enhanced_backdated',
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            # Base statistics from comprehensive analytics
+            stats = {
                 'total_transactions': analytics_result.total_transactions,
                 'total_amount': float(analytics_result.total_amount),
                 'unique_users': analytics_result.unique_users,
@@ -14721,6 +14981,74 @@ class DatabaseStoredComprehensiveAnalyticsView(generics.GenericAPIView):
                 'average_amount': float(analytics_result.total_amount) / analytics_result.total_transactions if analytics_result.total_transactions > 0 else 0,
                 'data_source': 'database'
             }
+            
+            # Get duplicate analysis data for additional integration
+            duplicate_results = AnalyticsProcessingResult.objects.filter(
+                data_file=data_file,
+                analytics_type='duplicate_analysis',
+                processing_status='COMPLETED'
+            ).order_by('-created_at').first()
+            
+            # Integrate backdated data if available
+            if backdated_results:
+                backdated_count = backdated_results.get_backdated_count()
+                backdated_amount = backdated_results.get_total_amount()
+                risk_dist = backdated_results.get_risk_distribution()
+                
+                # Update statistics with backdated data
+                stats.update({
+                    'backdated_entries': backdated_count,
+                    'backdated_amount': backdated_amount,
+                    'total_anomalies': stats['anomalies_found'] + backdated_count,  # Include backdated as anomalies
+                    'total_risk_transactions': stats['high_risk_transactions'] + risk_dist.get('high_risk', 0),
+                    'backdated_high_risk': risk_dist.get('high_risk', 0),
+                    'backdated_medium_risk': risk_dist.get('medium_risk', 0),
+                    'backdated_low_risk': risk_dist.get('low_risk', 0)
+                })
+                
+                # Update total flagged transactions to include backdated
+                stats['flagged_transactions'] += backdated_count
+                
+                # Update high risk transactions to include high-risk backdated
+                stats['high_risk_transactions'] += risk_dist.get('high_risk', 0)
+            else:
+                # No backdated data available
+                stats.update({
+                    'backdated_entries': 0,
+                    'backdated_amount': 0,
+                    'total_anomalies': stats['anomalies_found'],
+                    'total_risk_transactions': stats['high_risk_transactions'],
+                    'backdated_high_risk': 0,
+                    'backdated_medium_risk': 0,
+                    'backdated_low_risk': 0
+                })
+            
+            # Integrate duplicate analysis data if available
+            if duplicate_results:
+                trial_balance_data = duplicate_results.trial_balance_data
+                analysis_info = trial_balance_data.get('analysis_info', {})
+                duplicate_count = analysis_info.get('total_duplicate_transactions', 0)
+                duplicate_amount = analysis_info.get('total_amount_involved', 0)
+                
+                # Update statistics with duplicate data
+                stats.update({
+                    'duplicate_analysis_entries': duplicate_count,
+                    'duplicate_analysis_amount': duplicate_amount,
+                    'duplicate_analysis_groups': analysis_info.get('total_duplicate_groups', 0),
+                    'duplicate_analysis_percentage': analysis_info.get('duplicate_percentage', 0),
+                    'total_duplicates_including_analysis': stats['duplicates_found'] + duplicate_count
+                })
+            else:
+                # No duplicate analysis data available
+                stats.update({
+                    'duplicate_analysis_entries': 0,
+                    'duplicate_analysis_amount': 0,
+                    'duplicate_analysis_groups': 0,
+                    'duplicate_analysis_percentage': 0,
+                    'total_duplicates_including_analysis': stats['duplicates_found']
+                })
+            
+            return stats
         except Exception as e:
             logger.error(f"Error getting general stats from DB: {e}")
             return {}
@@ -14757,9 +15085,24 @@ class DatabaseStoredComprehensiveAnalyticsView(generics.GenericAPIView):
             logger.error(f"Error getting charts from DB: {e}")
             return {'data_source': 'database'}
     
-    def _get_summary_from_db(self, analytics_result):
-        """Get summary data from database-stored analytics"""
+    def _get_summary_from_db(self, analytics_result, data_file):
+        """Get summary data from database-stored analytics with backdated data integration"""
         try:
+            # Get backdated analysis data
+            backdated_results = BackdatedAnalysisResult.objects.filter(
+                data_file=data_file,
+                analysis_type='enhanced_backdated',
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            # Get duplicate analysis data for additional integration
+            duplicate_results = AnalyticsProcessingResult.objects.filter(
+                data_file=data_file,
+                analytics_type='duplicate_analysis',
+                processing_status='COMPLETED'
+            ).order_by('-created_at').first()
+            
+            # Base summary from comprehensive analytics
             summary = {
                 'total_transactions': analytics_result.total_transactions,
                 'total_amount': float(analytics_result.total_amount),
@@ -14772,9 +15115,66 @@ class DatabaseStoredComprehensiveAnalyticsView(generics.GenericAPIView):
                 'data_source': 'database'
             }
             
+            # Integrate backdated data if available
+            if backdated_results:
+                backdated_count = backdated_results.get_backdated_count()
+                backdated_amount = backdated_results.get_total_amount()
+                risk_dist = backdated_results.get_risk_distribution()
+                
+                # Update summary with backdated data
+                summary.update({
+                    'backdated_entries': backdated_count,
+                    'backdated_amount': backdated_amount,
+                    'total_anomalies': summary['anomalies_found'] + backdated_count,
+                    'total_risk_transactions': summary['high_risk_transactions'] + risk_dist.get('high_risk', 0),
+                    'backdated_high_risk': risk_dist.get('high_risk', 0),
+                    'backdated_medium_risk': risk_dist.get('medium_risk', 0),
+                    'backdated_low_risk': risk_dist.get('low_risk', 0)
+                })
+                
+                # Update flagged and high risk transactions
+                summary['flagged_transactions'] += backdated_count
+                summary['high_risk_transactions'] += risk_dist.get('high_risk', 0)
+            else:
+                # No backdated data available
+                summary.update({
+                    'backdated_entries': 0,
+                    'backdated_amount': 0,
+                    'total_anomalies': summary['anomalies_found'],
+                    'total_risk_transactions': summary['high_risk_transactions'],
+                    'backdated_high_risk': 0,
+                    'backdated_medium_risk': 0,
+                    'backdated_low_risk': 0
+                })
+            
             # Add risk assessment if available
             if analytics_result.risk_assessment:
                 summary['risk_assessment'] = analytics_result.risk_assessment
+            
+            # Integrate duplicate analysis data if available
+            if duplicate_results:
+                trial_balance_data = duplicate_results.trial_balance_data
+                analysis_info = trial_balance_data.get('analysis_info', {})
+                duplicate_count = analysis_info.get('total_duplicate_transactions', 0)
+                duplicate_amount = analysis_info.get('total_amount_involved', 0)
+                
+                # Update summary with duplicate data
+                summary.update({
+                    'duplicate_analysis_entries': duplicate_count,
+                    'duplicate_analysis_amount': duplicate_amount,
+                    'duplicate_analysis_groups': analysis_info.get('total_duplicate_groups', 0),
+                    'duplicate_analysis_percentage': analysis_info.get('duplicate_percentage', 0),
+                    'total_duplicates_including_analysis': summary['duplicates_found'] + duplicate_count
+                })
+            else:
+                # No duplicate analysis data available
+                summary.update({
+                    'duplicate_analysis_entries': 0,
+                    'duplicate_analysis_amount': 0,
+                    'duplicate_analysis_groups': 0,
+                    'duplicate_analysis_percentage': 0,
+                    'total_duplicates_including_analysis': summary['duplicates_found']
+                })
             
             return summary
             
@@ -14783,7 +15183,7 @@ class DatabaseStoredComprehensiveAnalyticsView(generics.GenericAPIView):
             return {'data_source': 'database'}
     
     def _get_risk_data_from_db(self, data_file):
-        """Get risk data from database-stored ML processing results"""
+        """Get risk data from database-stored ML processing results, comprehensive analytics, and backdated analysis"""
         try:
             # Get ML processing results for this file
             ml_results = MLModelProcessingResult.objects.filter(
@@ -14791,27 +15191,149 @@ class DatabaseStoredComprehensiveAnalyticsView(generics.GenericAPIView):
                 processing_status='COMPLETED'
             ).order_by('-created_at').first()
             
-            if not ml_results:
-                return {
-                    'risk_stats': {},
-                    'risk_charts': {},
-                    'data_source': 'database',
-                    'message': 'No ML processing results found'
-                }
+            # Get comprehensive analytics results for risk assessment
+            comprehensive_analytics = AnalyticsProcessingResult.objects.filter(
+                data_file=data_file,
+                analytics_type='comprehensive_expense',
+                processing_status='COMPLETED'
+            ).order_by('-created_at').first()
             
-            # Extract risk data from ML results
+            # Get backdated analysis results
+            backdated_results = BackdatedAnalysisResult.objects.filter(
+                data_file=data_file,
+                analysis_type='enhanced_backdated',
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            # Initialize risk data structure
             risk_data = {
-                'risk_stats': {
+                'risk_stats': {},
+                'risk_charts': {},
+                'data_source': 'database',
+                'ml_processing_id': None,
+                'comprehensive_analytics_id': None,
+                'backdated_analysis_id': None
+            }
+            
+            # Add ML results if available
+            if ml_results:
+                risk_data['risk_stats'].update({
                     'anomalies_detected': ml_results.anomalies_detected,
                     'duplicates_found': ml_results.duplicates_found,
-                    'risk_score': ml_results.risk_score,
+                    'ml_risk_score': ml_results.risk_score,
                     'confidence_score': ml_results.confidence_score,
                     'model_type': ml_results.model_type
-                },
-                'risk_charts': ml_results.detailed_results.get('risk_charts', {}),
-                'data_source': 'database',
-                'ml_processing_id': str(ml_results.id)
-            }
+                })
+                risk_data['ml_processing_id'] = str(ml_results.id)
+                
+                # Extract risk charts from ML detailed results if available
+                if ml_results.detailed_results:
+                    risk_data['risk_charts'].update(
+                        ml_results.detailed_results.get('risk_charts', {})
+                    )
+            
+            # Add comprehensive analytics risk assessment if available
+            if comprehensive_analytics and comprehensive_analytics.risk_assessment:
+                risk_assessment = comprehensive_analytics.risk_assessment
+                
+                # Integrate comprehensive risk assessment
+                risk_data['risk_stats'].update({
+                    'comprehensive_risk_level': risk_assessment.get('risk_level', 'UNKNOWN'),
+                    'comprehensive_risk_score': risk_assessment.get('risk_score', 0.0),
+                    'total_transactions': comprehensive_analytics.total_transactions,
+                    'flagged_transactions': comprehensive_analytics.flagged_transactions,
+                    'high_risk_transactions': comprehensive_analytics.high_risk_transactions
+                })
+                
+                # Add risk factors and recommendations
+                risk_data['risk_factors'] = risk_assessment.get('risk_factors', {})
+                risk_data['recommendations'] = risk_assessment.get('recommendations', [])
+                
+                # Generate risk charts from comprehensive analytics
+                risk_data['risk_charts'].update(self._generate_risk_charts_from_analytics(comprehensive_analytics))
+                
+                risk_data['comprehensive_analytics_id'] = str(comprehensive_analytics.id)
+            
+            # Add backdated analysis risk data if available
+            if backdated_results:
+                backdated_count = backdated_results.get_backdated_count()
+                backdated_amount = backdated_results.get_total_amount()
+                risk_dist = backdated_results.get_risk_distribution()
+                
+                # Update risk stats with backdated data
+                risk_data['risk_stats'].update({
+                    'backdated_entries': backdated_count,
+                    'backdated_amount': backdated_amount,
+                    'backdated_high_risk': risk_dist.get('high_risk', 0),
+                    'backdated_medium_risk': risk_dist.get('medium_risk', 0),
+                    'backdated_low_risk': risk_dist.get('low_risk', 0),
+                    'total_anomalies': risk_data['risk_stats'].get('anomalies_detected', 0) + backdated_count,
+                    'total_risk_transactions': risk_data['risk_stats'].get('high_risk_transactions', 0) + risk_dist.get('high_risk', 0)
+                })
+                
+                # Add backdated-specific risk factors
+                if 'risk_factors' not in risk_data:
+                    risk_data['risk_factors'] = {}
+                
+                risk_data['risk_factors'].update({
+                    'backdated_entries': backdated_count,
+                    'backdated_amount': backdated_amount,
+                    'backdated_high_risk_entries': risk_dist.get('high_risk', 0)
+                })
+                
+                # Add backdated-specific recommendations
+                if 'recommendations' not in risk_data:
+                    risk_data['recommendations'] = []
+                
+                backdated_recommendations = [
+                    f"Review {backdated_count} backdated entries for compliance",
+                    f"Investigate {risk_dist.get('high_risk', 0)} high-risk backdated entries",
+                    "Implement controls to prevent backdated entries",
+                    "Document reasons for all backdated entries"
+                ]
+                risk_data['recommendations'].extend(backdated_recommendations)
+                
+                # Generate backdated risk charts
+                backdated_charts = self._generate_backdated_risk_charts(backdated_results)
+                risk_data['risk_charts'].update(backdated_charts)
+                
+                risk_data['backdated_analysis_id'] = str(backdated_results.id)
+            
+            # Calculate overall risk score (combine ML, comprehensive, and backdated scores)
+            if risk_data['risk_stats']:
+                ml_score = risk_data['risk_stats'].get('ml_risk_score', 0.0)
+                comprehensive_score = risk_data['risk_stats'].get('comprehensive_risk_score', 0.0)
+                
+                # Calculate backdated risk score
+                backdated_risk_score = 0.0
+                if backdated_results:
+                    backdated_count = backdated_results.get_backdated_count()
+                    total_transactions = risk_data['risk_stats'].get('total_transactions', 1)
+                    backdated_ratio = backdated_count / total_transactions if total_transactions > 0 else 0
+                    backdated_risk_score = min(1.0, backdated_ratio * 2.0)  # Scale backdated ratio to risk score
+                
+                # Normalize comprehensive score to 0-1 range (assuming it's 0-100)
+                normalized_comprehensive = comprehensive_score / 100.0 if comprehensive_score > 0 else 0.0
+                
+                # Weighted average: 40% ML score, 30% comprehensive score, 30% backdated score
+                overall_risk_score = (ml_score * 0.4) + (normalized_comprehensive * 0.3) + (backdated_risk_score * 0.3)
+                risk_data['risk_stats']['overall_risk_score'] = round(overall_risk_score, 3)
+                risk_data['risk_stats']['backdated_risk_score'] = round(backdated_risk_score, 3)
+                
+                # Determine overall risk level
+                if overall_risk_score >= 0.8:
+                    risk_data['risk_stats']['overall_risk_level'] = 'CRITICAL'
+                elif overall_risk_score >= 0.6:
+                    risk_data['risk_stats']['overall_risk_level'] = 'HIGH'
+                elif overall_risk_score >= 0.4:
+                    risk_data['risk_stats']['overall_risk_level'] = 'MEDIUM'
+                elif overall_risk_score >= 0.2:
+                    risk_data['risk_stats']['overall_risk_level'] = 'LOW'
+                else:
+                    risk_data['risk_stats']['overall_risk_level'] = 'MINIMAL'
+            
+            if not risk_data['risk_stats']:
+                risk_data['message'] = 'No risk data found'
             
             return risk_data
             
@@ -14823,6 +15345,845 @@ class DatabaseStoredComprehensiveAnalyticsView(generics.GenericAPIView):
                 'data_source': 'database',
                 'error': str(e)
             }
+    
+    def _generate_risk_charts_from_analytics(self, analytics_result):
+        """Generate risk charts from comprehensive analytics data"""
+        try:
+            charts = {}
+            
+            # Risk level distribution chart
+            if analytics_result.risk_assessment:
+                risk_assessment = analytics_result.risk_assessment
+                risk_factors = risk_assessment.get('risk_factors', {})
+                
+                # Risk factors breakdown
+                if risk_factors:
+                    charts['risk_factors_breakdown'] = {
+                        'labels': list(risk_factors.keys()),
+                        'data': list(risk_factors.values()),
+                        'type': 'bar',
+                        'title': 'Risk Factors Breakdown'
+                    }
+                
+                # Risk level distribution
+                risk_level = risk_assessment.get('risk_level', 'UNKNOWN')
+                charts['risk_level_distribution'] = {
+                    'labels': ['Current Risk Level'],
+                    'data': [1],
+                    'colors': [self._get_risk_color(risk_level)],
+                    'type': 'doughnut',
+                    'title': f'Risk Level: {risk_level}'
+                }
+            
+            # Transaction risk distribution
+            if analytics_result.total_transactions > 0:
+                flagged_pct = (analytics_result.flagged_transactions / analytics_result.total_transactions) * 100
+                high_risk_pct = (analytics_result.high_risk_transactions / analytics_result.total_transactions) * 100
+                normal_pct = 100 - flagged_pct - high_risk_pct
+                
+                charts['transaction_risk_distribution'] = {
+                    'labels': ['Normal', 'Flagged', 'High Risk'],
+                    'data': [normal_pct, flagged_pct, high_risk_pct],
+                    'colors': ['#28a745', '#ffc107', '#dc3545'],
+                    'type': 'pie',
+                    'title': 'Transaction Risk Distribution'
+                }
+            
+            # Risk score timeline (if temporal data available)
+            if analytics_result.temporal_patterns:
+                temporal_data = analytics_result.temporal_patterns
+                if 'monthly_risk' in temporal_data:
+                    monthly_risk = temporal_data['monthly_risk']
+                    charts['risk_timeline'] = {
+                        'labels': list(monthly_risk.keys()),
+                        'data': list(monthly_risk.values()),
+                        'type': 'line',
+                        'title': 'Risk Score Timeline'
+                    }
+            
+            return charts
+            
+        except Exception as e:
+            logger.error(f"Error generating risk charts: {e}")
+            return {}
+    
+    def _get_risk_color(self, risk_level):
+        """Get color for risk level"""
+        colors = {
+            'CRITICAL': '#dc3545',
+            'HIGH': '#fd7e14',
+            'MEDIUM': '#ffc107',
+            'LOW': '#28a745',
+            'MINIMAL': '#6c757d'
+        }
+        return colors.get(risk_level, '#6c757d')
+    
+    def _generate_backdated_risk_charts(self, backdated_results):
+        """Generate risk charts specifically for backdated analysis"""
+        try:
+            charts = {}
+            
+            # Backdated risk distribution chart
+            risk_dist = backdated_results.get_risk_distribution()
+            if risk_dist:
+                charts['backdated_risk_distribution'] = {
+                    'labels': ['High Risk', 'Medium Risk', 'Low Risk'],
+                    'data': [
+                        risk_dist.get('high_risk', 0),
+                        risk_dist.get('medium_risk', 0),
+                        risk_dist.get('low_risk', 0)
+                    ],
+                    'backgroundColor': ['#dc3545', '#ffc107', '#28a745'],
+                    'type': 'pie',
+                    'title': 'Backdated Entries Risk Distribution'
+                }
+            
+            # Backdated entries by user risk chart
+            if backdated_results.backdated_by_user:
+                user_data = backdated_results.backdated_by_user[:10]  # Top 10 users
+                charts['backdated_user_risk'] = {
+                    'labels': [user['user_name'] for user in user_data],
+                    'data': [user['high_risk_count'] for user in user_data],
+                    'backgroundColor': '#dc3545',
+                    'type': 'bar',
+                    'title': 'High-Risk Backdated Entries by User'
+                }
+            
+            # Backdated entries by account risk chart
+            if backdated_results.backdated_by_account:
+                account_data = backdated_results.backdated_by_account[:10]  # Top 10 accounts
+                charts['backdated_account_risk'] = {
+                    'labels': [f"{account['account']} - {account['account_name']}" for account in account_data],
+                    'data': [account['high_risk_count'] for account in account_data],
+                    'backgroundColor': '#dc3545',
+                    'type': 'bar',
+                    'title': 'High-Risk Backdated Entries by Account'
+                }
+            
+            # Days difference vs risk level chart
+            if backdated_results.backdated_entries:
+                high_risk_days = []
+                medium_risk_days = []
+                low_risk_days = []
+                
+                for entry in backdated_results.backdated_entries:
+                    days_diff = entry.get('days_difference', 0)
+                    risk_level = entry.get('risk_level', 'low')
+                    
+                    if risk_level == 'high':
+                        high_risk_days.append(days_diff)
+                    elif risk_level == 'medium':
+                        medium_risk_days.append(days_diff)
+                    else:
+                        low_risk_days.append(days_diff)
+                
+                if high_risk_days or medium_risk_days or low_risk_days:
+                    charts['days_difference_vs_risk'] = {
+                        'labels': ['High Risk', 'Medium Risk', 'Low Risk'],
+                        'data': [
+                            sum(high_risk_days) / len(high_risk_days) if high_risk_days else 0,
+                            sum(medium_risk_days) / len(medium_risk_days) if medium_risk_days else 0,
+                            sum(low_risk_days) / len(low_risk_days) if low_risk_days else 0
+                        ],
+                        'backgroundColor': ['#dc3545', '#ffc107', '#28a745'],
+                        'type': 'bar',
+                        'title': 'Average Days Difference by Risk Level'
+                    }
+            
+            return charts
+            
+        except Exception as e:
+            logger.error(f"Error generating backdated risk charts: {e}")
+            return {}
+    
+    def _get_backdated_data_from_db(self, data_file):
+        """Get backdated analysis data from database-stored results"""
+        try:
+            # Get backdated analysis results for this file
+            backdated_results = BackdatedAnalysisResult.objects.filter(
+                data_file=data_file,
+                analysis_type='enhanced_backdated',
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            # Initialize backdated data structure
+            backdated_data = {
+                'backdated_stats': {},
+                'backdated_charts': {},
+                'backdated_entries': [],
+                'backdated_by_document': [],
+                'backdated_by_account': [],
+                'backdated_by_user': [],
+                'audit_recommendations': {},
+                'compliance_assessment': {},
+                'financial_statement_impact': {},
+                'data_source': 'database',
+                'backdated_analysis_id': None,
+                'has_backdated_data': False
+            }
+            
+            if backdated_results:
+                backdated_data['has_backdated_data'] = True
+                backdated_data['backdated_analysis_id'] = str(backdated_results.id)
+                
+                # Get backdated statistics
+                backdated_data['backdated_stats'] = {
+                    'total_backdated_entries': backdated_results.get_backdated_count(),
+                    'total_amount': backdated_results.get_total_amount(),
+                    'unique_documents': len(backdated_results.backdated_by_document) if backdated_results.backdated_by_document else 0,
+                    'unique_accounts': len(backdated_results.backdated_by_account) if backdated_results.backdated_by_account else 0,
+                    'unique_users': len(backdated_results.backdated_by_user) if backdated_results.backdated_by_user else 0,
+                    'avg_days_difference': backdated_results.analysis_info.get('avg_days_difference', 0),
+                    'max_days_difference': backdated_results.analysis_info.get('max_days_difference', 0),
+                    'high_risk_entries': backdated_results.analysis_info.get('high_risk_entries', 0),
+                    'medium_risk_entries': backdated_results.analysis_info.get('medium_risk_entries', 0),
+                    'low_risk_entries': backdated_results.analysis_info.get('low_risk_entries', 0),
+                    'processing_duration': backdated_results.processing_duration,
+                    'analysis_date': backdated_results.analysis_date.isoformat(),
+                    'analysis_version': backdated_results.analysis_version
+                }
+                
+                # Get risk distribution
+                risk_dist = backdated_results.get_risk_distribution()
+                if risk_dist:
+                    backdated_data['backdated_stats']['risk_distribution'] = risk_dist
+                
+                # Get detailed backdated entries (limit to first 50 for performance)
+                if backdated_results.backdated_entries:
+                    backdated_data['backdated_entries'] = backdated_results.backdated_entries[:50]
+                
+                # Get grouped data
+                if backdated_results.backdated_by_document:
+                    backdated_data['backdated_by_document'] = backdated_results.backdated_by_document[:20]
+                
+                if backdated_results.backdated_by_account:
+                    backdated_data['backdated_by_account'] = backdated_results.backdated_by_account[:20]
+                
+                if backdated_results.backdated_by_user:
+                    backdated_data['backdated_by_user'] = backdated_results.backdated_by_user[:20]
+                
+                # Get audit recommendations
+                if backdated_results.audit_recommendations:
+                    backdated_data['audit_recommendations'] = backdated_results.audit_recommendations
+                
+                # Get compliance assessment
+                if backdated_results.compliance_assessment:
+                    backdated_data['compliance_assessment'] = backdated_results.compliance_assessment
+                
+                # Get financial statement impact
+                if backdated_results.financial_statement_impact:
+                    backdated_data['financial_statement_impact'] = backdated_results.financial_statement_impact
+                
+                # Generate backdated charts data
+                backdated_data['backdated_charts'] = self._generate_backdated_charts(backdated_results)
+                
+            else:
+                backdated_data['message'] = 'No backdated analysis found for this file'
+            
+            return backdated_data
+            
+        except Exception as e:
+            logger.error(f"Error getting backdated data from DB: {e}")
+            return {
+                'backdated_stats': {},
+                'backdated_charts': {},
+                'backdated_entries': [],
+                'backdated_by_document': [],
+                'backdated_by_account': [],
+                'backdated_by_user': [],
+                'audit_recommendations': {},
+                'compliance_assessment': {},
+                'financial_statement_impact': {},
+                'data_source': 'database',
+                'error': str(e)
+            }
+    
+    def _generate_backdated_charts(self, backdated_results):
+        """Generate chart data for backdated analysis"""
+        try:
+            charts = {}
+            
+            # Risk distribution chart
+            risk_dist = backdated_results.get_risk_distribution()
+            if risk_dist:
+                charts['risk_distribution'] = {
+                    'labels': ['High Risk', 'Medium Risk', 'Low Risk'],
+                    'data': [
+                        risk_dist.get('high_risk', 0),
+                        risk_dist.get('medium_risk', 0),
+                        risk_dist.get('low_risk', 0)
+                    ],
+                    'backgroundColor': ['#dc3545', '#ffc107', '#28a745']
+                }
+            
+            # Backdated entries by user chart
+            if backdated_results.backdated_by_user:
+                user_data = backdated_results.backdated_by_user[:10]  # Top 10 users
+                charts['backdated_by_user'] = {
+                    'labels': [user['user_name'] for user in user_data],
+                    'data': [user['transaction_count'] for user in user_data],
+                    'backgroundColor': '#007bff'
+                }
+            
+            # Backdated entries by account chart
+            if backdated_results.backdated_by_account:
+                account_data = backdated_results.backdated_by_account[:10]  # Top 10 accounts
+                charts['backdated_by_account'] = {
+                    'labels': [f"{account['account']} - {account['account_name']}" for account in account_data],
+                    'data': [account['transaction_count'] for account in account_data],
+                    'backgroundColor': '#6f42c1'
+                }
+            
+            # Days difference distribution
+            if backdated_results.backdated_entries:
+                days_diff_data = [entry.get('days_difference', 0) for entry in backdated_results.backdated_entries]
+                if days_diff_data:
+                    charts['days_difference_distribution'] = {
+                        'labels': ['1-7 days', '8-30 days', '31-90 days', '90+ days'],
+                        'data': [
+                            len([d for d in days_diff_data if 1 <= d <= 7]),
+                            len([d for d in days_diff_data if 8 <= d <= 30]),
+                            len([d for d in days_diff_data if 31 <= d <= 90]),
+                            len([d for d in days_diff_data if d > 90])
+                        ],
+                        'backgroundColor': ['#28a745', '#ffc107', '#fd7e14', '#dc3545']
+                    }
+            
+            return charts
+            
+        except Exception as e:
+            logger.error(f"Error generating backdated charts: {e}")
+            return {}
+
+    def _get_duplicate_data_from_db(self, data_file):
+        """Get duplicate analysis data from database-stored results"""
+        try:
+            # Get duplicate analysis results for this file
+            duplicate_results = AnalyticsProcessingResult.objects.filter(
+                data_file=data_file,
+                analytics_type='duplicate_analysis',
+                processing_status='COMPLETED'
+            ).order_by('-created_at').first()
+            
+            # Initialize duplicate data structure
+            duplicate_data = {
+                'duplicate_stats': {},
+                'duplicate_charts': {},
+                'duplicate_list': [],
+                'breakdowns': {},
+                'summary_table': [],
+                'export_data': [],
+                'detailed_insights': {},
+                'ml_enhancement': {},
+                'data_source': 'database',
+                'duplicate_analysis_id': None,
+                'has_duplicate_data': False
+            }
+            
+            if duplicate_results:
+                duplicate_data['has_duplicate_data'] = True
+                duplicate_data['duplicate_analysis_id'] = str(duplicate_results.id)
+                
+                # Get trial balance data (contains all duplicate analysis results)
+                trial_balance_data = duplicate_results.trial_balance_data
+                
+                # Extract duplicate statistics
+                analysis_info = trial_balance_data.get('analysis_info', {})
+                duplicate_data['duplicate_stats'] = {
+                    'total_transactions': analysis_info.get('total_transactions', 0),
+                    'total_duplicate_transactions': analysis_info.get('total_duplicate_transactions', 0),
+                    'total_duplicate_groups': analysis_info.get('total_duplicate_groups', 0),
+                    'total_amount_involved': analysis_info.get('total_amount_involved', 0),
+                    'duplicate_percentage': analysis_info.get('duplicate_percentage', 0),
+                    'data_source': 'database'
+                }
+                
+                # Get detailed duplicate list (limit to first 50 for performance)
+                if trial_balance_data.get('duplicate_list'):
+                    duplicate_data['duplicate_list'] = trial_balance_data['duplicate_list'][:50]
+                
+                # Get breakdowns
+                if trial_balance_data.get('breakdowns'):
+                    duplicate_data['breakdowns'] = trial_balance_data['breakdowns']
+                
+                # Get summary table
+                if trial_balance_data.get('summary_table'):
+                    duplicate_data['summary_table'] = trial_balance_data['summary_table'][:20]  # Limit to 20
+                
+                # Get export data
+                if trial_balance_data.get('export_data'):
+                    duplicate_data['export_data'] = trial_balance_data['export_data'][:50]  # Limit to 50
+                
+                # Get detailed insights
+                if trial_balance_data.get('detailed_insights'):
+                    duplicate_data['detailed_insights'] = trial_balance_data['detailed_insights']
+                
+                # Get ML enhancement data
+                if trial_balance_data.get('ml_enhancement'):
+                    duplicate_data['ml_enhancement'] = trial_balance_data['ml_enhancement']
+                
+                # Get chart data from the analytics result
+                if duplicate_results.chart_data:
+                    duplicate_data['duplicate_charts'] = duplicate_results.chart_data
+                elif trial_balance_data.get('chart_data'):
+                    duplicate_data['duplicate_charts'] = trial_balance_data['chart_data']
+                
+            else:
+                duplicate_data['message'] = 'No duplicate analysis found for this file'
+            
+            return duplicate_data
+            
+        except Exception as e:
+            logger.error(f"Error getting duplicate data from DB: {e}")
+            return {
+                'duplicate_stats': {},
+                'duplicate_charts': {},
+                'duplicate_list': [],
+                'breakdowns': {},
+                'summary_table': [],
+                'export_data': [],
+                'detailed_insights': {},
+                'ml_enhancement': {},
+                'data_source': 'database',
+                'error': str(e)
+            }
+
+
+class DatabaseStoredBackdatedAnalysisView(generics.GenericAPIView):
+    """Database-stored backdated analysis that returns the same pattern as existing endpoint"""
+    
+    def get(self, request, file_id, *args, **kwargs):
+        """Get backdated analysis from database-stored results"""
+        try:
+            from rest_framework import status
+            from django.shortcuts import get_object_or_404
+            import uuid
+            
+            # Clean file_id - ensure it's a string
+            file_id = str(file_id).rstrip('/')
+            
+            # Validate UUID format
+            try:
+                uuid.UUID(file_id)
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid file ID format'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get the data file
+            data_file = get_object_or_404(DataFile, id=file_id)
+            
+            # Check if we have database-stored backdated analysis results
+            backdated_results = BackdatedAnalysisResult.objects.filter(
+                data_file=data_file,
+                analysis_type='enhanced_backdated',
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            if not backdated_results:
+                return Response(
+                    {'error': 'No database-stored backdated analysis found for this file. Please run backdated analysis processing first.'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Generate response with existing analysis data
+            analysis_response = self._generate_backdated_analysis_response(data_file, backdated_results)
+            
+            return Response(analysis_response)
+            
+        except Exception as e:
+            logger.error(f"Error in DatabaseStoredBackdatedAnalysisView: {e}")
+            return Response(
+                {'error': f'Error retrieving database-stored backdated analysis: {str(e)}'}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    def _generate_backdated_analysis_response(self, data_file, backdated_result):
+        """Generate backdated analysis response in the same pattern as existing endpoint"""
+        try:
+            # Extract analysis info
+            analysis_info = {
+                'total_backdated_entries': backdated_result.get_backdated_count(),
+                'total_amount': backdated_result.get_total_amount(),
+                'unique_documents': len(backdated_result.backdated_by_document) if backdated_result.backdated_by_document else 0,
+                'unique_accounts': len(backdated_result.backdated_by_account) if backdated_result.backdated_by_account else 0,
+                'unique_users': len(backdated_result.backdated_by_user) if backdated_result.backdated_by_user else 0,
+                'avg_days_difference': backdated_result.analysis_info.get('avg_days_difference', 0),
+                'max_days_difference': backdated_result.analysis_info.get('max_days_difference', 0),
+                'high_risk_entries': backdated_result.analysis_info.get('high_risk_entries', 0),
+                'medium_risk_entries': backdated_result.analysis_info.get('medium_risk_entries', 0),
+                'low_risk_entries': backdated_result.analysis_info.get('low_risk_entries', 0),
+                'processing_duration': backdated_result.processing_duration,
+                'analysis_date': backdated_result.analysis_date.isoformat(),
+                'analysis_version': backdated_result.analysis_version
+            }
+            
+            # Get risk distribution
+            risk_dist = backdated_result.get_risk_distribution()
+            if risk_dist:
+                analysis_info['risk_distribution'] = risk_dist
+            
+            # Extract backdated entries list
+            backdated_list = backdated_result.backdated_entries if backdated_result.backdated_entries else []
+            
+            # Extract breakdowns
+            breakdowns = {
+                'by_document': backdated_result.backdated_by_document if backdated_result.backdated_by_document else [],
+                'by_account': backdated_result.backdated_by_account if backdated_result.backdated_by_account else [],
+                'by_user': backdated_result.backdated_by_user if backdated_result.backdated_by_user else []
+            }
+            
+            # Generate chart data
+            chart_data = self._generate_backdated_chart_data(backdated_result)
+            
+            # Generate summary table
+            summary_table = self._generate_backdated_summary_table(backdated_result)
+            
+            # Generate export data
+            export_data = self._generate_backdated_export_data(backdated_result)
+            
+            # Generate detailed insights
+            detailed_insights = self._generate_backdated_insights(backdated_result)
+            
+            # Generate ML enhancement data
+            ml_enhancement = self._generate_backdated_ml_enhancement(backdated_result)
+            
+            # Generate response in the same pattern as existing endpoint
+            response = {
+                'file_info': {
+                    'id': str(data_file.id),
+                    'file_name': data_file.file_name,
+                    'client_name': data_file.client_name,
+                    'company_name': data_file.company_name,
+                    'fiscal_year': data_file.fiscal_year,
+                    'status': data_file.status,
+                    'total_records': data_file.total_records,
+                    'processed_records': data_file.processed_records,
+                    'failed_records': data_file.failed_records,
+                    'uploaded_at': data_file.uploaded_at.isoformat() if data_file.uploaded_at else None,
+                    'processed_at': data_file.processed_at.isoformat() if data_file.processed_at else None
+                },
+                'analysis_info': analysis_info,
+                'backdated_list': backdated_list,
+                'breakdowns': breakdowns,
+                'chart_data': chart_data,
+                'summary_table': summary_table,
+                'export_data': export_data,
+                'detailed_insights': detailed_insights,
+                'ml_enhancement': ml_enhancement,
+                'audit_recommendations': backdated_result.audit_recommendations if backdated_result.audit_recommendations else {},
+                'compliance_assessment': backdated_result.compliance_assessment if backdated_result.compliance_assessment else {},
+                'financial_statement_impact': backdated_result.financial_statement_impact if backdated_result.financial_statement_impact else {},
+                'processing_info': {
+                    'analytics_id': str(backdated_result.id),
+                    'processing_status': backdated_result.status,
+                    'processing_duration': backdated_result.processing_duration,
+                    'created_at': backdated_result.created_at.isoformat(),
+                    'updated_at': backdated_result.updated_at.isoformat(),
+                    'data_source': 'database'
+                }
+            }
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error generating backdated analysis response: {e}")
+            return {
+                'error': f'Error generating backdated analysis response: {str(e)}',
+                'data_source': 'database'
+            }
+    
+    def _generate_backdated_chart_data(self, backdated_result):
+        """Generate chart data for backdated analysis"""
+        try:
+            charts = {}
+            
+            # Risk distribution chart
+            risk_dist = backdated_result.get_risk_distribution()
+            if risk_dist:
+                charts['risk_distribution'] = {
+                    'labels': ['High Risk', 'Medium Risk', 'Low Risk'],
+                    'data': [
+                        risk_dist.get('high_risk', 0),
+                        risk_dist.get('medium_risk', 0),
+                        risk_dist.get('low_risk', 0)
+                    ],
+                    'backgroundColor': ['#dc3545', '#ffc107', '#28a745'],
+                    'type': 'pie',
+                    'title': 'Backdated Entries Risk Distribution'
+                }
+            
+            # Backdated entries by user chart
+            if backdated_result.backdated_by_user:
+                user_data = backdated_result.backdated_by_user[:10]  # Top 10 users
+                charts['backdated_by_user'] = {
+                    'labels': [user['user_name'] for user in user_data],
+                    'data': [user['transaction_count'] for user in user_data],
+                    'backgroundColor': '#007bff',
+                    'type': 'bar',
+                    'title': 'Backdated Entries by User'
+                }
+            
+            # Backdated entries by account chart
+            if backdated_result.backdated_by_account:
+                account_data = backdated_result.backdated_by_account[:10]  # Top 10 accounts
+                charts['backdated_by_account'] = {
+                    'labels': [f"{account['account']} - {account['account_name']}" for account in account_data],
+                    'data': [account['transaction_count'] for account in account_data],
+                    'backgroundColor': '#6f42c1',
+                    'type': 'bar',
+                    'title': 'Backdated Entries by Account'
+                }
+            
+            # Days difference distribution
+            if backdated_result.backdated_entries:
+                days_diff_data = [entry.get('days_difference', 0) for entry in backdated_result.backdated_entries]
+                if days_diff_data:
+                    charts['days_difference_distribution'] = {
+                        'labels': ['1-7 days', '8-30 days', '31-90 days', '90+ days'],
+                        'data': [
+                            len([d for d in days_diff_data if 1 <= d <= 7]),
+                            len([d for d in days_diff_data if 8 <= d <= 30]),
+                            len([d for d in days_diff_data if 31 <= d <= 90]),
+                            len([d for d in days_diff_data if d > 90])
+                        ],
+                        'backgroundColor': ['#28a745', '#ffc107', '#fd7e14', '#dc3545'],
+                        'type': 'doughnut',
+                        'title': 'Days Difference Distribution'
+                    }
+            
+            # Amount distribution chart
+            if backdated_result.backdated_entries:
+                amounts = [entry.get('amount', 0) for entry in backdated_result.backdated_entries]
+                if amounts:
+                    charts['amount_distribution'] = {
+                        'labels': ['Low Value', 'Medium Value', 'High Value'],
+                        'data': [
+                            len([a for a in amounts if a < 10000]),
+                            len([a for a in amounts if 10000 <= a < 100000]),
+                            len([a for a in amounts if a >= 100000])
+                        ],
+                        'backgroundColor': ['#28a745', '#ffc107', '#dc3545'],
+                        'type': 'pie',
+                        'title': 'Backdated Entries Amount Distribution'
+                    }
+            
+            return charts
+            
+        except Exception as e:
+            logger.error(f"Error generating backdated chart data: {e}")
+            return {}
+    
+    def _generate_backdated_summary_table(self, backdated_result):
+        """Generate summary table for backdated analysis"""
+        try:
+            summary_table = []
+            
+            # Add overall summary
+            summary_table.append({
+                'category': 'Overall Summary',
+                'metric': 'Total Backdated Entries',
+                'value': backdated_result.get_backdated_count(),
+                'description': 'Total number of backdated transactions found'
+            })
+            
+            summary_table.append({
+                'category': 'Overall Summary',
+                'metric': 'Total Amount',
+                'value': f"{backdated_result.get_total_amount():,.2f}",
+                'description': 'Total amount of backdated transactions'
+            })
+            
+            # Add risk summary
+            risk_dist = backdated_result.get_risk_distribution()
+            if risk_dist:
+                summary_table.append({
+                    'category': 'Risk Summary',
+                    'metric': 'High Risk Entries',
+                    'value': risk_dist.get('high_risk', 0),
+                    'description': 'Number of high-risk backdated entries'
+                })
+                
+                summary_table.append({
+                    'category': 'Risk Summary',
+                    'metric': 'Medium Risk Entries',
+                    'value': risk_dist.get('medium_risk', 0),
+                    'description': 'Number of medium-risk backdated entries'
+                })
+                
+                summary_table.append({
+                    'category': 'Risk Summary',
+                    'metric': 'Low Risk Entries',
+                    'value': risk_dist.get('low_risk', 0),
+                    'description': 'Number of low-risk backdated entries'
+                })
+            
+            # Add timing summary
+            if backdated_result.analysis_info:
+                summary_table.append({
+                    'category': 'Timing Summary',
+                    'metric': 'Average Days Difference',
+                    'value': f"{backdated_result.analysis_info.get('avg_days_difference', 0):.1f} days",
+                    'description': 'Average days between posting and effective date'
+                })
+                
+                summary_table.append({
+                    'category': 'Timing Summary',
+                    'metric': 'Maximum Days Difference',
+                    'value': f"{backdated_result.analysis_info.get('max_days_difference', 0)} days",
+                    'description': 'Maximum days between posting and effective date'
+                })
+            
+            return summary_table
+            
+        except Exception as e:
+            logger.error(f"Error generating backdated summary table: {e}")
+            return []
+    
+    def _generate_backdated_export_data(self, backdated_result):
+        """Generate export data for backdated analysis"""
+        try:
+            export_data = []
+            
+            if backdated_result.backdated_entries:
+                for entry in backdated_result.backdated_entries:
+                    export_data.append({
+                        'document_number': entry.get('document_number', ''),
+                        'gl_account': entry.get('gl_account', ''),
+                        'account_name': entry.get('account_name', ''),
+                        'user_name': entry.get('user_name', ''),
+                        'posting_date': entry.get('posting_date', ''),
+                        'effective_date': entry.get('effective_date', ''),
+                        'days_difference': entry.get('days_difference', 0),
+                        'amount': entry.get('amount', 0),
+                        'risk_level': entry.get('risk_level', ''),
+                        'risk_score': entry.get('risk_score', 0),
+                        'risk_factors': entry.get('risk_factors', []),
+                        'recommendations': entry.get('recommendations', [])
+                    })
+            
+            return export_data
+            
+        except Exception as e:
+            logger.error(f"Error generating backdated export data: {e}")
+            return []
+    
+    def _generate_backdated_insights(self, backdated_result):
+        """Generate detailed insights for backdated analysis"""
+        try:
+            insights = {
+                'key_findings': [],
+                'risk_analysis': {},
+                'compliance_issues': [],
+                'audit_implications': [],
+                'recommendations': []
+            }
+            
+            # Key findings
+            total_entries = backdated_result.get_backdated_count()
+            total_amount = backdated_result.get_total_amount()
+            
+            insights['key_findings'].append({
+                'finding': f"Found {total_entries} backdated entries totaling {total_amount:,.2f}",
+                'severity': 'high' if total_entries > 0 else 'low',
+                'description': 'Backdated entries indicate potential compliance issues'
+            })
+            
+            # Risk analysis
+            risk_dist = backdated_result.get_risk_distribution()
+            if risk_dist:
+                high_risk = risk_dist.get('high_risk', 0)
+                insights['risk_analysis'] = {
+                    'overall_risk_level': 'HIGH' if high_risk > 0 else 'MEDIUM' if total_entries > 0 else 'LOW',
+                    'high_risk_entries': high_risk,
+                    'risk_factors': ['Backdated entries', 'Compliance violations', 'Audit concerns']
+                }
+            
+            # Compliance issues
+            if total_entries > 0:
+                insights['compliance_issues'].append({
+                    'issue': 'Backdated journal entries',
+                    'description': 'Journal entries posted after their effective date',
+                    'impact': 'Potential compliance violations and audit findings'
+                })
+            
+            # Audit implications
+            insights['audit_implications'].append({
+                'implication': 'Increased audit risk',
+                'description': 'Backdated entries require additional audit procedures',
+                'recommendation': 'Review all backdated entries for proper authorization'
+            })
+            
+            # Recommendations
+            insights['recommendations'].extend([
+                'Implement controls to prevent backdated entries',
+                'Review and approve all backdated entries',
+                'Document reasons for backdated entries',
+                'Monitor user activity for unusual patterns'
+            ])
+            
+            return insights
+            
+        except Exception as e:
+            logger.error(f"Error generating backdated insights: {e}")
+            return {}
+    
+    def _generate_backdated_ml_enhancement(self, backdated_result):
+        """Generate ML enhancement data for backdated analysis"""
+        try:
+            ml_enhancement = {
+                'ml_features': {},
+                'prediction_confidence': 0.0,
+                'anomaly_scores': [],
+                'model_recommendations': []
+            }
+            
+            # Extract ML features from analysis info
+            if backdated_result.analysis_info:
+                analysis_info = backdated_result.analysis_info
+                
+                ml_enhancement['ml_features'] = {
+                    'total_entries': analysis_info.get('total_backdated_entries', 0),
+                    'avg_days_difference': analysis_info.get('avg_days_difference', 0),
+                    'max_days_difference': analysis_info.get('max_days_difference', 0),
+                    'unique_users': len(backdated_result.backdated_by_user) if backdated_result.backdated_by_user else 0,
+                    'unique_accounts': len(backdated_result.backdated_by_account) if backdated_result.backdated_by_account else 0,
+                    'total_amount': analysis_info.get('total_amount', 0)
+                }
+            
+            # Calculate prediction confidence based on risk distribution
+            risk_dist = backdated_result.get_risk_distribution()
+            if risk_dist:
+                high_risk = risk_dist.get('high_risk', 0)
+                total_entries = backdated_result.get_backdated_count()
+                
+                if total_entries > 0:
+                    ml_enhancement['prediction_confidence'] = min(0.95, (high_risk / total_entries) * 0.8 + 0.15)
+            
+            # Generate anomaly scores for entries
+            if backdated_result.backdated_entries:
+                for entry in backdated_result.backdated_entries:
+                    score = entry.get('risk_score', 0)
+                    ml_enhancement['anomaly_scores'].append({
+                        'document_number': entry.get('document_number', ''),
+                        'anomaly_score': score,
+                        'risk_level': entry.get('risk_level', '')
+                    })
+            
+            # Model recommendations
+            ml_enhancement['model_recommendations'] = [
+                'Use anomaly detection to identify unusual backdating patterns',
+                'Implement real-time monitoring for backdated entries',
+                'Train models on historical backdated entry patterns',
+                'Set up automated alerts for high-risk backdated entries'
+            ]
+            
+            return ml_enhancement
+            
+        except Exception as e:
+            logger.error(f"Error generating backdated ML enhancement: {e}")
+            return {}
 
 
 class DatabaseStoredDuplicateAnalysisView(generics.GenericAPIView):
@@ -14884,11 +16245,14 @@ class DatabaseStoredDuplicateAnalysisView(generics.GenericAPIView):
             analysis_info = trial_balance_data.get('analysis_info', {})
             duplicate_list = trial_balance_data.get('duplicate_list', [])
             breakdowns = trial_balance_data.get('breakdowns', {})
-            chart_data = trial_balance_data.get('chart_data', {})
+            chart_data = duplicate_result.chart_data if duplicate_result.chart_data else {}
             summary_table = trial_balance_data.get('summary_table', [])
             export_data = trial_balance_data.get('export_data', [])
             detailed_insights = trial_balance_data.get('detailed_insights', {})
             ml_enhancement = trial_balance_data.get('ml_enhancement', {})
+            
+            # Check chart data availability
+            chart_data_available = bool(duplicate_result.chart_data)
             
             # Generate response in the same pattern as existing endpoint
             response = {
@@ -14909,6 +16273,7 @@ class DatabaseStoredDuplicateAnalysisView(generics.GenericAPIView):
                 'duplicate_list': duplicate_list,
                 'breakdowns': breakdowns,
                 'chart_data': chart_data,
+                'chart_data_available': chart_data_available,
                 'summary_table': summary_table,
                 'export_data': export_data,
                 'detailed_insights': detailed_insights,
@@ -15104,3 +16469,255 @@ class AnalyticsDatabaseCheckView(generics.GenericAPIView):
             })
         
         return recommendations
+
+
+# BackdatedAnalysisView removed - backdated analysis is now included in main processing flow
+# Use DatabaseStoredComprehensiveAnalyticsView to get backdated analysis results
+
+
+class BackdatedAnalysisDetailView(generics.RetrieveAPIView):
+    """Detailed view for specific backdated analysis results"""
+    
+    def get(self, request, analysis_id):
+        """Get detailed backdated analysis results"""
+        try:
+            from .models import BackdatedAnalysisResult
+            
+            # Get the analysis
+            try:
+                backdated_analysis = BackdatedAnalysisResult.objects.get(id=analysis_id)
+            except BackdatedAnalysisResult.DoesNotExist:
+                return Response({
+                    'error': f'Backdated analysis with id {analysis_id} not found'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            # Get all backdated entries (no limit for detailed view)
+            all_backdated_entries = backdated_analysis.backdated_entries
+            
+            # Apply filters if provided
+            risk_level = request.query_params.get('risk_level')
+            if risk_level:
+                all_backdated_entries = [entry for entry in all_backdated_entries if entry.get('risk_level') == risk_level.upper()]
+            
+            user_name = request.query_params.get('user_name')
+            if user_name:
+                all_backdated_entries = [entry for entry in all_backdated_entries if entry.get('user_name') == user_name]
+            
+            gl_account = request.query_params.get('gl_account')
+            if gl_account:
+                all_backdated_entries = [entry for entry in all_backdated_entries if entry.get('gl_account') == gl_account]
+            
+            # Pagination
+            page = int(request.query_params.get('page', 1))
+            page_size = int(request.query_params.get('page_size', 50))
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            
+            paginated_entries = all_backdated_entries[start_idx:end_idx]
+            
+            return Response({
+                'analysis_id': str(backdated_analysis.id),
+                'file_id': str(backdated_analysis.data_file.id),
+                'file_name': backdated_analysis.data_file.file_name,
+                'analysis_date': backdated_analysis.analysis_date.isoformat(),
+                'analysis_version': backdated_analysis.analysis_version,
+                'status': backdated_analysis.status,
+                'processing_duration': backdated_analysis.processing_duration,
+                'summary': backdated_analysis.analysis_info,
+                'backdated_entries': paginated_entries,
+                'pagination': {
+                    'page': page,
+                    'page_size': page_size,
+                    'total_entries': len(all_backdated_entries),
+                    'total_pages': (len(all_backdated_entries) + page_size - 1) // page_size,
+                    'has_next': end_idx < len(all_backdated_entries),
+                    'has_previous': page > 1
+                },
+                'backdated_by_document': backdated_analysis.backdated_by_document,
+                'backdated_by_account': backdated_analysis.backdated_by_account,
+                'backdated_by_user': backdated_analysis.backdated_by_user,
+                'audit_recommendations': backdated_analysis.audit_recommendations,
+                'compliance_assessment': backdated_analysis.compliance_assessment,
+                'financial_statement_impact': backdated_analysis.financial_statement_impact,
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f"Error getting detailed backdated analysis: {e}")
+            return Response({
+                'error': f'Error getting detailed backdated analysis: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class BackdatedMLTrainingView(generics.GenericAPIView):
+    """API view for training backdated ML models"""
+    
+    def post(self, request):
+        """Start backdated ML model training"""
+        try:
+            # Get training parameters
+            training_parameters = request.data.get('training_parameters', {})
+            session_name = request.data.get('session_name', 'Backdated ML Model Training')
+            description = request.data.get('description', 'Training specialized ML model for backdated entry detection')
+            
+            # Create training session
+            training_session = MLModelTraining.objects.create(
+                session_name=session_name,
+                description=description,
+                model_type='backdated',
+                training_parameters=training_parameters,
+                status='PENDING'
+            )
+            
+            # Start training asynchronously
+            from .tasks import train_backdated_ml_model
+            task = train_backdated_ml_model.delay(str(training_session.id))
+            
+            return Response({
+                'message': 'Backdated ML model training started',
+                'training_session_id': str(training_session.id),
+                'task_id': task.id,
+                'status': 'queued'
+            }, status=status.HTTP_202_ACCEPTED)
+            
+        except Exception as e:
+            logger.error(f"Error starting backdated ML training: {e}")
+            return Response({
+                'error': f'Error starting backdated ML training: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def get(self, request):
+        """Get backdated ML training sessions"""
+        try:
+            # Get training sessions for backdated models
+            training_sessions = MLModelTraining.objects.filter(
+                model_type='backdated'
+            ).order_by('-created_at')
+            
+            # Apply filters
+            status_filter = request.query_params.get('status')
+            if status_filter:
+                training_sessions = training_sessions.filter(status=status_filter.upper())
+            
+            # Pagination
+            page = int(request.query_params.get('page', 1))
+            page_size = int(request.query_params.get('page_size', 20))
+            
+            paginator = Paginator(training_sessions, page_size)
+            page_obj = paginator.get_page(page)
+            
+            sessions_data = []
+            for session in page_obj:
+                sessions_data.append({
+                    'id': str(session.id),
+                    'session_name': session.session_name,
+                    'description': session.description,
+                    'model_type': session.model_type,
+                    'status': session.status,
+                    'training_data_size': session.training_data_size,
+                    'training_duration': session.training_duration,
+                    'performance_metrics': session.performance_metrics,
+                    'created_at': session.created_at.isoformat(),
+                    'started_at': session.started_at.isoformat() if session.started_at else None,
+                    'completed_at': session.completed_at.isoformat() if session.completed_at else None,
+                    'error_message': session.error_message,
+                })
+            
+            return Response({
+                'training_sessions': sessions_data,
+                'pagination': {
+                    'page': page,
+                    'page_size': page_size,
+                    'total_sessions': paginator.count,
+                    'total_pages': paginator.num_pages,
+                    'has_next': page_obj.has_next(),
+                    'has_previous': page_obj.has_previous()
+                }
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f"Error getting backdated ML training sessions: {e}")
+            return Response({
+                'error': f'Error getting backdated ML training sessions: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class BackdatedExportView(generics.GenericAPIView):
+    """API view for exporting backdated analysis results"""
+    
+    def get(self, request, analysis_id):
+        """Export backdated analysis results"""
+        try:
+            from .models import BackdatedAnalysisResult
+            
+            # Get the analysis
+            try:
+                backdated_analysis = BackdatedAnalysisResult.objects.get(id=analysis_id)
+            except BackdatedAnalysisResult.DoesNotExist:
+                return Response({
+                    'error': f'Backdated analysis with id {analysis_id} not found'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            # Get export format
+            export_format = request.query_params.get('format', 'json')
+            
+            if export_format.lower() == 'csv':
+                # Generate CSV export
+                import csv
+                from io import StringIO
+                
+                output = StringIO()
+                writer = csv.writer(output)
+                
+                # Write header
+                writer.writerow([
+                    'Transaction ID', 'Document Number', 'Posting Date', 'Document Date',
+                    'Days Difference', 'Amount', 'Currency', 'User Name', 'GL Account',
+                    'Account Name', 'Risk Score', 'Risk Level', 'Investigation Priority',
+                    'Recommendations'
+                ])
+                
+                # Write data
+                for entry in backdated_analysis.backdated_entries:
+                    writer.writerow([
+                        entry.get('transaction_id', ''),
+                        entry.get('document_number', ''),
+                        entry.get('posting_date', ''),
+                        entry.get('document_date', ''),
+                        entry.get('days_difference', ''),
+                        entry.get('amount', ''),
+                        entry.get('currency', ''),
+                        entry.get('user_name', ''),
+                        entry.get('gl_account', ''),
+                        entry.get('account_name', ''),
+                        entry.get('risk_score', ''),
+                        entry.get('risk_level', ''),
+                        entry.get('investigation_priority', ''),
+                        '; '.join(entry.get('recommendations', []))
+                    ])
+                
+                # Create response
+                response = HttpResponse(output.getvalue(), content_type='text/csv')
+                response['Content-Disposition'] = f'attachment; filename="backdated_analysis_{analysis_id}.csv"'
+                return response
+                
+            else:
+                # Return JSON export
+                return Response({
+                    'analysis_id': str(backdated_analysis.id),
+                    'file_name': backdated_analysis.data_file.file_name,
+                    'analysis_date': backdated_analysis.analysis_date.isoformat(),
+                    'summary': backdated_analysis.analysis_info,
+                    'backdated_entries': backdated_analysis.backdated_entries,
+                    'backdated_by_document': backdated_analysis.backdated_by_document,
+                    'backdated_by_account': backdated_analysis.backdated_by_account,
+                    'backdated_by_user': backdated_analysis.backdated_by_user,
+                    'audit_recommendations': backdated_analysis.audit_recommendations,
+                    'compliance_assessment': backdated_analysis.compliance_assessment,
+                    'financial_statement_impact': backdated_analysis.financial_statement_impact,
+                }, status=status.HTTP_200_OK)
+                
+        except Exception as e:
+            logger.error(f"Error exporting backdated analysis: {e}")
+            return Response({
+                'error': f'Error exporting backdated analysis: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

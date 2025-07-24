@@ -44,6 +44,10 @@ urlpatterns = [
     
     # Database-stored comprehensive analytics (same pattern as existing endpoints)
     path('db-comprehensive-analytics/file/<str:file_id>/', views.DatabaseStoredComprehensiveAnalyticsView.as_view(), name='db-comprehensive-analytics'),
+    path('db-comprehensive-backdated-analysis/file/<str:file_id>/', views.DatabaseStoredBackdatedAnalysisView.as_view(), name='db-comprehensive-backdated-analysis'),
     path('db-comprehensive-duplicate-analysis/file/<str:file_id>/', views.DatabaseStoredDuplicateAnalysisView.as_view(), name='db-comprehensive-duplicate-analysis'),
     path('analytics-db-check/file/<str:file_id>/', views.AnalyticsDatabaseCheckView.as_view(), name='analytics-db-check'),
+    
+    # Backdated analysis is now included in main processing flow
+    # Use DatabaseStoredComprehensiveAnalyticsView to get backdated analysis results
 ] 

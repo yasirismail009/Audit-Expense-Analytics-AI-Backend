@@ -142,35 +142,177 @@ class SpecializedAnomalyDetector:
         return df
     
     def extract_backdated_features(self, transactions: List[SAPGLPosting]) -> pd.DataFrame:
-        """Extract features specific to backdated entry detection"""
+        """Extract enhanced features specific to backdated entry detection"""
         if not transactions:
             return pd.DataFrame()
         
         current_date = datetime.now().date()
         
+        # Calculate user statistics for pattern analysis
+        user_stats = {}
+        account_stats = {}
+        
+        for t in transactions:
+            # User statistics
+            if t.user_name not in user_stats:
+                user_stats[t.user_name] = {
+                    'total_transactions': 0,
+                    'total_amount': 0,
+                    'backdated_count': 0,
+                    'backdated_amount': 0,
+                    'accounts_used': set(),
+                    'avg_days_diff': 0,
+                    'max_days_diff': 0
+                }
+            
+            user_stats[t.user_name]['total_transactions'] += 1
+            user_stats[t.user_name]['total_amount'] += float(t.amount_local_currency)
+            user_stats[t.user_name]['accounts_used'].add(t.gl_account or 'UNKNOWN')
+            
+            # Account statistics
+            if t.gl_account not in account_stats:
+                account_stats[t.gl_account] = {
+                    'total_transactions': 0,
+                    'total_amount': 0,
+                    'backdated_count': 0,
+                    'backdated_amount': 0,
+                    'users': set()
+                }
+            
+            account_stats[t.gl_account]['total_transactions'] += 1
+            account_stats[t.gl_account]['total_amount'] += float(t.amount_local_currency)
+            account_stats[t.gl_account]['users'].add(t.user_name)
+        
+        # Calculate backdated statistics
+        for t in transactions:
+            if t.posting_date and t.document_date and t.posting_date > t.document_date:
+                days_diff = (t.posting_date - t.document_date).days
+                user_stats[t.user_name]['backdated_count'] += 1
+                user_stats[t.user_name]['backdated_amount'] += float(t.amount_local_currency)
+                user_stats[t.user_name]['avg_days_diff'] += days_diff
+                user_stats[t.user_name]['max_days_diff'] = max(user_stats[t.user_name]['max_days_diff'], days_diff)
+                
+                account_stats[t.gl_account]['backdated_count'] += 1
+                account_stats[t.gl_account]['backdated_amount'] += float(t.amount_local_currency)
+        
+        # Calculate averages
+        for user in user_stats:
+            if user_stats[user]['backdated_count'] > 0:
+                user_stats[user]['avg_days_diff'] /= user_stats[user]['backdated_count']
+            user_stats[user]['accounts_count'] = len(user_stats[user]['accounts_used'])
+            user_stats[user]['backdated_rate'] = user_stats[user]['backdated_count'] / user_stats[user]['total_transactions']
+        
+        for account in account_stats:
+            account_stats[account]['users_count'] = len(account_stats[account]['users'])
+            account_stats[account]['backdated_rate'] = account_stats[account]['backdated_count'] / account_stats[account]['total_transactions']
+        
         df = pd.DataFrame([{
+            # Basic transaction features
             'amount': float(t.amount_local_currency),
-            'gl_account': t.gl_account or 'UNKNOWN',
-            'user_name': t.user_name,
+            'amount_log': np.log1p(abs(float(t.amount_local_currency))),
+            'amount_rounded': round(float(t.amount_local_currency), -3),
+            'amount_mod_1000': float(t.amount_local_currency) % 1000,
+            'is_credit': 1 if t.transaction_type == 'CREDIT' else 0,
+            
+            # Date features
             'posting_date': t.posting_date,
             'document_date': t.document_date,
             'entry_date': t.entry_date,
             'days_diff_posting_document': (t.posting_date - t.document_date).days if t.posting_date and t.document_date else 0,
             'days_diff_entry_posting': (t.entry_date - t.posting_date).days if t.entry_date and t.posting_date else 0,
             'days_diff_current_posting': (current_date - t.posting_date).days if t.posting_date else 0,
-            'is_backdated': 1 if t.posting_date and t.document_date and t.posting_date < t.document_date else 0,
-            'is_old_entry': 1 if t.posting_date and (current_date - t.posting_date).days > 30 else 0,
-            'is_very_old_entry': 1 if t.posting_date and (current_date - t.posting_date).days > 90 else 0,
-            'amount_log': np.log1p(abs(float(t.amount_local_currency))),
+            
+            # Backdated indicators
+            'is_backdated': 1 if t.posting_date and t.document_date and t.posting_date > t.document_date else 0,
+            'is_extreme_backdated': 1 if t.posting_date and t.document_date and (t.posting_date - t.document_date).days > 90 else 0,
+            'is_significant_backdated': 1 if t.posting_date and t.document_date and 30 < (t.posting_date - t.document_date).days <= 90 else 0,
+            'is_moderate_backdated': 1 if t.posting_date and t.document_date and 7 < (t.posting_date - t.document_date).days <= 30 else 0,
+            
+            # Temporal features
             'day_of_week': t.posting_date.weekday() if t.posting_date else 0,
             'month': t.posting_date.month if t.posting_date else 1,
             'quarter': ((t.posting_date.month - 1) // 3) + 1 if t.posting_date else 1,
             'is_month_end': 1 if t.posting_date and t.posting_date.day >= 25 else 0,
             'is_quarter_end': 1 if t.posting_date and t.posting_date.month in [3, 6, 9, 12] and t.posting_date.day >= 25 else 0,
             'is_year_end': 1 if t.posting_date and t.posting_date.month == 12 and t.posting_date.day >= 25 else 0,
+            'is_weekend': 1 if t.posting_date and t.posting_date.weekday() >= 5 else 0,
+            
+            # Account features
+            'gl_account': t.gl_account or 'UNKNOWN',
+            'account_first_digit': int(t.gl_account[0]) if t.gl_account and t.gl_account[0].isdigit() else 0,
+            'account_type': self._get_account_type_code(t.gl_account),
+            'is_sensitive_account': 1 if t.gl_account in ['1000', '1100', '1200', '1300', '2000', '2100', '3000', '4000', '5000'] else 0,
+            
+            # User features
+            'user_name': t.user_name,
+            'user_total_transactions': user_stats[t.user_name]['total_transactions'],
+            'user_total_amount': user_stats[t.user_name]['total_amount'],
+            'user_backdated_count': user_stats[t.user_name]['backdated_count'],
+            'user_backdated_amount': user_stats[t.user_name]['backdated_amount'],
+            'user_backdated_rate': user_stats[t.user_name]['backdated_rate'],
+            'user_avg_days_diff': user_stats[t.user_name]['avg_days_diff'],
+            'user_max_days_diff': user_stats[t.user_name]['max_days_diff'],
+            'user_accounts_count': user_stats[t.user_name]['accounts_count'],
+            
+            # Account pattern features
+            'account_total_transactions': account_stats[t.gl_account]['total_transactions'],
+            'account_total_amount': account_stats[t.gl_account]['total_amount'],
+            'account_backdated_count': account_stats[t.gl_account]['backdated_count'],
+            'account_backdated_amount': account_stats[t.gl_account]['backdated_amount'],
+            'account_backdated_rate': account_stats[t.gl_account]['backdated_rate'],
+            'account_users_count': account_stats[t.gl_account]['users_count'],
+            
+            # Document features
+            'document_type': t.document_type or 'UNKNOWN',
+            'is_manual_entry': 1 if t.document_type in ['SA', 'AB'] else 0,
+            'has_text': 1 if t.text and len(t.text.strip()) > 0 else 0,
+            'text_length': len(t.text) if t.text else 0,
+            
+            # Organizational features
+            'profit_center': t.profit_center or 'UNKNOWN',
+            'cost_center': t.cost_center or 'UNKNOWN',
+            'segment': t.segment or 'UNKNOWN',
+            
+            # Amount-based features
+            'is_high_value': 1 if float(t.amount_local_currency) > 1000000 else 0,
+            'is_medium_value': 1 if 100000 < float(t.amount_local_currency) <= 1000000 else 0,
+            'is_low_value': 1 if float(t.amount_local_currency) <= 100000 else 0,
+            
+            # Pattern features
+            'amount_vs_user_avg': float(t.amount_local_currency) / (user_stats[t.user_name]['total_amount'] / user_stats[t.user_name]['total_transactions'] + 1),
+            'amount_vs_account_avg': float(t.amount_local_currency) / (account_stats[t.gl_account]['total_amount'] / account_stats[t.gl_account]['total_transactions'] + 1),
+            
+            # Risk indicators
+            'user_risk_indicator': user_stats[t.user_name]['backdated_rate'] * 100,
+            'account_risk_indicator': account_stats[t.gl_account]['backdated_rate'] * 100,
+            'timing_risk_indicator': 1 if t.posting_date and t.posting_date.day >= 25 else 0,
+            'amount_risk_indicator': 1 if float(t.amount_local_currency) > 100000 else 0,
+            
         } for t in transactions])
         
         return df
+    
+    def _get_account_type_code(self, account_id):
+        """Get account type code for ML features"""
+        if not account_id:
+            return 0
+        
+        try:
+            account_num = int(account_id)
+            if 1000 <= account_num <= 1999:
+                return 1  # Asset
+            elif 2000 <= account_num <= 2999:
+                return 2  # Liability
+            elif 3000 <= account_num <= 3999:
+                return 3  # Equity
+            elif 4000 <= account_num <= 4999:
+                return 4  # Revenue
+            elif 5000 <= account_num <= 5999:
+                return 5  # Expense
+            else:
+                return 0  # Other
+        except:
+            return 0
     
     def extract_user_anomaly_features(self, transactions: List[SAPGLPosting]) -> pd.DataFrame:
         """Extract features specific to user anomaly detection"""

@@ -7,7 +7,7 @@ from django.utils import timezone
 import logging
 from calendar import monthrange
 import holidays
-
+from django.db import models
 from .models import SAPGLPosting, AnalysisSession, TransactionAnalysis, SystemMetrics
 
 logger = logging.getLogger(__name__)
@@ -579,33 +579,542 @@ class SAPGLAnalyzer:
         return user_anomalies
     
     def detect_backdated_entries(self, transactions):
-        """Detect backdated entries (posting date after document date)"""
+        """Enhanced detection of backdated entries (posting date after document date) with comprehensive analysis"""
         if not transactions:
             return []
         
         backdated = []
+        backdated_by_document = {}
+        backdated_by_account = {}
+        backdated_by_user = {}
+        
+        current_date = datetime.now().date()
         
         for t in transactions:
             if t.posting_date and t.document_date:
                 if t.posting_date > t.document_date:
                     days_diff = (t.posting_date - t.document_date).days
-                    risk_score = min(days_diff * 2, 100)
                     
-                    backdated.append({
+                    # Enhanced risk scoring based on multiple factors
+                    risk_score = self._calculate_backdated_risk_score(t, days_diff, current_date)
+                    
+                    # Generate recommendations based on risk factors
+                    recommendations = self._generate_backdated_recommendations(t, days_diff, risk_score)
+                    
+                    # Create detailed backdated entry record
+                    backdated_entry = {
                         'type': 'Backdated Entry',
                         'transaction_id': str(t.id),
                         'document_number': t.document_number,
                         'posting_date': t.posting_date.isoformat(),
                         'document_date': t.document_date.isoformat(),
+                        'entry_date': t.entry_date.isoformat() if t.entry_date else None,
                         'days_difference': days_diff,
                         'amount': float(t.amount_local_currency),
+                        'currency': t.local_currency,
                         'user_name': t.user_name,
                         'gl_account': t.gl_account,
+                        'account_name': self._get_account_name(t.gl_account),
+                        'profit_center': t.profit_center,
+                        'cost_center': t.cost_center,
+                        'document_type': t.document_type,
+                        'text': t.text,
                         'risk_score': risk_score,
-                        'risk_factors': [f'Posted {days_diff} days after document date']
-                    })
+                        'risk_level': self.determine_risk_level(risk_score),
+                        'risk_factors': self._identify_backdated_risk_factors(t, days_diff),
+                        'recommendations': recommendations,
+                        'audit_implications': self._get_audit_implications(t, days_diff),
+                        'compliance_issues': self._identify_compliance_issues(t, days_diff),
+                        'financial_statement_impact': self._assess_fs_impact(t),
+                        'investigation_priority': 'HIGH' if risk_score > 70 else 'MEDIUM' if risk_score > 40 else 'LOW'
+                    }
+                    
+                    backdated.append(backdated_entry)
+                    
+                    # Group by document number for FS line analysis
+                    if t.document_number not in backdated_by_document:
+                        backdated_by_document[t.document_number] = {
+                            'document_number': t.document_number,
+                            'total_amount': 0,
+                            'transaction_count': 0,
+                            'users': set(),
+                            'accounts': set(),
+                            'posting_dates': [],
+                            'document_date': t.document_date.isoformat(),
+                            'max_days_diff': 0,
+                            'risk_score': 0
+                        }
+                    
+                    doc_group = backdated_by_document[t.document_number]
+                    doc_group['total_amount'] += float(t.amount_local_currency)
+                    doc_group['transaction_count'] += 1
+                    doc_group['users'].add(t.user_name)
+                    doc_group['accounts'].add(t.gl_account)
+                    doc_group['posting_dates'].append(t.posting_date.isoformat())
+                    doc_group['max_days_diff'] = max(doc_group['max_days_diff'], days_diff)
+                    doc_group['risk_score'] = max(doc_group['risk_score'], risk_score)
+                    
+                    # Group by account
+                    if t.gl_account not in backdated_by_account:
+                        backdated_by_account[t.gl_account] = {
+                            'account': t.gl_account,
+                            'account_name': self._get_account_name(t.gl_account),
+                            'total_amount': 0,
+                            'transaction_count': 0,
+                            'users': set(),
+                            'documents': set(),
+                            'avg_days_diff': 0,
+                            'max_days_diff': 0,
+                            'risk_score': 0
+                        }
+                    
+                    acc_group = backdated_by_account[t.gl_account]
+                    acc_group['total_amount'] += float(t.amount_local_currency)
+                    acc_group['transaction_count'] += 1
+                    acc_group['users'].add(t.user_name)
+                    acc_group['documents'].add(t.document_number)
+                    acc_group['max_days_diff'] = max(acc_group['max_days_diff'], days_diff)
+                    acc_group['risk_score'] = max(acc_group['risk_score'], risk_score)
+                    
+                    # Group by user
+                    if t.user_name not in backdated_by_user:
+                        backdated_by_user[t.user_name] = {
+                            'user_name': t.user_name,
+                            'total_amount': 0,
+                            'transaction_count': 0,
+                            'accounts': set(),
+                            'documents': set(),
+                            'avg_days_diff': 0,
+                            'max_days_diff': 0,
+                            'risk_score': 0,
+                            'pattern_analysis': {}
+                        }
+                    
+                    user_group = backdated_by_user[t.user_name]
+                    user_group['total_amount'] += float(t.amount_local_currency)
+                    user_group['transaction_count'] += 1
+                    user_group['accounts'].add(t.gl_account)
+                    user_group['documents'].add(t.document_number)
+                    user_group['max_days_diff'] = max(user_group['max_days_diff'], days_diff)
+                    user_group['risk_score'] = max(user_group['risk_score'], risk_score)
         
-        return backdated
+        # Calculate averages and convert sets to lists
+        for doc_group in backdated_by_document.values():
+            doc_group['users'] = list(doc_group['users'])
+            doc_group['accounts'] = list(doc_group['accounts'])
+            doc_group['avg_days_diff'] = sum([(datetime.fromisoformat(d) - datetime.fromisoformat(doc_group['document_date'])).days for d in doc_group['posting_dates']]) / len(doc_group['posting_dates'])
+        
+        for acc_group in backdated_by_account.values():
+            acc_group['users'] = list(acc_group['users'])
+            acc_group['documents'] = list(acc_group['documents'])
+            # Calculate average days difference for this account
+            account_transactions = [b for b in backdated if b['gl_account'] == acc_group['account']]
+            if account_transactions:
+                acc_group['avg_days_diff'] = sum(b['days_difference'] for b in account_transactions) / len(account_transactions)
+        
+        for user_group in backdated_by_user.values():
+            user_group['accounts'] = list(user_group['accounts'])
+            user_group['documents'] = list(user_group['documents'])
+            # Calculate average days difference for this user
+            user_transactions = [b for b in backdated if b['user_name'] == user_group['user_name']]
+            if user_transactions:
+                user_group['avg_days_diff'] = sum(b['days_difference'] for b in user_transactions) / len(user_transactions)
+                # Analyze user patterns
+                user_group['pattern_analysis'] = self._analyze_user_backdated_patterns(user_transactions)
+        
+        # Create comprehensive backdated analysis result
+        backdated_analysis = {
+            'summary': {
+                'total_backdated_entries': len(backdated),
+                'total_amount': sum(b['amount'] for b in backdated),
+                'unique_documents': len(backdated_by_document),
+                'unique_accounts': len(backdated_by_account),
+                'unique_users': len(backdated_by_user),
+                'avg_days_difference': sum(b['days_difference'] for b in backdated) / len(backdated) if backdated else 0,
+                'max_days_difference': max(b['days_difference'] for b in backdated) if backdated else 0,
+                'high_risk_entries': len([b for b in backdated if b['risk_score'] > 70]),
+                'medium_risk_entries': len([b for b in backdated if 40 < b['risk_score'] <= 70]),
+                'low_risk_entries': len([b for b in backdated if b['risk_score'] <= 40])
+            },
+            'backdated_entries': backdated,
+            'backdated_by_document': list(backdated_by_document.values()),
+            'backdated_by_account': list(backdated_by_account.values()),
+            'backdated_by_user': list(backdated_by_user.values()),
+            'audit_recommendations': self._generate_audit_recommendations(backdated, list(backdated_by_document.values()), list(backdated_by_account.values()), list(backdated_by_user.values())),
+            'compliance_assessment': self._assess_compliance_risks(backdated),
+            'financial_statement_impact': self._assess_overall_fs_impact(list(backdated_by_document.values()), list(backdated_by_account.values()))
+        }
+        
+        return backdated_analysis
+    
+    def _calculate_backdated_risk_score(self, transaction, days_diff, current_date):
+        """Calculate comprehensive risk score for backdated entry"""
+        risk_score = 0
+        
+        # Base risk from days difference
+        if days_diff <= 7:
+            risk_score += 20
+        elif days_diff <= 30:
+            risk_score += 40
+        elif days_diff <= 90:
+            risk_score += 60
+        else:
+            risk_score += 80
+        
+        # Amount-based risk
+        amount = float(transaction.amount_local_currency)
+        if amount > 1000000:  # High value
+            risk_score += 30
+        elif amount > 100000:  # Medium value
+            risk_score += 20
+        elif amount > 10000:  # Low-medium value
+            risk_score += 10
+        
+        # User pattern risk
+        if transaction.user_name:
+            # Check if user has history of backdated entries
+            user_backdated_count = SAPGLPosting.objects.filter(
+                user_name=transaction.user_name,
+                posting_date__gt=models.F('document_date'),
+                document_date__isnull=False
+            ).count()
+            if user_backdated_count > 10:
+                risk_score += 25
+            elif user_backdated_count > 5:
+                risk_score += 15
+            elif user_backdated_count > 1:
+                risk_score += 10
+        
+        # Account risk (sensitive accounts)
+        sensitive_accounts = ['1000', '1100', '1200', '1300', '2000', '2100', '3000', '4000', '5000']
+        if transaction.gl_account in sensitive_accounts:
+            risk_score += 20
+        
+        # Timing risk (month-end, quarter-end, year-end)
+        if transaction.posting_date:
+            if transaction.posting_date.day >= 25:  # Month-end
+                risk_score += 15
+            if transaction.posting_date.month in [3, 6, 9, 12] and transaction.posting_date.day >= 25:  # Quarter-end
+                risk_score += 20
+            if transaction.posting_date.month == 12 and transaction.posting_date.day >= 25:  # Year-end
+                risk_score += 25
+        
+        # Document type risk
+        if transaction.document_type in ['SA', 'AB']:  # Manual entries
+            risk_score += 15
+        
+        return min(risk_score, 100)  # Cap at 100
+    
+    def _identify_backdated_risk_factors(self, transaction, days_diff):
+        """Identify specific risk factors for backdated entry"""
+        risk_factors = []
+        
+        if days_diff > 90:
+            risk_factors.append(f'Extreme backdating: {days_diff} days after document date')
+        elif days_diff > 30:
+            risk_factors.append(f'Significant backdating: {days_diff} days after document date')
+        elif days_diff > 7:
+            risk_factors.append(f'Moderate backdating: {days_diff} days after document date')
+        else:
+            risk_factors.append(f'Minor backdating: {days_diff} days after document date')
+        
+        amount = float(transaction.amount_local_currency)
+        if amount > 1000000:
+            risk_factors.append('High-value transaction')
+        elif amount > 100000:
+            risk_factors.append('Medium-value transaction')
+        
+        if transaction.posting_date and transaction.posting_date.day >= 25:
+            risk_factors.append('Month-end posting')
+        
+        if transaction.document_type in ['SA', 'AB']:
+            risk_factors.append('Manual journal entry')
+        
+        return risk_factors
+    
+    def _generate_backdated_recommendations(self, transaction, days_diff, risk_score):
+        """Generate specific recommendations for backdated entry"""
+        recommendations = []
+        
+        if days_diff > 90:
+            recommendations.extend([
+                'Immediate investigation required',
+                'Review supporting documentation thoroughly',
+                'Verify business justification for extreme backdating',
+                'Check for related transactions or patterns',
+                'Consider materiality impact on financial statements'
+            ])
+        elif days_diff > 30:
+            recommendations.extend([
+                'Detailed investigation recommended',
+                'Obtain management explanation for backdating',
+                'Review approval process and controls',
+                'Assess impact on period-end cut-off procedures'
+            ])
+        elif days_diff > 7:
+            recommendations.extend([
+                'Standard review procedures',
+                'Verify business justification',
+                'Check approval documentation'
+            ])
+        else:
+            recommendations.extend([
+                'Routine review',
+                'Verify posting accuracy'
+            ])
+        
+        if risk_score > 70:
+            recommendations.extend([
+                'High priority for audit testing',
+                'Consider expanding audit scope',
+                'Review related internal controls'
+            ])
+        
+        return recommendations
+    
+    def _get_audit_implications(self, transaction, days_diff):
+        """Assess audit implications of backdated entry"""
+        implications = []
+        
+        if days_diff > 30:
+            implications.extend([
+                'Potential cut-off misstatement',
+                'Risk of period-end manipulation',
+                'Internal control weakness indicator',
+                'May require extended audit procedures'
+            ])
+        elif days_diff > 7:
+            implications.extend([
+                'Cut-off testing required',
+                'Verify proper period recognition',
+                'Check approval controls'
+            ])
+        
+        if float(transaction.amount_local_currency) > 100000:
+            implications.append('Material amount - detailed testing required')
+        
+        return implications
+    
+    def _identify_compliance_issues(self, transaction, days_diff):
+        """Identify potential compliance issues"""
+        issues = []
+        
+        if days_diff > 90:
+            issues.extend([
+                'Potential violation of timely posting requirements',
+                'Risk of financial reporting non-compliance',
+                'May violate internal control policies'
+            ])
+        elif days_diff > 30:
+            issues.extend([
+                'Timely posting policy violation',
+                'Internal control policy concern'
+            ])
+        
+        return issues
+    
+    def _assess_fs_impact(self, transaction):
+        """Assess financial statement impact"""
+        impact = {
+            'account_type': self._get_account_type(transaction.gl_account),
+            'materiality': 'Material' if float(transaction.amount_local_currency) > 100000 else 'Immaterial',
+            'period_impact': 'Current period' if transaction.posting_date else 'Unknown',
+            'classification': self._get_account_classification(transaction.gl_account)
+        }
+        return impact
+    
+    def _analyze_user_backdated_patterns(self, user_transactions):
+        """Analyze backdated patterns for a specific user"""
+        if not user_transactions:
+            return {}
+        
+        patterns = {
+            'frequency': len(user_transactions),
+            'avg_days_diff': sum(t['days_difference'] for t in user_transactions) / len(user_transactions),
+            'max_days_diff': max(t['days_difference'] for t in user_transactions),
+            'total_amount': sum(t['amount'] for t in user_transactions),
+            'accounts_used': list(set(t['gl_account'] for t in user_transactions)),
+            'document_types': list(set(t.get('document_type', 'Unknown') for t in user_transactions)),
+            'timing_pattern': self._analyze_timing_pattern(user_transactions),
+            'amount_pattern': self._analyze_amount_pattern(user_transactions)
+        }
+        return patterns
+    
+    def _analyze_timing_pattern(self, transactions):
+        """Analyze timing patterns in backdated transactions"""
+        posting_dates = [datetime.fromisoformat(t['posting_date']) for t in transactions]
+        document_dates = [datetime.fromisoformat(t['document_date']) for t in transactions]
+        
+        return {
+            'month_end_postings': len([d for d in posting_dates if d.day >= 25]),
+            'quarter_end_postings': len([d for d in posting_dates if d.month in [3, 6, 9, 12] and d.day >= 25]),
+            'year_end_postings': len([d for d in posting_dates if d.month == 12 and d.day >= 25]),
+            'weekend_postings': len([d for d in posting_dates if d.weekday() >= 5])
+        }
+    
+    def _analyze_amount_pattern(self, transactions):
+        """Analyze amount patterns in backdated transactions"""
+        amounts = [t['amount'] for t in transactions]
+        
+        return {
+            'total_amount': sum(amounts),
+            'avg_amount': sum(amounts) / len(amounts),
+            'max_amount': max(amounts),
+            'min_amount': min(amounts),
+            'round_amounts': len([a for a in amounts if a % 1000 == 0]),
+            'high_value_count': len([a for a in amounts if a > 100000])
+        }
+    
+    def _generate_audit_recommendations(self, backdated_entries, by_document, by_account, by_user):
+        """Generate comprehensive audit recommendations"""
+        recommendations = {
+            'high_priority': [],
+            'medium_priority': [],
+            'low_priority': [],
+            'general_recommendations': []
+        }
+        
+        # High priority recommendations
+        high_risk_entries = [b for b in backdated_entries if b['risk_score'] > 70]
+        if high_risk_entries:
+            recommendations['high_priority'].extend([
+                f'Investigate {len(high_risk_entries)} high-risk backdated entries immediately',
+                'Review internal controls over journal entry posting',
+                'Assess management override of controls',
+                'Consider expanding audit scope for related periods'
+            ])
+        
+        # Medium priority recommendations
+        medium_risk_entries = [b for b in backdated_entries if 40 < b['risk_score'] <= 70]
+        if medium_risk_entries:
+            recommendations['medium_priority'].extend([
+                f'Review {len(medium_risk_entries)} medium-risk backdated entries',
+                'Test cut-off procedures for affected periods',
+                'Verify business justification for backdating'
+            ])
+        
+        # Account-specific recommendations
+        high_risk_accounts = [a for a in by_account if a['risk_score'] > 60]
+        if high_risk_accounts:
+            recommendations['high_priority'].append(
+                f'Focus testing on {len(high_risk_accounts)} high-risk accounts with backdated entries'
+            )
+        
+        # User-specific recommendations
+        high_risk_users = [u for u in by_user if u['risk_score'] > 60]
+        if high_risk_users:
+            recommendations['high_priority'].append(
+                f'Investigate {len(high_risk_users)} users with high-risk backdated entry patterns'
+            )
+        
+        # General recommendations
+        recommendations['general_recommendations'] = [
+            'Implement stronger controls over journal entry posting',
+            'Establish clear policies for backdated entries',
+            'Require additional approval for entries posted more than 7 days after document date',
+            'Regular monitoring of backdated entry patterns',
+            'Training for users on proper posting procedures'
+        ]
+        
+        return recommendations
+    
+    def _assess_compliance_risks(self, backdated_entries):
+        """Assess overall compliance risks"""
+        compliance_risks = {
+            'high_risk': 0,
+            'medium_risk': 0,
+            'low_risk': 0,
+            'total_entries': len(backdated_entries),
+            'compliance_issues': []
+        }
+        
+        for entry in backdated_entries:
+            if entry['risk_score'] > 70:
+                compliance_risks['high_risk'] += 1
+            elif entry['risk_score'] > 40:
+                compliance_risks['medium_risk'] += 1
+            else:
+                compliance_risks['low_risk'] += 1
+        
+        if compliance_risks['high_risk'] > 0:
+            compliance_risks['compliance_issues'].append(
+                f'{compliance_risks["high_risk"]} high-risk entries may violate timely posting requirements'
+            )
+        
+        if compliance_risks['total_entries'] > 50:
+            compliance_risks['compliance_issues'].append(
+                'High volume of backdated entries indicates potential control weaknesses'
+            )
+        
+        return compliance_risks
+    
+    def _assess_overall_fs_impact(self, by_document, by_account):
+        """Assess overall financial statement impact"""
+        total_amount = sum(doc['total_amount'] for doc in by_document)
+        total_entries = sum(doc['transaction_count'] for doc in by_document)
+        
+        return {
+            'total_impact_amount': total_amount,
+            'total_impact_entries': total_entries,
+            'avg_amount_per_entry': total_amount / total_entries if total_entries > 0 else 0,
+            'materiality_assessment': 'Material' if total_amount > 1000000 else 'Immaterial',
+            'affected_accounts': len(by_account),
+            'affected_documents': len(by_document)
+        }
+    
+    def _get_account_name(self, account_id):
+        """Get account name from GL Account reference"""
+        try:
+            from .models import GLAccount
+            account = GLAccount.objects.filter(account_id=account_id).first()
+            return account.account_name if account else f'Account {account_id}'
+        except:
+            return f'Account {account_id}'
+    
+    def _get_account_type(self, account_id):
+        """Get account type classification"""
+        if not account_id:
+            return 'Unknown'
+        
+        # Simple classification based on account number ranges
+        account_num = int(account_id) if account_id.isdigit() else 0
+        
+        if 1000 <= account_num <= 1999:
+            return 'Asset'
+        elif 2000 <= account_num <= 2999:
+            return 'Liability'
+        elif 3000 <= account_num <= 3999:
+            return 'Equity'
+        elif 4000 <= account_num <= 4999:
+            return 'Revenue'
+        elif 5000 <= account_num <= 5999:
+            return 'Expense'
+        else:
+            return 'Other'
+    
+    def _get_account_classification(self, account_id):
+        """Get detailed account classification"""
+        if not account_id:
+            return 'Unknown'
+        
+        account_num = int(account_id) if account_id.isdigit() else 0
+        
+        if 1000 <= account_num <= 1099:
+            return 'Current Assets'
+        elif 1100 <= account_num <= 1199:
+            return 'Fixed Assets'
+        elif 2000 <= account_num <= 2099:
+            return 'Current Liabilities'
+        elif 2100 <= account_num <= 2199:
+            return 'Long-term Liabilities'
+        elif 3000 <= account_num <= 3999:
+            return 'Equity'
+        elif 4000 <= account_num <= 4999:
+            return 'Revenue'
+        elif 5000 <= account_num <= 5999:
+            return 'Expense'
+        else:
+            return 'Other'
     
     def detect_closing_entries(self, transactions):
         """Detect month-end closing entries"""
