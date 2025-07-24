@@ -2970,3 +2970,82 @@ INFO 2025-07-24 17:29:27,820 basehttp 6700 30644 "GET /api/db-comprehensive-dupl
 INFO 2025-07-24 17:29:32,988 basehttp 6700 30644 "GET /api/db-comprehensive-backdated-analysis/file/63caf694-d448-42a5-aa75-ae072e39428a/ HTTP/1.1" 200 4181
 INFO 2025-07-24 17:29:40,276 basehttp 6700 30644 "GET /api/all-files/ HTTP/1.1" 200 66374
 INFO 2025-07-24 17:29:41,479 basehttp 6700 8112 "GET /api/all-files/ HTTP/1.1" 200 66374
+INFO 2025-07-24 17:41:54,876 autoreload 23772 26008 Watching for file changes with StatReloader
+INFO 2025-07-24 17:41:59,901 basehttp 23772 12040 "GET /api/all-files/ HTTP/1.1" 200 389
+INFO 2025-07-24 17:41:59,958 basehttp 23772 12040 "GET /api/all-files/ HTTP/1.1" 200 389
+INFO 2025-07-24 17:42:26,507 views 23772 12040 Starting NON-BLOCKING Celery task for job 142b7c14-5554-431a-88a3-0a47f36a4fb2
+INFO 2025-07-24 17:42:26,510 views 23772 12040 Job 142b7c14-5554-431a-88a3-0a47f36a4fb2 saved to queue for processing
+INFO 2025-07-24 17:42:26,510 views 23772 12040 Job 142b7c14-5554-431a-88a3-0a47f36a4fb2 saved to queue for processing
+INFO 2025-07-24 17:42:26,522 basehttp 23772 12040 "POST /api/targeted-anomaly-upload/ HTTP/1.1" 202 1248
+INFO 2025-07-24 17:42:28,238 basehttp 23772 12040 "GET /api/all-files/ HTTP/1.1" 200 1409
+INFO 2025-07-24 17:42:38,717 tasks 13516 25860 Found 1 queued jobs to process
+INFO 2025-07-24 17:42:38,719 tasks 13516 25860 Processing queued job 142b7c14-5554-431a-88a3-0a47f36a4fb2
+INFO 2025-07-24 17:42:38,738 analytics_db_saver 13516 25860 Created new job tracker for job 142b7c14-5554-431a-88a3-0a47f36a4fb2
+INFO 2025-07-24 17:42:38,738 tasks 13516 25860 [TASK:_process_file_content] [JOB:142b7c14-5554-431a-88a3-0a47f36a4fb2] STATE: STARTED | DETAILS: Getting transactions from database...
+INFO 2025-07-24 17:42:38,739 tasks 13516 25860 [TASK:_process_file_content] [JOB:142b7c14-5554-431a-88a3-0a47f36a4fb2] STATE: GETTING_TRANSACTIONS | DETAILS: Getting transactions from database...
+INFO 2025-07-24 17:42:38,752 tasks 13516 25860 [TASK:_process_file_content] [JOB:142b7c14-5554-431a-88a3-0a47f36a4fb2] STATE: UPDATING_DATA_FILE | DETAILS: Updating DataFile record...
+INFO 2025-07-24 17:42:38,755 tasks 13516 25860 [TASK:_process_file_content] [JOB:142b7c14-5554-431a-88a3-0a47f36a4fb2] STATE: COMPLETED | DETAILS: Returning success result with 63 transactions from database
+INFO 2025-07-24 17:42:38,755 tasks 13516 25860 Using 63 transactions from processing result
+INFO 2025-07-24 17:42:38,756 tasks 13516 25860 [TASK:_auto_train_ml_models] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: STARTED | DETAILS: Auto-training ML models with stored data...
+INFO 2025-07-24 17:42:38,756 tasks 13516 25860 [TASK:_auto_train_ml_models] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: CHECKING_DATA_SUFFICIENCY | DETAILS: Checking if 63 stored transactions are sufficient...
+INFO 2025-07-24 17:42:38,786 ml_models 13516 25860 Duplicate detection model initialized successfully
+INFO 2025-07-24 17:42:38,789 tasks 13516 25860 [TASK:_run_default_analytics] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: STARTED | DETAILS: Running default analytics...
+INFO 2025-07-24 17:42:38,789 tasks 13516 25860 [TASK:_run_default_analytics] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: CALCULATING_STATISTICS | DETAILS: Calculating basic statistics...
+INFO 2025-07-24 17:42:38,794 analytics_db_saver 13516 25860 Updated progress for Default Analytics: 20% - PROCESSING
+INFO 2025-07-24 17:42:38,801 analytics_db_saver 13516 25860 Updated progress for Default Analytics: 100% - COMPLETED
+INFO 2025-07-24 17:42:38,801 analytics_db_saver 13516 25860 Saved default analytics for file Data For DA.csv
+ERROR 2025-07-24 17:42:39,026 analytics 13516 25860 Error in analysis: string indices must be integers, not 'str'
+INFO 2025-07-24 17:42:39,031 analytics_db_saver 13516 25860 Updated progress for Comprehensive Analytics: 40% - PROCESSING
+INFO 2025-07-24 17:42:39,038 analytics_db_saver 13516 25860 Updated progress for Comprehensive Analytics: 100% - COMPLETED
+INFO 2025-07-24 17:42:39,039 analytics_db_saver 13516 25860 Saved comprehensive analytics for file Data For DA.csv
+INFO 2025-07-24 17:42:39,039 tasks 13516 25860 [TASK:_run_requested_anomalies] [JOB:unknown] STATE: STARTED | DETAILS: Running requested anomalies...
+INFO 2025-07-24 17:42:39,040 tasks 13516 25860 [TASK:_run_requested_anomalies] [JOB:unknown] STATE: CREATING_ANALYZER | DETAILS: Creating SAPGLAnalyzer...
+INFO 2025-07-24 17:42:39,092 analytics_db_saver 13516 25860 Updated progress for Anomaly Detection: 90% - PROCESSING
+INFO 2025-07-24 17:42:39,098 analytics_db_saver 13516 25860 Updated progress for Anomaly Detection: 100% - COMPLETED
+INFO 2025-07-24 17:42:39,098 analytics_db_saver 13516 25860 Saved anomaly detection results for file Data For DA.csv
+INFO 2025-07-24 17:42:39,098 tasks 13516 25860 [TASK:_run_duplicate_analysis] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: STARTED | DETAILS: Running enhanced duplicate analysis...
+INFO 2025-07-24 17:42:39,098 tasks 13516 25860 [TASK:_run_duplicate_analysis] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: RUNNING_ENHANCED_ANALYSIS | DETAILS: Running enhanced duplicate analysis...
+INFO 2025-07-24 17:42:39,150 tasks 13516 25860 [TASK:_run_duplicate_analysis] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: ENHANCED_COMPLETED | DETAILS: Enhanced duplicate analysis completed with 4 duplicates
+INFO 2025-07-24 17:42:39,151 ml_models 13516 25860 Duplicate detection model initialized successfully
+INFO 2025-07-24 17:42:39,151 tasks 13516 25860 [TASK:_run_duplicate_analysis] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: ENHANCING_WITH_ML | DETAILS: Enhancing results with ML model...
+INFO 2025-07-24 17:42:39,152 tasks 13516 25860 [TASK:_run_duplicate_analysis] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: COMPLETED | DETAILS: Enhanced duplicate analysis with ML enhancement completed
+INFO 2025-07-24 17:42:39,154 analytics_db_saver 13516 25860 Updated progress for Duplicate Analysis: 60% - PROCESSING
+INFO 2025-07-24 17:42:39,161 analytics_db_saver 13516 25860 Updated progress for Duplicate Analysis: 100% - COMPLETED
+INFO 2025-07-24 17:42:39,161 analytics_db_saver 13516 25860 Saved duplicate analysis for file Data For DA.csv
+INFO 2025-07-24 17:42:39,161 tasks 13516 25860 [TASK:_run_backdated_analysis] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: STARTED | DETAILS: Running enhanced backdated analysis...
+INFO 2025-07-24 17:42:39,162 tasks 13516 25860 [TASK:_run_backdated_analysis] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: RUNNING_BACKDATED_ANALYSIS | DETAILS: Running enhanced backdated analysis...
+INFO 2025-07-24 17:42:39,167 tasks 13516 25860 [TASK:_run_backdated_analysis] [JOB:0f5feda2-9342-4c98-a35b-6cb1db63798a] STATE: BACKDATED_COMPLETED | DETAILS: Backdated analysis completed with 3 backdated entries
+INFO 2025-07-24 17:42:39,170 analytics_db_saver 13516 25860 Updated progress for Backdated Analysis: 70% - PROCESSING
+INFO 2025-07-24 17:42:39,180 analytics_db_saver 13516 25860 Updated progress for Backdated Analysis: 100% - COMPLETED
+INFO 2025-07-24 17:42:39,180 analytics_db_saver 13516 25860 Saved backdated analysis for file Data For DA.csv
+INFO 2025-07-24 17:42:39,183 analytics_db_saver 13516 25860 Updated progress for ML Processing: 80% - PROCESSING
+INFO 2025-07-24 17:42:39,190 analytics_db_saver 13516 25860 Updated progress for ML Processing: 100% - COMPLETED
+INFO 2025-07-24 17:42:39,191 analytics_db_saver 13516 25860 Saved ML processing results for file Data For DA.csv
+INFO 2025-07-24 17:42:39,192 analytics_db_saver 13516 25860 Processing completed successfully for job 142b7c14-5554-431a-88a3-0a47f36a4fb2
+INFO 2025-07-24 17:42:39,198 tasks 13516 25860 Queued job 142b7c14-5554-431a-88a3-0a47f36a4fb2 completed successfully
+INFO 2025-07-24 17:42:42,026 basehttp 23772 12040 "GET /api/db-comprehensive-analytics/file/0f5feda2-9342-4c98-a35b-6cb1db63798a HTTP/1.1" 301 0
+ERROR 2025-07-24 17:42:42,090 views 23772 15076 Error generating backdated risk charts: 'high_risk_count'
+INFO 2025-07-24 17:42:42,098 basehttp 23772 15076 "GET /api/db-comprehensive-analytics/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 23953
+ERROR 2025-07-24 17:42:42,158 views 23772 3980 Error generating backdated risk charts: 'high_risk_count'
+INFO 2025-07-24 17:42:42,169 basehttp 23772 3980 "GET /api/db-comprehensive-analytics/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 23953
+INFO 2025-07-24 17:42:49,552 basehttp 23772 3980 "GET /api/db-comprehensive-duplicate-analysis/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 10133
+INFO 2025-07-24 17:49:58,035 basehttp 23772 8876 "GET /api/all-files/ HTTP/1.1" 200 31659
+INFO 2025-07-24 17:49:58,107 basehttp 23772 8876 "GET /api/all-files/ HTTP/1.1" 200 31659
+ERROR 2025-07-24 17:51:04,629 views 23772 8876 Error generating backdated risk charts: 'high_risk_count'
+INFO 2025-07-24 17:51:04,653 basehttp 23772 8876 "GET /api/db-comprehensive-analytics/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 23953
+ERROR 2025-07-24 17:51:04,753 views 23772 8876 Error generating backdated risk charts: 'high_risk_count'
+INFO 2025-07-24 17:51:04,780 basehttp 23772 8876 "GET /api/db-comprehensive-analytics/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 23953
+INFO 2025-07-24 17:51:27,445 basehttp 23772 8876 "GET /api/db-comprehensive-duplicate-analysis/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 10133
+ERROR 2025-07-24 17:53:16,249 views 23772 8876 Error generating backdated risk charts: 'high_risk_count'
+INFO 2025-07-24 17:53:16,272 basehttp 23772 8876 "GET /api/db-comprehensive-analytics/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 23953
+ERROR 2025-07-24 17:53:16,380 views 23772 8876 Error generating backdated risk charts: 'high_risk_count'
+INFO 2025-07-24 17:53:16,401 basehttp 23772 8876 "GET /api/db-comprehensive-analytics/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 23953
+INFO 2025-07-24 17:53:20,012 basehttp 23772 8876 "GET /api/db-comprehensive-backdated-analysis/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 12973
+INFO 2025-07-24 17:54:37,876 basehttp 23772 8876 "GET /api/all-files/ HTTP/1.1" 200 31659
+INFO 2025-07-24 17:54:37,966 basehttp 23772 8876 "GET /api/all-files/ HTTP/1.1" 200 31659
+ERROR 2025-07-24 17:55:38,024 views 23772 8876 Error generating backdated risk charts: 'high_risk_count'
+INFO 2025-07-24 17:55:38,043 basehttp 23772 8876 "GET /api/db-comprehensive-analytics/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 23953
+ERROR 2025-07-24 17:55:38,124 views 23772 20968 Error generating backdated risk charts: 'high_risk_count'
+INFO 2025-07-24 17:55:38,140 basehttp 23772 20968 "GET /api/db-comprehensive-analytics/file/0f5feda2-9342-4c98-a35b-6cb1db63798a/ HTTP/1.1" 200 23953
+INFO 2025-07-24 17:58:26,648 basehttp 23772 20968 "GET /api/all-files/ HTTP/1.1" 200 31659
+INFO 2025-07-24 17:58:26,728 basehttp 23772 8876 "GET /api/all-files/ HTTP/1.1" 200 31659
