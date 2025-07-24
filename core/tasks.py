@@ -14,9 +14,10 @@ import os
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-from .models import FileProcessingJob, SAPGLPosting, DataFile, MLModelTraining, AnalysisSession
+from .models import FileProcessingJob, SAPGLPosting, DataFile, MLModelTraining, AnalysisSession, BackdatedAnalysisResult
 from .analytics import SAPGLAnalyzer
 from .analytics_db_saver import AnalyticsDBSaver, save_analytics_to_db
+from .specialized_ml_models import SpecializedAnomalyDetector
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,25 @@ def process_file_with_anomalies(self, job_id):
                 log_task_info(task_name, job_id, f"Duplicate error type: {type(duplicate_error).__name__}", "error")
                 log_task_info(task_name, job_id, f"Duplicate error traceback: {traceback.format_exc()}", "error")
                 duplicate_results = {'error': str(duplicate_error)}
+            
+            # Run backdated analysis and save to database (ALWAYS run together with duplicate)
+            log_task_info(task_name, job_id, "Running backdated analysis...")
+            try:
+                backdated_results = _run_backdated_analysis(result['transactions'], job.data_file)
+                log_task_info(task_name, job_id, "Backdated analysis completed successfully")
+                
+                # Save to database instead of keeping in memory
+                print(f"🔍 DEBUG: ===== Saving backdated analysis to database =====")
+                print(f"🔍 DEBUG: Backdated results keys: {list(backdated_results.keys())}")
+                db_saver.save_backdated_analysis(backdated_results)
+                print(f"🔍 DEBUG: Backdated analysis saved to database successfully")
+                log_task_info(task_name, job_id, "Backdated analysis saved to database")
+                
+            except Exception as backdated_error:
+                log_task_info(task_name, job_id, f"Error in backdated analysis: {backdated_error}", "error")
+                log_task_info(task_name, job_id, f"Backdated error type: {type(backdated_error).__name__}", "error")
+                log_task_info(task_name, job_id, f"Backdated error traceback: {traceback.format_exc()}", "error")
+                backdated_results = {'error': str(backdated_error)}
             
             # Run requested anomaly tests and save to database
             log_task_info(task_name, job_id, "Running requested anomaly tests...")
@@ -603,13 +623,44 @@ def _auto_train_ml_models(transactions, data_file):
         try:
             ml_detector.load_models_from_memory()
             if ml_detector.is_trained:
-                return {
-                    'status': 'SKIPPED',
-                    'reason': 'ML models already trained and loaded',
-                    'transactions_count': len(transactions),
-                    'models_loaded': True,
-                    'data_source': 'database'
-                }
+                # Even if models are loaded, run prediction to generate risk charts
+                debug_task_state(task_name, job_id, "RUNNING_PREDICTIONS", "Running ML predictions to generate risk charts...")
+                
+                try:
+                    # Run predictions to generate risk data
+                    predictions = ml_detector.ensemble_predict(transactions)
+                    
+                    # Generate risk charts from predictions
+                    risk_charts = _generate_ml_risk_charts(predictions, transactions)
+                    
+                    return {
+                        'status': 'COMPLETED',
+                        'reason': 'ML models already trained and loaded, predictions generated',
+                        'transactions_count': len(transactions),
+                        'models_loaded': True,
+                        'anomalies_detected': len([p for p in predictions if p.get('is_anomaly', False)]),
+                        'duplicates_found': len([p for p in predictions if p.get('is_duplicate', False)]),
+                        'risk_score': _calculate_ml_risk_score(predictions),
+                        'confidence_score': 0.8,  # Default confidence for loaded models
+                        'detailed_results': {
+                            'risk_charts': risk_charts,
+                            'predictions_summary': {
+                                'total_predictions': len(predictions),
+                                'anomaly_predictions': len([p for p in predictions if p.get('is_anomaly', False)]),
+                                'duplicate_predictions': len([p for p in predictions if p.get('is_duplicate', False)])
+                            }
+                        },
+                        'data_source': 'database'
+                    }
+                except Exception as pred_error:
+                    logger.error(f"Error running ML predictions: {pred_error}")
+                    return {
+                        'status': 'SKIPPED',
+                        'reason': 'ML models loaded but prediction failed',
+                        'transactions_count': len(transactions),
+                        'models_loaded': True,
+                        'data_source': 'database'
+                    }
         except:
             pass
         
@@ -646,6 +697,47 @@ def _auto_train_ml_models(transactions, data_file):
             'error': str(e),
             'transactions_count': len(transactions)
         }
+
+def _run_backdated_analysis(transactions, data_file):
+    """Run enhanced backdated analysis"""
+    task_name = "_run_backdated_analysis"
+    job_id = str(data_file.id) if data_file else "unknown"
+    
+    debug_task_state(task_name, job_id, "STARTED", "Running enhanced backdated analysis...")
+    
+    try:
+        if not transactions:
+            debug_task_state(task_name, job_id, "SKIPPED", "No transactions to analyze")
+            return {'error': 'No transactions to analyze'}
+        
+        # Run enhanced backdated analysis
+        debug_task_state(task_name, job_id, "RUNNING_BACKDATED_ANALYSIS", "Running enhanced backdated analysis...")
+        print(f"🔍 DEBUG: Running enhanced backdated analysis")
+        
+        try:
+            from .analytics import SAPGLAnalyzer
+            analyzer = SAPGLAnalyzer()
+            backdated_result = analyzer.detect_backdated_entries(transactions)
+            
+            debug_task_state(task_name, job_id, "BACKDATED_COMPLETED", f"Backdated analysis completed with {len(backdated_result.get('backdated_entries', []))} backdated entries")
+            print(f"🔍 DEBUG: Backdated analysis completed with {len(backdated_result.get('backdated_entries', []))} backdated entries")
+            
+            # Log detailed analysis info
+            summary = backdated_result.get('summary', {})
+            print(f"🔍 DEBUG: Summary: {summary}")
+            
+            return backdated_result
+            
+        except Exception as analysis_error:
+            debug_task_state(task_name, job_id, "ANALYSIS_FAILED", f"Backdated analysis failed: {str(analysis_error)}")
+            print(f"🔍 DEBUG: Backdated analysis failed: {analysis_error}")
+            return {'error': str(analysis_error)}
+            
+    except Exception as e:
+        debug_task_state(task_name, job_id, "FAILED", f"Unexpected error: {str(e)}")
+        print(f"🔍 DEBUG: Unexpected error in backdated analysis: {e}")
+        return {'error': str(e)}
+
 
 def _run_duplicate_analysis(transactions, data_file):
     """Run enhanced duplicate analysis with ML model enhancement"""
@@ -1285,7 +1377,11 @@ def process_queued_jobs():
                     duplicate_results = _run_duplicate_analysis(stored_transactions, job.data_file)
                     db_saver.save_duplicate_analysis(duplicate_results)
                     
-                    # Step 8: Save ML processing results to database
+                    # Step 8: Run backdated analysis (always run together with duplicate) and save to database
+                    backdated_results = _run_backdated_analysis(stored_transactions, job.data_file)
+                    db_saver.save_backdated_analysis(backdated_results)
+                    
+                    # Step 9: Save ML processing results to database
                     # Convert ML training result to expected format
                     ml_processing_result = _convert_ml_training_to_processing_result(ml_training_result, duplicate_results)
                     db_saver.save_ml_processing_result(ml_processing_result, 'all')
@@ -1309,6 +1405,7 @@ def process_queued_jobs():
                     serializable_anomalies = convert_dates_for_json(anomaly_results)
                     serializable_ml_training = convert_dates_for_json(ml_training_result)
                     serializable_duplicates = convert_dates_for_json(duplicate_results)
+                    serializable_backdated = convert_dates_for_json(backdated_results)
                     
                     job.analytics_results = serializable_analytics
                     job.anomaly_results = serializable_anomalies
@@ -1317,6 +1414,10 @@ def process_queued_jobs():
                     # Add duplicate results to anomaly_results for compatibility
                     if 'duplicate_analysis' not in job.anomaly_results:
                         job.anomaly_results['duplicate_analysis'] = serializable_duplicates
+                    
+                    # Add backdated results to anomaly_results for compatibility
+                    if 'backdated' not in job.anomaly_results:
+                        job.anomaly_results['backdated'] = serializable_backdated
                     
                     # If duplicates were requested in anomalies, add them to anomaly_results
                     if job.run_anomalies and job.requested_anomalies and 'duplicates' in job.requested_anomalies:
@@ -1961,3 +2062,355 @@ def monitor_worker_performance(self):
     log_task_info(task_name, job_id, f"===== PERFORMANCE MONITORING COMPLETED =====")
     
     return performance_data 
+
+def _generate_ml_risk_charts(predictions, transactions):
+    """Generate risk charts from ML predictions"""
+    try:
+        charts = {}
+        
+        # Anomaly distribution chart
+        anomaly_count = len([p for p in predictions if p.get('is_anomaly', False)])
+        normal_count = len(predictions) - anomaly_count
+        
+        charts['anomaly_distribution'] = {
+            'labels': ['Normal', 'Anomaly'],
+            'data': [normal_count, anomaly_count],
+            'colors': ['#28a745', '#dc3545'],
+            'type': 'pie',
+            'title': 'Anomaly Distribution'
+        }
+        
+        # Risk score distribution
+        risk_scores = [p.get('risk_score', 0.0) for p in predictions if p.get('risk_score') is not None]
+        if risk_scores:
+            # Create risk score bins
+            bins = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+            bin_labels = ['0-0.2', '0.2-0.4', '0.4-0.6', '0.6-0.8', '0.8-1.0']
+            bin_counts = [0] * (len(bins) - 1)
+            
+            for score in risk_scores:
+                for i in range(len(bins) - 1):
+                    if bins[i] <= score < bins[i + 1]:
+                        bin_counts[i] += 1
+                        break
+            
+            charts['risk_score_distribution'] = {
+                'labels': bin_labels,
+                'data': bin_counts,
+                'type': 'bar',
+                'title': 'Risk Score Distribution'
+            }
+        
+        # Model confidence distribution
+        confidence_scores = [p.get('confidence', 0.0) for p in predictions if p.get('confidence') is not None]
+        if confidence_scores:
+            avg_confidence = sum(confidence_scores) / len(confidence_scores)
+            charts['model_confidence'] = {
+                'labels': ['Average Confidence'],
+                'data': [avg_confidence],
+                'type': 'gauge',
+                'title': f'Model Confidence: {avg_confidence:.2f}'
+            }
+        
+        # Feature importance (if available)
+        feature_importance = {}
+        for pred in predictions:
+            if 'feature_importance' in pred:
+                for feature, importance in pred['feature_importance'].items():
+                    if feature not in feature_importance:
+                        feature_importance[feature] = 0
+                    feature_importance[feature] += importance
+        
+        if feature_importance:
+            # Sort by importance and take top 10
+            sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:10]
+            charts['feature_importance'] = {
+                'labels': [f[0] for f in sorted_features],
+                'data': [f[1] for f in sorted_features],
+                'type': 'horizontal_bar',
+                'title': 'Top Feature Importance'
+            }
+        
+        return charts
+        
+    except Exception as e:
+        logger.error(f"Error generating ML risk charts: {e}")
+        return {}
+
+def _calculate_ml_risk_score(predictions):
+    """Calculate overall ML risk score from predictions"""
+    try:
+        if not predictions:
+            return 0.0
+        
+        # Calculate weighted risk score
+        total_weight = 0
+        weighted_sum = 0
+        
+        for pred in predictions:
+            risk_score = pred.get('risk_score', 0.0)
+            confidence = pred.get('confidence', 0.5)  # Default confidence if not available
+            
+            # Weight by confidence
+            weight = confidence
+            weighted_sum += risk_score * weight
+            total_weight += weight
+        
+        if total_weight > 0:
+            return weighted_sum / total_weight
+        else:
+            return 0.0
+            
+    except Exception as e:
+        logger.error(f"Error calculating ML risk score: {e}")
+        return 0.0
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=120, time_limit=600, soft_time_limit=480)
+def run_backdated_analysis(self, job_id):
+    """
+    Background task to run enhanced backdated entry analysis
+    
+    Args:
+        job_id (str): UUID of the FileProcessingJob to process
+    """
+    task_name = "run_backdated_analysis"
+    start_time = timezone.now()
+    
+    debug_task_state(task_name, job_id, "STARTED", f"Task ID: {self.request.id}")
+    log_task_info(task_name, job_id, f"===== BACKDATED ANALYSIS STARTED =====")
+    
+    try:
+        # Get the processing job
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        log_task_info(task_name, job_id, f"Processing file: {data_file.file_name}")
+        
+        # Get all transactions for this file
+        # Since SAPGLPosting doesn't have a direct data_file foreign key,
+        # we need to get transactions that were processed for this specific file
+        # We'll use a simple approach based on the file's engagement_id and processing time
+        transactions = SAPGLPosting.objects.filter(
+            created_at__gte=data_file.uploaded_at
+        ).select_related('gl_account_ref')
+        
+        # If we have processed_records info, limit to that number
+        if data_file.processed_records > 0:
+            transactions = transactions.order_by('-created_at')[:data_file.processed_records]
+        
+        log_task_info(task_name, job_id, f"Found {transactions.count()} transactions to analyze")
+        
+        if transactions.count() == 0:
+            log_task_info(task_name, job_id, "No transactions found, skipping backdated analysis")
+            return {
+                'status': 'completed',
+                'message': 'No transactions found for backdated analysis',
+                'backdated_entries': 0,
+                'processing_duration': 0
+            }
+        
+        # Convert to list for processing
+        transactions_list = list(transactions)
+        
+        # Run enhanced backdated analysis
+        analyzer = SAPGLAnalyzer()
+        backdated_results = analyzer.detect_backdated_entries(transactions_list)
+        
+        log_task_info(task_name, job_id, f"Backdated analysis completed. Found {backdated_results.get('summary', {}).get('total_backdated_entries', 0)} backdated entries")
+        
+        # Save results to database
+        from .models import BackdatedAnalysisResult
+        
+        # Check if analysis already exists
+        existing_analysis = BackdatedAnalysisResult.objects.filter(
+            data_file=data_file,
+            analysis_type='enhanced_backdated'
+        ).first()
+        
+        if existing_analysis:
+            # Update existing analysis
+            existing_analysis.analysis_info = backdated_results.get('summary', {})
+            existing_analysis.backdated_entries = backdated_results.get('backdated_entries', [])
+            existing_analysis.backdated_by_document = backdated_results.get('backdated_by_document', [])
+            existing_analysis.backdated_by_account = backdated_results.get('backdated_by_account', [])
+            existing_analysis.backdated_by_user = backdated_results.get('backdated_by_user', [])
+            existing_analysis.audit_recommendations = backdated_results.get('audit_recommendations', {})
+            existing_analysis.compliance_assessment = backdated_results.get('compliance_assessment', {})
+            existing_analysis.financial_statement_impact = backdated_results.get('financial_statement_impact', {})
+            existing_analysis.processing_job = job
+            existing_analysis.processing_duration = (timezone.now() - start_time).total_seconds()
+            existing_analysis.status = 'COMPLETED'
+            existing_analysis.save()
+            
+            log_task_info(task_name, job_id, "Updated existing backdated analysis")
+        else:
+            # Create new analysis
+            backdated_analysis = BackdatedAnalysisResult.objects.create(
+                data_file=data_file,
+                analysis_type='enhanced_backdated',
+                analysis_version='1.0.0',
+                analysis_info=backdated_results.get('summary', {}),
+                backdated_entries=backdated_results.get('backdated_entries', []),
+                backdated_by_document=backdated_results.get('backdated_by_document', []),
+                backdated_by_account=backdated_results.get('backdated_by_account', []),
+                backdated_by_user=backdated_results.get('backdated_by_user', []),
+                audit_recommendations=backdated_results.get('audit_recommendations', {}),
+                compliance_assessment=backdated_results.get('compliance_assessment', {}),
+                financial_statement_impact=backdated_results.get('financial_statement_impact', {}),
+                processing_job=job,
+                processing_duration=(timezone.now() - start_time).total_seconds(),
+                status='COMPLETED'
+            )
+            
+            log_task_info(task_name, job_id, f"Created new backdated analysis: {backdated_analysis.id}")
+        
+        # Update job with backdated results
+        job.anomaly_results['backdated'] = {
+            'analysis_id': str(existing_analysis.id if existing_analysis else backdated_analysis.id),
+            'total_backdated_entries': backdated_results.get('summary', {}).get('total_backdated_entries', 0),
+            'total_amount': backdated_results.get('summary', {}).get('total_amount', 0),
+            'high_risk_entries': backdated_results.get('summary', {}).get('high_risk_entries', 0),
+            'medium_risk_entries': backdated_results.get('summary', {}).get('medium_risk_entries', 0),
+            'low_risk_entries': backdated_results.get('summary', {}).get('low_risk_entries', 0),
+            'processing_duration': (timezone.now() - start_time).total_seconds()
+        }
+        job.save()
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        debug_task_state(task_name, job_id, "COMPLETED", f"Duration: {processing_duration:.2f}s")
+        
+        return {
+            'status': 'completed',
+            'message': 'Backdated analysis completed successfully',
+            'backdated_entries': backdated_results.get('summary', {}).get('total_backdated_entries', 0),
+            'total_amount': backdated_results.get('summary', {}).get('total_amount', 0),
+            'high_risk_entries': backdated_results.get('summary', {}).get('high_risk_entries', 0),
+            'processing_duration': processing_duration,
+            'analysis_id': existing_analysis.id if existing_analysis else backdated_analysis.id
+        }
+        
+    except FileProcessingJob.DoesNotExist:
+        error_msg = f"FileProcessingJob with id {job_id} not found"
+        debug_task_exception(task_name, job_id, Exception(error_msg))
+        return {'status': 'failed', 'error': error_msg}
+        
+    except Exception as e:
+        error_msg = f"Error in backdated analysis: {str(e)}"
+        debug_task_exception(task_name, job_id, e, "Backdated analysis processing")
+        
+        # Update job status
+        try:
+            job = FileProcessingJob.objects.get(id=job_id)
+            job.anomaly_results['backdated'] = {
+                'error': error_msg,
+                'status': 'failed'
+            }
+            job.save()
+        except:
+            pass
+        
+        return {'status': 'failed', 'error': error_msg}
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=120, time_limit=600, soft_time_limit=480)
+def train_backdated_ml_model(self, training_session_id):
+    """
+    Background task to train specialized ML model for backdated entry detection
+    
+    Args:
+        training_session_id (str): UUID of the MLModelTraining session
+    """
+    task_name = "train_backdated_ml_model"
+    start_time = timezone.now()
+    
+    debug_task_state(task_name, training_session_id, "STARTED", f"Task ID: {self.request.id}")
+    log_task_info(task_name, training_session_id, f"===== BACKDATED ML MODEL TRAINING STARTED =====")
+    
+    try:
+        # Get training session
+        training_session = MLModelTraining.objects.get(id=training_session_id)
+        training_session.status = 'TRAINING'
+        training_session.started_at = timezone.now()
+        training_session.save()
+        
+        # Get training data
+        transactions = SAPGLPosting.objects.all()
+        
+        # Apply date filters if specified
+        if training_session.training_parameters.get('date_from'):
+            transactions = transactions.filter(
+                posting_date__gte=training_session.training_parameters['date_from']
+            )
+        
+        if training_session.training_parameters.get('date_to'):
+            transactions = transactions.filter(
+                posting_date__lte=training_session.training_parameters['date_to']
+            )
+        
+        # Convert to list for processing
+        transactions_list = list(transactions)
+        
+        if len(transactions_list) < 100:
+            training_session.status = 'FAILED'
+            training_session.error_message = f"Insufficient data for backdated model training. Found {len(transactions_list)} transactions, need at least 100."
+            training_session.completed_at = timezone.now()
+            training_session.save()
+            return {'status': 'failed', 'error': training_session.error_message}
+        
+        # Initialize specialized ML detector
+        from .specialized_ml_models import SpecializedAnomalyDetector
+        ml_detector = SpecializedAnomalyDetector()
+        
+        # Train backdated model specifically
+        training_results = ml_detector.train_specialized_models(transactions_list)
+        
+        if 'backdated' not in training_results:
+            training_session.status = 'FAILED'
+            training_session.error_message = "Failed to train backdated model"
+            training_session.completed_at = timezone.now()
+            training_session.save()
+            return {'status': 'failed', 'error': 'Failed to train backdated model'}
+        
+        backdated_results = training_results['backdated']
+        
+        # Update training session
+        training_session.status = 'COMPLETED'
+        training_session.completed_at = timezone.now()
+        training_session.training_duration = (timezone.now() - start_time).total_seconds()
+        training_session.training_data_size = len(transactions_list)
+        training_session.performance_metrics = {
+            'backdated_model': backdated_results
+        }
+        training_session.save()
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        debug_task_state(task_name, training_session_id, "COMPLETED", f"Duration: {processing_duration:.2f}s")
+        
+        return {
+            'status': 'completed',
+            'message': 'Backdated ML model training completed successfully',
+            'training_data_size': len(transactions_list),
+            'performance_metrics': backdated_results,
+            'processing_duration': processing_duration
+        }
+        
+    except MLModelTraining.DoesNotExist:
+        error_msg = f"MLModelTraining with id {training_session_id} not found"
+        debug_task_exception(task_name, training_session_id, Exception(error_msg))
+        return {'status': 'failed', 'error': error_msg}
+        
+    except Exception as e:
+        error_msg = f"Error in backdated ML model training: {str(e)}"
+        debug_task_exception(task_name, training_session_id, e, "Backdated ML model training")
+        
+        # Update training session status
+        try:
+            training_session = MLModelTraining.objects.get(id=training_session_id)
+            training_session.status = 'FAILED'
+            training_session.error_message = error_msg
+            training_session.completed_at = timezone.now()
+            training_session.save()
+        except:
+            pass
+        
+        return {'status': 'failed', 'error': error_msg}

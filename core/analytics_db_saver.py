@@ -18,7 +18,8 @@ from .models import (
     AnalyticsProcessingResult, 
     ProcessingJobTracker,
     FileProcessingJob,
-    DataFile
+    DataFile,
+    BackdatedAnalysisResult
 )
 
 logger = logging.getLogger(__name__)
@@ -236,7 +237,8 @@ class AnalyticsDBSaver:
                     'slicer_filters': serialized_slicer_filters,
                     'summary_table': serialized_summary_table,
                     'detailed_insights': serialized_detailed_insights,
-                    'ml_enhancement': serialized_ml_enhancement
+                    'ml_enhancement': serialized_ml_enhancement,
+                    'chart_data': serialized_chart_data
                 },
                 chart_data=serialized_chart_data,
                 export_data=serialized_export_data,
@@ -350,6 +352,83 @@ class AnalyticsDBSaver:
             print(f"🔍 DEBUG: ERROR in save_anomaly_detection_results: {e}")
             logger.error(f"Error saving anomaly detection results: {e}")
             self.update_progress("Anomaly Detection", 0, "FAILED")
+            raise
+    
+    def save_backdated_analysis(self, backdated_results: Dict[str, Any]) -> BackdatedAnalysisResult:
+        """Save backdated analysis results to database"""
+        try:
+            print(f"🔍 DEBUG: ===== save_backdated_analysis STARTED =====")
+            print(f"🔍 DEBUG: Data file: {self.data_file.file_name}")
+            print(f"🔍 DEBUG: Processing job: {self.processing_job.id}")
+            print(f"🔍 DEBUG: Backdated results keys: {list(backdated_results.keys())}")
+            
+            self.update_progress("Backdated Analysis", 70, "PROCESSING")
+            
+            # Extract backdated analysis data
+            summary = backdated_results.get('summary', {})
+            backdated_entries = backdated_results.get('backdated_entries', [])
+            backdated_by_document = backdated_results.get('backdated_by_document', [])
+            backdated_by_account = backdated_results.get('backdated_by_account', [])
+            backdated_by_user = backdated_results.get('backdated_by_user', [])
+            audit_recommendations = backdated_results.get('audit_recommendations', {})
+            compliance_assessment = backdated_results.get('compliance_assessment', {})
+            financial_statement_impact = backdated_results.get('financial_statement_impact', {})
+            
+            print(f"🔍 DEBUG: Extracted backdated data - Entries: {len(backdated_entries)}, Summary: {summary}")
+            
+            # Check if analysis already exists
+            existing_analysis = BackdatedAnalysisResult.objects.filter(
+                data_file=self.data_file,
+                analysis_type='enhanced_backdated'
+            ).first()
+            
+            if existing_analysis:
+                # Update existing analysis
+                existing_analysis.analysis_info = summary
+                existing_analysis.backdated_entries = backdated_entries
+                existing_analysis.backdated_by_document = backdated_by_document
+                existing_analysis.backdated_by_account = backdated_by_account
+                existing_analysis.backdated_by_user = backdated_by_user
+                existing_analysis.audit_recommendations = audit_recommendations
+                existing_analysis.compliance_assessment = compliance_assessment
+                existing_analysis.financial_statement_impact = financial_statement_impact
+                existing_analysis.processing_job = self.processing_job
+                existing_analysis.processing_duration = (timezone.now() - self.processing_job.started_at).total_seconds() if self.processing_job.started_at else None
+                existing_analysis.status = 'COMPLETED'
+                existing_analysis.save()
+                
+                print(f"🔍 DEBUG: Updated existing BackdatedAnalysisResult with ID: {existing_analysis.id}")
+                backdated_analysis = existing_analysis
+            else:
+                # Create new analysis
+                backdated_analysis = BackdatedAnalysisResult.objects.create(
+                    data_file=self.data_file,
+                    analysis_type='enhanced_backdated',
+                    analysis_version='1.0.0',
+                    analysis_info=summary,
+                    backdated_entries=backdated_entries,
+                    backdated_by_document=backdated_by_document,
+                    backdated_by_account=backdated_by_account,
+                    backdated_by_user=backdated_by_user,
+                    audit_recommendations=audit_recommendations,
+                    compliance_assessment=compliance_assessment,
+                    financial_statement_impact=financial_statement_impact,
+                    processing_job=self.processing_job,
+                    processing_duration=(timezone.now() - self.processing_job.started_at).total_seconds() if self.processing_job.started_at else None,
+                    status='COMPLETED'
+                )
+                
+                print(f"🔍 DEBUG: Created new BackdatedAnalysisResult with ID: {backdated_analysis.id}")
+            
+            self.update_progress("Backdated Analysis", 100, "COMPLETED")
+            logger.info(f"Saved backdated analysis for file {self.data_file.file_name}")
+            
+            return backdated_analysis
+            
+        except Exception as e:
+            print(f"🔍 DEBUG: ERROR in save_backdated_analysis: {e}")
+            logger.error(f"Error saving backdated analysis: {e}")
+            self.update_progress("Backdated Analysis", 0, "FAILED")
             raise
     
     def finalize_processing(self, success: bool = True, error_message: str = None):
