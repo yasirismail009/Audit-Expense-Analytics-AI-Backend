@@ -8,7 +8,7 @@ import logging
 from calendar import monthrange
 import holidays
 from django.db import models
-from .models import SAPGLPosting, AnalysisSession, TransactionAnalysis, SystemMetrics
+from .models import SAPGLPosting, AnalysisSession, TransactionAnalysis
 
 logger = logging.getLogger(__name__)
 

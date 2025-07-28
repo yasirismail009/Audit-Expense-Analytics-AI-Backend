@@ -1,7 +1,7 @@
 from django.contrib import admin
 from .models import (
     SAPGLPosting, DataFile, AnalysisSession, TransactionAnalysis, 
-    SystemMetrics, GLAccount, FileProcessingJob, MLModelTraining
+    GLAccount, FileProcessingJob, MLModelTraining
 )
 
 @admin.register(GLAccount)
@@ -38,13 +38,6 @@ class TransactionAnalysisAdmin(admin.ModelAdmin):
     list_display = ['transaction', 'risk_score', 'risk_level', 'created_at']
     list_filter = ['risk_level', 'created_at']
     search_fields = ['transaction__document_number']
-    readonly_fields = ['id', 'created_at', 'updated_at']
-
-@admin.register(SystemMetrics)
-class SystemMetricsAdmin(admin.ModelAdmin):
-    list_display = ['metric_date', 'total_transactions', 'total_amount', 'active_users']
-    list_filter = ['metric_date']
-    date_hierarchy = 'metric_date'
     readonly_fields = ['id', 'created_at', 'updated_at']
 
 @admin.register(FileProcessingJob)

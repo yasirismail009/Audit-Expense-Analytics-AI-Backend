@@ -14,7 +14,6 @@ import json
 from datetime import datetime, date
 
 from .models import (
-    MLModelProcessingResult, 
     AnalyticsProcessingResult, 
     ProcessingJobTracker,
     FileProcessingJob,
@@ -258,7 +257,7 @@ class AnalyticsDBSaver:
             self.update_progress("Duplicate Analysis", 0, "FAILED")
             raise
     
-    def save_ml_processing_result(self, ml_results: Dict[str, Any], model_type: str = 'all') -> MLModelProcessingResult:
+    def save_ml_processing_result(self, ml_results: Dict[str, Any], model_type: str = 'all') -> AnalyticsProcessingResult:
         """Save ML model processing results to database"""
         try:
             print(f"🔍 DEBUG: ===== save_ml_processing_result STARTED =====")
@@ -278,24 +277,27 @@ class AnalyticsDBSaver:
             
             print(f"🔍 DEBUG: Extracted ML metrics - Anomalies: {anomalies_detected}, Duplicates: {duplicates_found}, Risk Score: {risk_score}, Confidence: {confidence_score}, Data Size: {data_size}")
             
-            # Create ML processing result record
-            ml_result = MLModelProcessingResult.objects.create(
+            # Create ML processing result record using AnalyticsProcessingResult
+            ml_result = AnalyticsProcessingResult.objects.create(
                 data_file=self.data_file,
                 processing_job=self.processing_job,
-                model_type=model_type,
+                analytics_type='ml_processing',
                 processing_status='COMPLETED',
-                anomalies_detected=anomalies_detected,
+                anomalies_found=anomalies_detected,
                 duplicates_found=duplicates_found,
-                risk_score=risk_score,
-                confidence_score=confidence_score,
-                data_size=data_size,
-                detailed_results=serialize_for_json(ml_results.get('detailed_results', {})),
-                model_metrics=serialize_for_json(ml_results.get('model_metrics', {})),
-                feature_importance=serialize_for_json(ml_results.get('feature_importance', {})),
+                trial_balance_data=serialize_for_json({
+                    'model_type': model_type,
+                    'risk_score': risk_score,
+                    'confidence_score': confidence_score,
+                    'data_size': data_size,
+                    'detailed_results': ml_results.get('detailed_results', {}),
+                    'model_metrics': ml_results.get('model_metrics', {}),
+                    'feature_importance': ml_results.get('feature_importance', {})
+                }),
                 processed_at=timezone.now()
             )
             
-            print(f"🔍 DEBUG: Created MLModelProcessingResult with ID: {ml_result.id}")
+            print(f"🔍 DEBUG: Created AnalyticsProcessingResult with ID: {ml_result.id}")
             
             self.update_progress("ML Processing", 100, "COMPLETED")
             logger.info(f"Saved ML processing results for file {self.data_file.file_name}")

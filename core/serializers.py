@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import SAPGLPosting, DataFile, AnalysisSession, TransactionAnalysis, SystemMetrics, GLAccount, FileProcessingJob, MLModelTraining
+from .models import SAPGLPosting, DataFile, AnalysisSession, TransactionAnalysis, GLAccount, FileProcessingJob, MLModelTraining
 from decimal import Decimal
 import uuid
 
@@ -177,13 +177,7 @@ class TransactionAnalysisListSerializer(serializers.ModelSerializer):
             'created_at'
         ]
 
-class SystemMetricsSerializer(serializers.ModelSerializer):
-    """Serializer for system metrics"""
-    
-    class Meta:
-        model = SystemMetrics
-        fields = '__all__'
-        read_only_fields = ['id', 'created_at', 'updated_at']
+
 
 class AnalysisRequestSerializer(serializers.Serializer):
     """Serializer for analysis requests"""

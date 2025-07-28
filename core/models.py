@@ -46,6 +46,9 @@ class SAPGLPosting(models.Model):
     # Unique identifier
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
+    # File association
+    data_file = models.ForeignKey('DataFile', on_delete=models.CASCADE, related_name='postings', null=True, blank=True, help_text='Reference to the uploaded data file')
+    
     # Document information (REQUIRED)
     document_number = models.CharField(max_length=20, db_index=True, help_text='SAP Document Number')
     posting_date = models.DateField(help_text='Posting Date')
@@ -105,6 +108,34 @@ class SAPGLPosting(models.Model):
     )
     year_month = models.CharField(max_length=10, blank=True, null=True, help_text='Year/Month (YYYY/MM)')
     
+    # Analysis flags
+    is_flagged_expense = models.BooleanField(default=False, help_text='Flagged as expense transaction')
+    expense_category = models.CharField(max_length=100, blank=True, null=True, help_text='Expense category classification')
+    expense_risk_level = models.CharField(
+        max_length=20, 
+        choices=[('LOW', 'Low Risk'), ('MEDIUM', 'Medium Risk'), ('HIGH', 'High Risk'), ('CRITICAL', 'Critical Risk')],
+        default='LOW',
+        help_text='Risk level for expense transaction'
+    )
+    expense_risk_score = models.FloatField(default=0.0, help_text='Risk score for expense transaction (0-100)')
+    expense_analysis_details = models.JSONField(default=dict, help_text='Detailed expense analysis results')
+    
+    # Anomaly detection tracking
+    is_duplicate = models.BooleanField(default=False, help_text='Flagged as duplicate transaction')
+    duplicate_type = models.CharField(max_length=20, blank=True, null=True, help_text='Type of duplicate (type_1, type_2, etc.)')
+    duplicate_risk_score = models.FloatField(default=0.0, help_text='Risk score for duplicate detection (0-100)')
+    duplicate_analysis_details = models.JSONField(default=dict, help_text='Detailed duplicate analysis results')
+    
+    is_backdated = models.BooleanField(default=False, help_text='Flagged as backdated transaction')
+    backdated_days = models.IntegerField(default=0, help_text='Number of days between document date and posting date')
+    backdated_risk_score = models.FloatField(default=0.0, help_text='Risk score for backdated detection (0-100)')
+    backdated_analysis_details = models.JSONField(default=dict, help_text='Detailed backdated analysis results')
+    
+    # Overall anomaly tracking
+    overall_risk_score = models.FloatField(default=0.0, help_text='Overall risk score combining all analyses (0-100)')
+    anomaly_types = models.JSONField(default=list, help_text='List of anomaly types detected for this transaction')
+    anomaly_analysis_summary = models.JSONField(default=dict, help_text='Summary of all anomaly analyses for this transaction')
+    
     # Metadata
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -118,20 +149,21 @@ class SAPGLPosting(models.Model):
             models.Index(fields=['profit_center', 'fiscal_year']),
             models.Index(fields=['amount_local_currency', 'posting_date']),
             models.Index(fields=['transaction_type', 'gl_account']),
+            models.Index(fields=['data_file', 'document_number']),
         ]
         ordering = ['-posting_date', '-created_at']
     
     def __str__(self):
-        return f"{self.document_number} - {self.amount_local_currency} {self.local_currency} ({self.transaction_type})"
+        return f"{self.document_number} - {self.gl_account} - {self.amount_local_currency}"
     
     @property
     def is_high_value(self):
-        """Check if this is a high-value transaction (> 5M SAR)"""
-        return self.amount_local_currency > 5000000
+        """Check if transaction is high value (over 1,000,000 SAR)"""
+        return self.amount_local_currency > Decimal('1000000.00')
     
     @property
     def is_cleared(self):
-        """Check if transaction is cleared"""
+        """Check if transaction is cleared (has clearing document)"""
         return bool(self.clearing_document)
     
     @property
@@ -139,16 +171,57 @@ class SAPGLPosting(models.Model):
         """Check if text contains Arabic characters"""
         if not self.text:
             return False
+        # Simple check for Arabic Unicode range
         arabic_range = range(0x0600, 0x06FF)
-        return any(ord(char) in arabic_range for char in str(self.text))
+        return any(ord(char) in arabic_range for char in self.text)
+    
+    @property
+    def is_expense_account(self):
+        """Check if GL account is an expense account"""
+        # Common expense account patterns
+        expense_patterns = ['5', '6', '7']  # 5xxx, 6xxx, 7xxx series
+        return any(self.gl_account.startswith(pattern) for pattern in expense_patterns)
+    
+    @property
+    def expense_type(self):
+        """Determine expense type based on GL account"""
+        if not self.is_expense_account:
+            return None
+        
+        # Map GL account ranges to expense types
+        account_mapping = {
+            '5000': 'Cost of Goods Sold',
+            '5100': 'Direct Labor',
+            '5200': 'Direct Materials',
+            '5300': 'Manufacturing Overhead',
+            '6000': 'Selling Expenses',
+            '6100': 'Advertising',
+            '6200': 'Sales Commissions',
+            '6300': 'Travel & Entertainment',
+            '7000': 'General & Administrative',
+            '7100': 'Office Supplies',
+            '7200': 'Utilities',
+            '7300': 'Rent',
+            '7400': 'Insurance',
+            '7500': 'Professional Services',
+        }
+        
+        for prefix, expense_type in account_mapping.items():
+            if self.gl_account.startswith(prefix):
+                return expense_type
+        
+        return 'Other Expenses'
     
     def save(self, *args, **kwargs):
-        """Override save to automatically link to GL Account"""
-        if self.gl_account and not self.gl_account_ref:
-            try:
-                self.gl_account_ref = GLAccount.objects.get(account_id=self.gl_account)
-            except GLAccount.DoesNotExist:
-                pass
+        # Auto-determine transaction type based on GL account if not set
+        if not self.transaction_type and self.gl_account:
+            # Asset and expense accounts normally have debit balances
+            if self.gl_account.startswith(('1', '5', '6', '7')):
+                self.transaction_type = 'DEBIT'
+            # Liability, equity, and revenue accounts normally have credit balances
+            elif self.gl_account.startswith(('2', '3', '4')):
+                self.transaction_type = 'CREDIT'
+        
         super().save(*args, **kwargs)
 
 class DataFile(models.Model):
@@ -197,6 +270,10 @@ class DataFile(models.Model):
     
     def __str__(self):
         return f"{self.file_name} - {self.client_name} ({self.engagement_id})"
+
+    def get_transaction_document_numbers(self):
+        """Get a list of unique document numbers from postings in this data file."""
+        return list(set(posting.document_number for posting in self.postings.all()))
 
 class AnalysisSession(models.Model):
     """Model to track analysis sessions"""
@@ -261,12 +338,12 @@ class TransactionAnalysis(models.Model):
     ]
     risk_level = models.CharField(max_length=10, choices=RISK_LEVELS, default='LOW')
     
-    # Anomaly flags
-    amount_anomaly = models.BooleanField(default=False, help_text='Unusual amount flag')
-    timing_anomaly = models.BooleanField(default=False, help_text='Unusual timing flag')
-    user_anomaly = models.BooleanField(default=False, help_text='Unusual user behavior flag')
-    account_anomaly = models.BooleanField(default=False, help_text='Unusual account usage flag')
-    pattern_anomaly = models.BooleanField(default=False, help_text='Unusual pattern flag')
+    # Analysis flags
+    general_analysis_flag = models.BooleanField(default=False, help_text='General analysis flag')
+    duplicate_analysis_flag = models.BooleanField(default=False, help_text='Duplicate analysis flag')
+    backdated_analysis_flag = models.BooleanField(default=False, help_text='Backdated analysis flag')
+    overall_analysis_flag = models.BooleanField(default=False, help_text='Overall analysis flag')
+    risk_analysis_flag = models.BooleanField(default=False, help_text='Risk analysis flag')
     
     # Detailed analysis
     analysis_details = models.JSONField(default=dict, help_text='Detailed analysis results')
@@ -282,43 +359,7 @@ class TransactionAnalysis(models.Model):
     def __str__(self):
         return f"Analysis for {self.transaction.document_number} - {self.risk_level}"
 
-class SystemMetrics(models.Model):
-    """Model to track system performance and usage metrics"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    metric_date = models.DateField(db_index=True, help_text='Date of the metric')
-    
-    # Data volume metrics
-    total_transactions = models.IntegerField(default=0)
-    total_amount = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'))
-    new_transactions = models.IntegerField(default=0)
-    new_amount = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal('0.00'))
-    
-    # User activity metrics
-    active_users = models.IntegerField(default=0)
-    unique_documents = models.IntegerField(default=0)
-    unique_accounts = models.IntegerField(default=0)
-    
-    # Analysis metrics
-    analyses_run = models.IntegerField(default=0)
-    flagged_transactions = models.IntegerField(default=0)
-    high_risk_transactions = models.IntegerField(default=0)
-    
-    # Performance metrics
-    avg_processing_time = models.FloatField(default=0.0, help_text='Average processing time in seconds')
-    max_processing_time = models.FloatField(default=0.0, help_text='Maximum processing time in seconds')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    
-    class Meta:
-        db_table = 'system_metrics'
-        unique_together = ['metric_date']
-        ordering = ['-metric_date']
-    
-    def __str__(self):
-        return f"Metrics for {self.metric_date}"
+
 
 class FileProcessingJob(models.Model):
     """Model to track file processing jobs with anomaly detection requests"""
@@ -596,71 +637,7 @@ class BackdatedAnalysisResult(models.Model):
         return self.compliance_assessment.get('compliance_issues', [])
 
 
-class AnalyticsResult(models.Model):
-    """Model to store analytics results for files"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File reference
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='analytics_results', help_text='Reference to the data file')
-    
-    # Analysis metadata
-    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
-    analysis_type = models.CharField(max_length=50, default='comprehensive_analytics', help_text='Type of analysis performed')
-    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
-    
-    # Analytics results - stored as JSON for flexibility
-    trial_balance = models.JSONField(default=dict, help_text='Trial balance analysis results')
-    general_ledger_summary = models.JSONField(default=dict, help_text='General ledger summary results')
-    account_analysis = models.JSONField(default=dict, help_text='Account-level analysis results')
-    transaction_summary = models.JSONField(default=dict, help_text='Transaction summary statistics')
-    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
-    breakdowns = models.JSONField(default=dict, help_text='Various breakdowns and summaries')
-    export_data = models.JSONField(default=list, help_text='Export-ready data')
-    
-    # Processing metadata
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='analytics_result_objects', help_text='Reference to the processing job that generated this analysis')
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    
-    # Analysis status
-    STATUS_CHOICES = [
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    
-    class Meta:
-        db_table = 'analytics_results'
-        ordering = ['-analysis_date']
-        indexes = [
-            models.Index(fields=['data_file', 'analysis_date']),
-            models.Index(fields=['status', 'analysis_date']),
-            models.Index(fields=['analysis_type']),
-        ]
-    
-    def __str__(self):
-        return f"Analytics for {self.data_file.file_name} ({self.analysis_date.strftime('%Y-%m-%d %H:%M')})"
-    
-    def get_analysis_summary(self):
-        """Get a summary of the analysis results"""
-        return {
-            'analysis_id': str(self.id),
-            'file_name': self.data_file.file_name,
-            'file_id': str(self.data_file.id),
-            'analysis_date': self.analysis_date.isoformat(),
-            'analysis_type': self.analysis_type,
-            'status': self.status,
-            'processing_duration': self.processing_duration,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat(),
-        }
+
 
 class MLModelTraining(models.Model):
     """Model to track ML model training sessions and performance"""
@@ -748,87 +725,7 @@ class MLModelTraining(models.Model):
             'completed_at': self.completed_at,
         }
 
-class MLModelProcessingResult(models.Model):
-    """Model to store ML model processing results for individual files"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File and job references
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='ml_processing_results', help_text='Reference to the data file')
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='ml_processing_results', help_text='Reference to the processing job')
-    
-    # ML Model information
-    model_type = models.CharField(max_length=50, choices=[
-        ('isolation_forest', 'Isolation Forest'),
-        ('random_forest', 'Random Forest'),
-        ('dbscan', 'DBSCAN'),
-        ('ensemble', 'Ensemble'),
-        ('duplicate_detection', 'Duplicate Detection'),
-        ('anomaly_detection', 'Anomaly Detection'),
-        ('all', 'All Models'),
-    ], help_text='Type of ML model used')
-    
-    # Processing results
-    processing_status = models.CharField(max_length=20, choices=[
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ], default='PENDING')
-    
-    # Results data
-    anomalies_detected = models.IntegerField(default=0, help_text='Number of anomalies detected')
-    duplicates_found = models.IntegerField(default=0, help_text='Number of duplicates found')
-    risk_score = models.FloatField(default=0.0, help_text='Overall risk score')
-    confidence_score = models.FloatField(default=0.0, help_text='Model confidence score')
-    
-    # Detailed results stored as JSON
-    detailed_results = models.JSONField(default=dict, help_text='Detailed ML processing results')
-    model_metrics = models.JSONField(default=dict, help_text='Model performance metrics')
-    feature_importance = models.JSONField(default=dict, help_text='Feature importance scores')
-    
-    # Processing metadata
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    data_size = models.IntegerField(default=0, help_text='Number of records processed')
-    model_version = models.CharField(max_length=20, default='1.0.0', help_text='Model version used')
-    
-    # Error handling
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if processing failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    processed_at = models.DateTimeField(null=True, blank=True, help_text='When processing was completed')
-    
-    class Meta:
-        db_table = 'ml_model_processing_results'
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['data_file', 'model_type']),
-            models.Index(fields=['processing_status', 'created_at']),
-            models.Index(fields=['model_type', 'processing_status']),
-        ]
-    
-    def __str__(self):
-        return f"ML Processing for {self.data_file.file_name} - {self.model_type} ({self.processing_status})"
-    
-    def get_summary(self):
-        """Get a summary of the ML processing results"""
-        return {
-            'id': str(self.id),
-            'file_name': self.data_file.file_name,
-            'file_id': str(self.data_file.id),
-            'model_type': self.model_type,
-            'processing_status': self.processing_status,
-            'anomalies_detected': self.anomalies_detected,
-            'duplicates_found': self.duplicates_found,
-            'risk_score': self.risk_score,
-            'confidence_score': self.confidence_score,
-            'processing_duration': self.processing_duration,
-            'data_size': self.data_size,
-            'created_at': self.created_at.isoformat(),
-            'processed_at': self.processed_at.isoformat() if self.processed_at else None,
-        }
+
 
 class AnalyticsProcessingResult(models.Model):
     """Model to store comprehensive analytics processing results"""
@@ -841,14 +738,11 @@ class AnalyticsProcessingResult(models.Model):
     
     # Analytics type
     analytics_type = models.CharField(max_length=50, choices=[
-        ('default_analytics', 'Default Analytics'),
-        ('comprehensive_expense', 'Comprehensive Expense Analytics'),
+        ('general_analysis', 'General Analysis'),
         ('duplicate_analysis', 'Duplicate Analysis'),
-        ('anomaly_detection', 'Anomaly Detection'),
-        ('risk_assessment', 'Risk Assessment'),
-        ('user_patterns', 'User Patterns'),
-        ('account_patterns', 'Account Patterns'),
-        ('temporal_patterns', 'Temporal Patterns'),
+        ('backdated_analysis', 'Backdated Analysis'),
+        ('overall_analysis', 'Overall Analysis'),
+        ('risk_analysis', 'Risk Analysis'),
         ('all', 'All Analytics'),
     ], help_text='Type of analytics performed')
     
@@ -1067,3 +961,230 @@ class ProcessingJobTracker(models.Model):
         self.step_details.append(step_detail)
         
         self.save()
+
+class GeneralAnalysisResult(models.Model):
+    """Model to store general analysis results including trial balance, GL account summaries, and statistical calculations"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='general_analyses', help_text='Reference to the data file')
+    
+    # Analysis metadata
+    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
+    analysis_type = models.CharField(max_length=50, default='general_analysis', help_text='Type of analysis performed')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
+    
+    # General Analysis Results - stored as JSON for flexibility
+    trial_balance_summary = models.JSONField(default=dict, help_text='Trial balance summary (total debits, credits, net)')
+    gl_account_summaries = models.JSONField(default=list, help_text='Detailed GL account summaries with debits, credits, balances')
+    user_summaries = models.JSONField(default=list, help_text='User activity summaries per GL account')
+    statistical_calculations = models.JSONField(default=dict, help_text='Mean, standard deviation, and other statistical measures')
+    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='general_results', help_text='Reference to the processing job that generated this analysis')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Analysis status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'general_analysis_results'
+        ordering = ['-analysis_date']
+        indexes = [
+            models.Index(fields=['data_file', 'analysis_date']),
+            models.Index(fields=['status', 'analysis_date']),
+            models.Index(fields=['analysis_type']),
+        ]
+    
+    def __str__(self):
+        return f"General Analysis for {self.data_file.file_name} ({self.analysis_date.strftime('%Y-%m-%d %H:%M')})"
+    
+    def get_analysis_summary(self):
+        """Get a summary of the general analysis results"""
+        return {
+            'analysis_id': str(self.id),
+            'file_name': self.data_file.file_name,
+            'file_id': str(self.data_file.id),
+            'analysis_date': self.analysis_date.isoformat(),
+            'analysis_type': self.analysis_type,
+            'status': self.status,
+            'processing_duration': self.processing_duration,
+            'trial_balance_summary': self.trial_balance_summary,
+            'total_accounts': len(self.gl_account_summaries),
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat(),
+        }
+
+class OverallAnalysisResult(models.Model):
+    """Model to store overall analysis results combining all analysis types with risk calculations"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='overall_analyses', help_text='Reference to the data file')
+    
+    # Analysis metadata
+    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
+    analysis_type = models.CharField(max_length=50, default='overall_analysis', help_text='Type of analysis performed')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
+    
+    # Overall Analysis Results - stored as JSON for flexibility
+    transaction_summary = models.JSONField(default=dict, help_text='Overall transaction summary statistics')
+    flagged_transactions = models.JSONField(default=list, help_text='List of all flagged transactions with their flag types')
+    flag_summary = models.JSONField(default=dict, help_text='Summary of flags by type (duplicate, backdated, etc.)')
+    expense_analysis = models.JSONField(default=dict, help_text='Expense data analysis and categorization')
+    risk_assessment = models.JSONField(default=dict, help_text='Overall risk assessment and scoring')
+    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='overall_results', help_text='Reference to the processing job that generated this analysis')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Analysis status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'overall_analysis_results'
+        ordering = ['-analysis_date']
+        indexes = [
+            models.Index(fields=['data_file', 'analysis_date']),
+            models.Index(fields=['status', 'analysis_date']),
+            models.Index(fields=['analysis_type']),
+        ]
+    
+    def __str__(self):
+        return f"Overall Analysis for {self.data_file.file_name} ({self.analysis_date.strftime('%Y-%m-%d %H:%M')})"
+    
+    def get_analysis_summary(self):
+        """Get a summary of the overall analysis results"""
+        return {
+            'analysis_id': str(self.id),
+            'file_name': self.data_file.file_name,
+            'file_id': str(self.data_file.id),
+            'analysis_date': self.analysis_date.isoformat(),
+            'analysis_type': self.analysis_type,
+            'status': self.status,
+            'processing_duration': self.processing_duration,
+            'total_flagged': len(self.flagged_transactions),
+            'flag_summary': self.flag_summary,
+            'overall_risk_score': self.risk_assessment.get('overall_risk_score', 0),
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat(),
+        }
+
+class RiskScoringDocument(models.Model):
+    """Model to store comprehensive risk scoring documentation and methodology"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='risk_scoring_documents', help_text='Reference to the data file')
+    
+    # Document metadata
+    document_date = models.DateTimeField(auto_now_add=True, help_text='When the risk scoring document was generated')
+    document_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of the risk scoring methodology')
+    document_type = models.CharField(max_length=50, default='comprehensive_risk_scoring', help_text='Type of risk scoring document')
+    
+    # Risk Scoring Methodology - stored as JSON for flexibility
+    methodology_overview = models.JSONField(default=dict, help_text='Overview of risk scoring methodology')
+    risk_factors = models.JSONField(default=dict, help_text='Detailed risk factors and their weights')
+    scoring_criteria = models.JSONField(default=dict, help_text='Scoring criteria for different risk levels')
+    risk_calculations = models.JSONField(default=dict, help_text='Detailed risk calculations for each transaction')
+    risk_distributions = models.JSONField(default=dict, help_text='Risk score distributions and statistics')
+    recommendations = models.JSONField(default=dict, help_text='Risk-based recommendations and actions')
+    audit_implications = models.JSONField(default=dict, help_text='Audit implications and follow-up actions')
+    
+    # Summary statistics
+    total_transactions = models.IntegerField(default=0, help_text='Total transactions analyzed')
+    high_risk_transactions = models.IntegerField(default=0, help_text='Number of high-risk transactions')
+    medium_risk_transactions = models.IntegerField(default=0, help_text='Number of medium-risk transactions')
+    low_risk_transactions = models.IntegerField(default=0, help_text='Number of low-risk transactions')
+    overall_risk_score = models.FloatField(default=0.0, help_text='Overall risk score for the dataset')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='risk_scoring_documents', help_text='Reference to the processing job that generated this document')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Document status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if document generation failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'risk_scoring_documents'
+        ordering = ['-document_date']
+        indexes = [
+            models.Index(fields=['data_file', 'document_date']),
+            models.Index(fields=['status', 'document_date']),
+            models.Index(fields=['document_type']),
+        ]
+    
+    def __str__(self):
+        return f"Risk Scoring Document for {self.data_file.file_name} ({self.document_date.strftime('%Y-%m-%d %H:%M')})"
+    
+    def get_document_summary(self):
+        """Get a summary of the risk scoring document"""
+        return {
+            'document_id': str(self.id),
+            'file_name': self.data_file.file_name,
+            'file_id': str(self.data_file.id),
+            'document_date': self.document_date.isoformat(),
+            'document_type': self.document_type,
+            'document_version': self.document_version,
+            'status': self.status,
+            'processing_duration': self.processing_duration,
+            'total_transactions': self.total_transactions,
+            'high_risk_transactions': self.high_risk_transactions,
+            'medium_risk_transactions': self.medium_risk_transactions,
+            'low_risk_transactions': self.low_risk_transactions,
+            'overall_risk_score': self.overall_risk_score,
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat(),
+        }
+    
+    def get_risk_distribution(self):
+        """Get risk distribution summary"""
+        return {
+            'high_risk': self.high_risk_transactions,
+            'medium_risk': self.medium_risk_transactions,
+            'low_risk': self.low_risk_transactions,
+            'total': self.total_transactions,
+            'high_risk_percentage': (self.high_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
+            'medium_risk_percentage': (self.medium_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
+            'low_risk_percentage': (self.low_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
+        }
