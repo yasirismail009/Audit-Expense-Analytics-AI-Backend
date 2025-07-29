@@ -473,6 +473,11 @@ class DuplicateAnalysisResult(models.Model):
     export_data = models.JSONField(default=list, help_text='Export-ready data')
     detailed_insights = models.JSONField(default=dict, help_text='Detailed insights and recommendations')
     
+    # Additional analysis fields for comprehensive reporting
+    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
+    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
+    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
+    
     # Processing metadata
     processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='duplicate_results', help_text='Reference to the processing job that generated this analysis')
     processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
@@ -525,7 +530,15 @@ class DuplicateAnalysisResult(models.Model):
     
     def get_total_amount(self):
         """Get the total amount involved in duplicates"""
-        return sum(item.get('amount', 0) for item in self.duplicate_list)
+        total = 0
+        for item in self.duplicate_list:
+            # Handle the new structure where amounts are in transaction1 and transaction2
+            if 'transaction1' in item and 'amount' in item['transaction1']:
+                total += item['transaction1']['amount']
+            elif 'amount' in item:
+                # Fallback for old structure
+                total += item['amount']
+        return total
     
     def get_risk_distribution(self):
         """Get risk level distribution"""
@@ -544,6 +557,202 @@ class DuplicateAnalysisResult(models.Model):
             risk_counts[risk_level] = risk_counts.get(risk_level, 0) + 1
         
         return risk_counts
+    
+    def get_compliance_issues(self):
+        """Get compliance issues based on duplicate analysis results"""
+        compliance_issues = []
+        
+        # Check for high-risk duplicates
+        high_risk_duplicates = [item for item in self.duplicate_list if item.get('risk_score', 0) >= 80]
+        if high_risk_duplicates:
+            # Calculate total amount for high-risk duplicates
+            high_risk_amount = 0
+            for item in high_risk_duplicates:
+                if 'transaction1' in item and 'amount' in item['transaction1']:
+                    high_risk_amount += item['transaction1']['amount']
+                elif 'amount' in item:
+                    high_risk_amount += item['amount']
+            
+            compliance_issues.append({
+                'type': 'high_risk_duplicates',
+                'severity': 'HIGH',
+                'description': f'Found {len(high_risk_duplicates)} high-risk duplicate transactions',
+                'count': len(high_risk_duplicates),
+                'total_amount': high_risk_amount
+            })
+        
+        # Check for duplicate percentage
+        total_duplicates = len(self.duplicate_list)
+        if total_duplicates > 0:
+            duplicate_percentage = self.analysis_info.get('duplicate_percentage', 0)
+            if duplicate_percentage > 10:  # More than 10% duplicates
+                compliance_issues.append({
+                    'type': 'high_duplicate_percentage',
+                    'severity': 'MEDIUM',
+                    'description': f'High duplicate percentage: {duplicate_percentage:.2f}%',
+                    'percentage': duplicate_percentage
+                })
+        
+        # Check for large amount duplicates
+        large_amount_duplicates = []
+        large_amount_total = 0
+        for item in self.duplicate_list:
+            amount = 0
+            if 'transaction1' in item and 'amount' in item['transaction1']:
+                amount = item['transaction1']['amount']
+            elif 'amount' in item:
+                amount = item['amount']
+            
+            if amount > 1000000:  # Over 1M SAR
+                large_amount_duplicates.append(item)
+                large_amount_total += amount
+        
+        if large_amount_duplicates:
+            compliance_issues.append({
+                'type': 'large_amount_duplicates',
+                'severity': 'HIGH',
+                'description': f'Found {len(large_amount_duplicates)} duplicate transactions with amounts over 1M SAR',
+                'count': len(large_amount_duplicates),
+                'total_amount': large_amount_total
+            })
+        
+        # Check for user concentration in duplicates
+        user_duplicate_counts = {}
+        for item in self.duplicate_list:
+            # Handle new structure where user is in transaction1
+            if 'transaction1' in item and 'user' in item['transaction1']:
+                user = item['transaction1']['user']
+            elif 'user' in item:
+                user = item['user']
+            else:
+                user = 'Unknown'
+            user_duplicate_counts[user] = user_duplicate_counts.get(user, 0) + 1
+        
+        high_duplicate_users = [user for user, count in user_duplicate_counts.items() if count > 5]
+        if high_duplicate_users:
+            compliance_issues.append({
+                'type': 'user_duplicate_concentration',
+                'severity': 'MEDIUM',
+                'description': f'Users with high duplicate counts: {", ".join(high_duplicate_users)}',
+                'users': high_duplicate_users,
+                'counts': {user: user_duplicate_counts[user] for user in high_duplicate_users}
+            })
+        
+        return compliance_issues
+    
+    def get_high_priority_recommendations(self):
+        """Get high priority recommendations based on duplicate analysis results"""
+        recommendations = []
+        
+        # Check for critical risk duplicates
+        critical_duplicates = [item for item in self.duplicate_list if item.get('risk_score', 0) >= 90]
+        if critical_duplicates:
+            # Calculate total amount for critical duplicates
+            critical_amount = 0
+            for item in critical_duplicates:
+                if 'transaction1' in item and 'amount' in item['transaction1']:
+                    critical_amount += item['transaction1']['amount']
+                elif 'amount' in item:
+                    critical_amount += item['amount']
+            
+            recommendations.append({
+                'priority': 'CRITICAL',
+                'action': 'Immediate investigation required',
+                'description': f'Found {len(critical_duplicates)} critical-risk duplicate transactions',
+                'count': len(critical_duplicates),
+                'total_amount': critical_amount,
+                'recommendation': 'Review and investigate these transactions immediately for potential fraud or errors'
+            })
+        
+        # Check for high-risk duplicates
+        high_risk_duplicates = [item for item in self.duplicate_list if 80 <= item.get('risk_score', 0) < 90]
+        if high_risk_duplicates:
+            # Calculate total amount for high-risk duplicates
+            high_risk_amount = 0
+            for item in high_risk_duplicates:
+                if 'transaction1' in item and 'amount' in item['transaction1']:
+                    high_risk_amount += item['transaction1']['amount']
+                elif 'amount' in item:
+                    high_risk_amount += item['amount']
+            
+            recommendations.append({
+                'priority': 'HIGH',
+                'action': 'Priority investigation',
+                'description': f'Found {len(high_risk_duplicates)} high-risk duplicate transactions',
+                'count': len(high_risk_duplicates),
+                'total_amount': high_risk_amount,
+                'recommendation': 'Investigate these transactions within 48 hours'
+            })
+        
+        # Check for large amount duplicates
+        large_amount_duplicates = []
+        large_amount_total = 0
+        for item in self.duplicate_list:
+            amount = 0
+            if 'transaction1' in item and 'amount' in item['transaction1']:
+                amount = item['transaction1']['amount']
+            elif 'amount' in item:
+                amount = item['amount']
+            
+            if amount > 1000000:  # Over 1M SAR
+                large_amount_duplicates.append(item)
+                large_amount_total += amount
+        
+        if large_amount_duplicates:
+            recommendations.append({
+                'priority': 'HIGH',
+                'action': 'Large amount duplicate review',
+                'description': f'Found {len(large_amount_duplicates)} duplicate transactions with amounts over 1M SAR',
+                'count': len(large_amount_duplicates),
+                'total_amount': large_amount_total,
+                'recommendation': 'Review these large amount duplicates for potential financial statement impact'
+            })
+        
+        # Check for user concentration
+        user_duplicate_counts = {}
+        for item in self.duplicate_list:
+            # Handle new structure where user is in transaction1
+            if 'transaction1' in item and 'user' in item['transaction1']:
+                user = item['transaction1']['user']
+            elif 'user' in item:
+                user = item['user']
+            else:
+                user = 'Unknown'
+            user_duplicate_counts[user] = user_duplicate_counts.get(user, 0) + 1
+        
+        high_duplicate_users = [user for user, count in user_duplicate_counts.items() if count > 10]
+        if high_duplicate_users:
+            recommendations.append({
+                'priority': 'MEDIUM',
+                'action': 'User behavior review',
+                'description': f'Users with excessive duplicates: {", ".join(high_duplicate_users)}',
+                'users': high_duplicate_users,
+                'counts': {user: user_duplicate_counts[user] for user in high_duplicate_users},
+                'recommendation': 'Review user training and system controls for these users'
+            })
+        
+        # Check for duplicate percentage
+        total_duplicates = len(self.duplicate_list)
+        if total_duplicates > 0:
+            duplicate_percentage = self.analysis_info.get('duplicate_percentage', 0)
+            if duplicate_percentage > 15:  # More than 15% duplicates
+                recommendations.append({
+                    'priority': 'HIGH',
+                    'action': 'System control review',
+                    'description': f'Very high duplicate percentage: {duplicate_percentage:.2f}%',
+                    'percentage': duplicate_percentage,
+                    'recommendation': 'Review and strengthen system controls to prevent duplicate entries'
+                })
+            elif duplicate_percentage > 5:  # More than 5% duplicates
+                recommendations.append({
+                    'priority': 'MEDIUM',
+                    'action': 'Process improvement',
+                    'description': f'High duplicate percentage: {duplicate_percentage:.2f}%',
+                    'percentage': duplicate_percentage,
+                    'recommendation': 'Consider process improvements to reduce duplicate entries'
+                })
+        
+        return recommendations
 
 class BackdatedAnalysisResult(models.Model):
     """Model to store enhanced backdated analysis results for files"""
@@ -594,39 +803,44 @@ class BackdatedAnalysisResult(models.Model):
         indexes = [
             models.Index(fields=['data_file', 'analysis_date']),
             models.Index(fields=['analysis_type', 'status']),
-            models.Index(fields=['processing_job']),
+            models.Index(fields=['processing_job', 'status']),
         ]
     
     def __str__(self):
         return f"Backdated Analysis for {self.data_file.file_name} - {self.analysis_date}"
     
     def get_analysis_summary(self):
-        """Get summary of backdated analysis"""
-        summary = self.analysis_info.copy()
-        summary.update({
-            'analysis_date': self.analysis_date.isoformat(),
-            'analysis_type': self.analysis_type,
-            'analysis_version': self.analysis_version,
-            'status': self.status,
+        """Get summary of backdated analysis results"""
+        return {
+            'total_backdated': self.get_backdated_count(),
+            'total_amount': self.get_total_amount(),
+            'risk_distribution': self.get_risk_distribution(),
             'processing_duration': self.processing_duration,
-        })
-        return summary
+            'analysis_date': self.analysis_date.isoformat()
+        }
     
     def get_backdated_count(self):
-        """Get total number of backdated entries"""
-        return self.analysis_info.get('total_backdated_entries', 0)
+        """Get count of backdated entries"""
+        return len(self.backdated_entries) if self.backdated_entries else 0
     
     def get_total_amount(self):
         """Get total amount of backdated entries"""
-        return self.analysis_info.get('total_amount', 0)
+        if not self.backdated_entries:
+            return Decimal('0.00')
+        return sum(Decimal(str(entry.get('amount_local_currency', 0))) for entry in self.backdated_entries)
     
     def get_risk_distribution(self):
         """Get risk distribution of backdated entries"""
-        return {
-            'high_risk': self.analysis_info.get('high_risk_entries', 0),
-            'medium_risk': self.analysis_info.get('medium_risk_entries', 0),
-            'low_risk': self.analysis_info.get('low_risk_entries', 0),
-        }
+        if not self.backdated_entries:
+            return {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+        
+        risk_counts = {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+        for entry in self.backdated_entries:
+            risk_level = entry.get('risk_level', 'low').lower()
+            if risk_level in risk_counts:
+                risk_counts[risk_level] += 1
+        
+        return risk_counts
     
     def get_high_priority_recommendations(self):
         """Get high priority audit recommendations"""
@@ -635,6 +849,103 @@ class BackdatedAnalysisResult(models.Model):
     def get_compliance_issues(self):
         """Get compliance issues identified"""
         return self.compliance_assessment.get('compliance_issues', [])
+
+class UserAnalysisResult(models.Model):
+    """Model to store user analysis results for identifying user activity patterns and anomalies"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='user_analyses', help_text='Reference to the data file')
+    
+    # Analysis metadata
+    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
+    analysis_type = models.CharField(max_length=50, default='user_analysis', help_text='Type of analysis performed')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
+    
+    # Analysis results - stored as JSON for flexibility
+    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total users, transactions per user, etc.)')
+    user_transaction_summary = models.JSONField(default=list, help_text='Summary of transactions per user')
+    user_debit_analysis = models.JSONField(default=list, help_text='Debit value analysis per user')
+    user_account_distribution = models.JSONField(default=list, help_text='Number of unique users per account')
+    user_fs_line_distribution = models.JSONField(default=list, help_text='Number of unique users per FS line')
+    user_anomalies = models.JSONField(default=list, help_text='List of user anomalies detected')
+    user_risk_assessment = models.JSONField(default=dict, help_text='User risk assessment and scoring')
+    user_patterns = models.JSONField(default=dict, help_text='User activity patterns and trends')
+    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='user_results', help_text='Reference to the processing job that generated this analysis')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Analysis status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'user_analysis_results'
+        ordering = ['-analysis_date']
+        indexes = [
+            models.Index(fields=['data_file', 'analysis_date']),
+            models.Index(fields=['analysis_type', 'status']),
+            models.Index(fields=['processing_job', 'status']),
+        ]
+    
+    def __str__(self):
+        return f"User Analysis for {self.data_file.file_name} - {self.analysis_date}"
+    
+    def get_analysis_summary(self):
+        """Get summary of user analysis results"""
+        return {
+            'total_users': self.get_total_users(),
+            'total_transactions': self.get_total_transactions(),
+            'anomalies_detected': self.get_anomalies_count(),
+            'high_risk_users': self.get_high_risk_users_count(),
+            'processing_duration': self.processing_duration,
+            'analysis_date': self.analysis_date.isoformat()
+        }
+    
+    def get_total_users(self):
+        """Get total number of unique users"""
+        return len(self.user_transaction_summary) if self.user_transaction_summary else 0
+    
+    def get_total_transactions(self):
+        """Get total number of transactions"""
+        if not self.user_transaction_summary:
+            return 0
+        return sum(user.get('transaction_count', 0) for user in self.user_transaction_summary)
+    
+    def get_anomalies_count(self):
+        """Get count of user anomalies detected"""
+        return len(self.user_anomalies) if self.user_anomalies else 0
+    
+    def get_high_risk_users_count(self):
+        """Get count of high-risk users"""
+        if not self.user_risk_assessment:
+            return 0
+        
+        # Handle list-based user risk assessment
+        if isinstance(self.user_risk_assessment, list):
+            return len([user for user in self.user_risk_assessment 
+                       if isinstance(user, dict) and user.get('risk_level', 'low') in ['high', 'critical']])
+        
+        # Handle dictionary-based user risk assessment (legacy)
+        if isinstance(self.user_risk_assessment, dict):
+            return len([user for user in self.user_risk_assessment.get('user_risk_scores', []) 
+                       if isinstance(user, dict) and user.get('risk_level', 'low') in ['high', 'critical']])
+        
+        return 0
 
 
 

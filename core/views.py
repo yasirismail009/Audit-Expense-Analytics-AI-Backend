@@ -18,7 +18,7 @@ from decimal import Decimal, InvalidOperation
 from rest_framework.pagination import PageNumberPagination
 from django.db.models import Q
 
-from .models import SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult
+from .models import SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult
 from .serializers import (
     DataFileSerializer, DataFileUploadSerializer, DataUploadResponseSerializer,
     FileProcessingJobSerializer, MLModelTrainingSerializer, TargetedAnomalyUploadSerializer,
@@ -855,6 +855,15 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
             if not risk_document:
                 logger.warning(f"No completed risk analysis found for file {file_id}")
             
+            # Get the latest user analysis result for this file with enhanced validation
+            user_analysis = UserAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            if not user_analysis:
+                logger.warning(f"No completed user analysis found for file {file_id}")
+            
             # Validate file processing status
             if data_file.status != 'COMPLETED':
                 logger.warning(f"File {file_id} is not in COMPLETED status. Current status: {data_file.status}")
@@ -878,10 +887,12 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                 },
                 'overall_analysis': {},
                 'risk_analysis': {},
+                'user_analysis': {},
                 'chart_data': {},
                 'analysis_metadata': {
                     'has_overall_analysis': bool(overall_analysis),
                     'has_risk_analysis': bool(risk_document),
+                    'has_user_analysis': bool(user_analysis),
                     'analysis_timestamp': timezone.now().isoformat(),
                     'analysis_version': '2.0.0'
                 }
@@ -902,6 +913,15 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     enhanced_flag_summary = self._enhance_flag_summary(
                         overall_analysis.flag_summary, transactions
                     )
+                    
+                    # Add debugging information for overall analysis
+                    enhanced_flag_summary['debug_info'] = {
+                        'backdated_anomalies_count': enhanced_flag_summary.get('backdated_anomalies', 0),
+                        'duplicate_anomalies_count': enhanced_flag_summary.get('duplicate_anomalies', 0),
+                        'high_value_anomalies_count': enhanced_flag_summary.get('high_value_anomalies', 0),
+                        'total_anomalies': enhanced_flag_summary.get('total_anomalies', 0),
+                        'debug_message': f'Overall analysis: {enhanced_flag_summary.get("backdated_anomalies", 0)} backdated, {enhanced_flag_summary.get("duplicate_anomalies", 0)} duplicates, {enhanced_flag_summary.get("high_value_anomalies", 0)} high value'
+                    }
                 
                     # Enhanced risk assessment with real data and validation
                     enhanced_risk_assessment = self._enhance_risk_assessment(
@@ -960,6 +980,59 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                 
                     # Enhanced risk analysis with real data and validation
                     enhanced_risk_analysis = self._enhance_risk_analysis(risk_document, transactions)
+                    
+                    # Add debugging information for transaction-based anomalies
+                    backdated_count = transactions.filter(is_backdated=True).count()
+                    duplicate_count = transactions.filter(is_duplicate=True).count()
+                    high_value_count = len([t for t in transactions if t.is_high_value])
+                    
+                    debug_info = {
+                        'backdated_anomalies_count': backdated_count,
+                        'duplicate_anomalies_count': duplicate_count,
+                        'high_value_anomalies_count': high_value_count,
+                        'total_transactions': transactions.count(),
+                        'backdated_percentage': (backdated_count / transactions.count() * 100) if transactions.count() > 0 else 0,
+                        'debug_message': f'Found {backdated_count} backdated anomalies out of {transactions.count()} total transactions',
+                        'clarification': 'Risk analysis is a comprehensive analysis that includes transaction-based and user-based anomalies'
+                    }
+                    
+                    # Add user anomalies information if available
+                    if user_analysis:
+                        user_anomalies_count = len(user_analysis.user_anomalies or [])
+                        high_risk_users_count = user_analysis.get_high_risk_users_count()
+                        total_users_count = user_analysis.get_total_users()
+                        
+                        debug_info.update({
+                            'user_anomalies_count': user_anomalies_count,
+                            'high_risk_users_count': high_risk_users_count,
+                            'total_users_count': total_users_count,
+                            'user_anomaly_percentage': (user_anomalies_count / total_users_count * 100) if total_users_count > 0 else 0,
+                            'debug_message': f'{debug_info["debug_message"]}, {user_anomalies_count} user anomalies out of {total_users_count} users',
+                            'clarification': 'Risk analysis includes both transaction-based anomalies (duplicates, backdated, high-value) and user-based anomalies (behavior patterns, risk factors)'
+                        })
+                        
+                        # Add user anomalies to risk analysis
+                        enhanced_risk_analysis['user_anomalies'] = {
+                            'total_user_anomalies': user_anomalies_count,
+                            'high_risk_users_count': high_risk_users_count,
+                            'total_users_count': total_users_count,
+                            'user_anomaly_percentage': (user_anomalies_count / total_users_count * 100) if total_users_count > 0 else 0,
+                            'user_anomaly_types_count': len(self._get_user_anomaly_type_summary(user_analysis.user_anomalies or [])),
+                            'user_anomaly_severity_distribution': self._get_user_anomaly_severity_distribution(user_analysis.user_anomalies or []),
+                            'user_risk_distribution': self._get_user_risk_distribution(user_analysis.user_risk_assessment)
+                        }
+                        
+                        # Update user behavior risk factor in risk_factors
+                        if 'risk_factors' in enhanced_risk_analysis:
+                            enhanced_risk_analysis['risk_factors']['user_behavior_risk'] = {
+                                'count': user_anomalies_count,
+                                'percentage': (user_anomalies_count / total_users_count * 100) if total_users_count > 0 else 0,
+                                'description': 'Risk associated with user behavior patterns and anomalies',
+                                'high_risk_users_count': high_risk_users_count,
+                                'high_risk_users_percentage': (high_risk_users_count / total_users_count * 100) if total_users_count > 0 else 0
+                            }
+                    
+                    enhanced_risk_analysis['debug_info'] = debug_info
                 
                     response_data['risk_analysis'] = enhanced_risk_analysis
                 except Exception as e:
@@ -980,6 +1053,49 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'suggestions': ['Run risk analysis for this file', 'Check if risk analysis processing completed successfully']
                 }
             
+            # User Analysis Statistics with enhanced error handling
+            if user_analysis:
+                try:
+                    # Get actual transaction data for enhanced user analysis with optimization
+                    transactions = SAPGLPosting.objects.filter(data_file=data_file).select_related()
+                    
+                    # Enhanced user analysis with real data and validation
+                    enhanced_user_analysis = self._enhance_user_analysis(user_analysis, transactions)
+                    
+                    # Add debugging information for user anomalies
+                    user_anomalies_count = len(user_analysis.user_anomalies or [])
+                    high_risk_users_count = user_analysis.get_high_risk_users_count()
+                    total_users_count = user_analysis.get_total_users()
+                    
+                    enhanced_user_analysis['debug_info'] = {
+                        'user_anomalies_count': user_anomalies_count,
+                        'high_risk_users_count': high_risk_users_count,
+                        'total_users_count': total_users_count,
+                        'anomaly_percentage': (user_anomalies_count / total_users_count * 100) if total_users_count > 0 else 0,
+                        'high_risk_percentage': (high_risk_users_count / total_users_count * 100) if total_users_count > 0 else 0,
+                        'debug_message': f'Found {user_anomalies_count} user anomalies out of {total_users_count} total users',
+                        'clarification': 'User analysis focuses on user behavior patterns and anomalies, complementing transaction-based anomaly detection'
+                    }
+                    
+                    response_data['user_analysis'] = enhanced_user_analysis
+                except Exception as e:
+                    logger.error(f"Error enhancing user analysis for file {file_id}: {e}")
+                    response_data['user_analysis'] = {
+                        'error': f'Error enhancing user analysis: {str(e)}',
+                        'status': 'ERROR',
+                        'original_data': {
+                            'analysis_id': str(user_analysis.id),
+                            'analysis_date': user_analysis.analysis_date,
+                            'status': user_analysis.status
+                        }
+                    }
+            else:
+                response_data['user_analysis'] = {
+                    'error': 'No user analysis results found for this file',
+                    'status': 'NOT_AVAILABLE',
+                    'suggestions': ['Run user analysis for this file', 'Check if user analysis processing completed successfully']
+                }
+            
             # Combined Chart Data (only for overall and risk analysis)
             combined_chart_data = {}
             
@@ -987,7 +1103,7 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                 combined_chart_data.update(overall_analysis.chart_data)
             
             # Add risk-specific chart data if available
-            if risk_document and risk_document.risk_distributions:
+            if risk_document:
                 # Create ANOMALY-BASED risk distribution chart data (not transaction-based)
                 # Get transactions for this file to calculate anomaly distribution
                 transactions = SAPGLPosting.objects.filter(data_file=data_file)
@@ -996,6 +1112,25 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                 duplicate_anomalies = transactions.filter(is_duplicate=True).count()
                 backdated_anomalies = transactions.filter(is_backdated=True).count()
                 high_value_anomalies = len([t for t in transactions if t.is_high_value])
+                
+                # Add debugging information for chart data
+                chart_debug_info = {
+                    'duplicate_anomalies': duplicate_anomalies,
+                    'backdated_anomalies': backdated_anomalies,
+                    'high_value_anomalies': high_value_anomalies,
+                    'total_transactions': transactions.count(),
+                    'debug_message': f'Chart data: {duplicate_anomalies} duplicates, {backdated_anomalies} backdated, {high_value_anomalies} high value'
+                }
+                
+                # Add user anomalies information if available
+                if user_analysis:
+                    user_anomalies_count = len(user_analysis.user_anomalies or [])
+                    high_risk_users_count = user_analysis.get_high_risk_users_count()
+                    chart_debug_info.update({
+                        'user_anomalies': user_anomalies_count,
+                        'high_risk_users': high_risk_users_count,
+                        'debug_message': f'{chart_debug_info["debug_message"]}, {user_anomalies_count} user anomalies, {high_risk_users_count} high-risk users'
+                    })
                 
                 # Calculate anomaly distribution based on actual anomaly counts
                 # This is the correct approach - show individual anomalies, not merged transactions
@@ -1029,7 +1164,8 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     ],
                     'colors': ['#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384'],
                     'description': 'Distribution of anomalies across risk levels (not transactions)',
-                    'total_anomalies': low_risk_anomalies + medium_risk_anomalies + high_risk_anomalies + critical_risk_anomalies
+                    'total_anomalies': low_risk_anomalies + medium_risk_anomalies + high_risk_anomalies + critical_risk_anomalies,
+                    'debug_info': chart_debug_info
                 }
                 
                 # Add overall risk score gauge chart with comprehensive definitions
@@ -1162,7 +1298,13 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                 'total_alerts': len(response_data.get('overall_analysis', {}).get('critical_alerts', [])),
                 'critical_issues': len([a for a in response_data.get('overall_analysis', {}).get('critical_alerts', []) if a.get('type') == 'CRITICAL']),
                 'warnings': len([a for a in response_data.get('overall_analysis', {}).get('critical_alerts', []) if a.get('type') == 'WARNING']),
-                'analysis_quality': 'HIGH' if response_data['analysis_metadata']['has_overall_analysis'] and response_data['analysis_metadata']['has_risk_analysis'] else 'PARTIAL'
+                'analysis_quality': 'HIGH' if response_data['analysis_metadata']['has_overall_analysis'] and response_data['analysis_metadata']['has_risk_analysis'] else 'PARTIAL',
+                'user_anomalies_summary': {
+                    'total_user_anomalies': user_analysis.get_anomalies_count() if user_analysis else 0,
+                    'high_risk_users': user_analysis.get_high_risk_users_count() if user_analysis else 0,
+                    'total_users': user_analysis.get_total_users() if user_analysis else 0,
+                    'anomaly_percentage': (user_analysis.get_anomalies_count() / user_analysis.get_total_users() * 100) if user_analysis and user_analysis.get_total_users() > 0 else 0
+                } if user_analysis else {}
             }
             
             # Log successful response for monitoring
@@ -1476,6 +1618,14 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
             }
         }
         
+        # Add user-based risk factors if user analysis data is available
+        # Note: This will be populated in the main method when user_analysis is available
+        enhanced_risk_factors['user_behavior_risk'] = {
+            'count': 0,  # Will be updated if user analysis is available
+            'percentage': 0,  # Will be updated if user analysis is available
+            'description': 'Risk associated with user behavior patterns and anomalies'
+        }
+        
         # Enhanced recommendations based on actual data
         enhanced_recommendations = []
         
@@ -1710,6 +1860,543 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
             all_gl_accounts.append(account_info)
         
         return all_gl_accounts
+    
+    def _enhance_user_analysis(self, user_analysis, transactions):
+        """Enhanced user analysis with key statistics only"""
+        try:
+            enhanced_analysis = {
+                'analysis_id': str(user_analysis.id),
+                'analysis_date': user_analysis.analysis_date,
+                'processing_duration': user_analysis.processing_duration,
+                'status': user_analysis.status,
+                'analysis_version': user_analysis.analysis_version or '1.0.0',
+                
+                # User Summary Statistics
+                'user_summary': {
+                    'total_users': user_analysis.get_total_users(),
+                    'total_transactions': user_analysis.get_total_transactions(),
+                    'avg_transactions_per_user': user_analysis.get_total_transactions() / user_analysis.get_total_users() if user_analysis.get_total_users() > 0 else 0,
+                    'unique_accounts_accessed': len(set(t.gl_account for t in transactions)),
+                    'date_range': {
+                        'earliest_date': min(t.posting_date for t in transactions).isoformat() if transactions else None,
+                        'latest_date': max(t.posting_date for t in transactions).isoformat() if transactions else None
+                    }
+                },
+                
+                # User Anomalies Statistics
+                'user_anomalies': {
+                    'total_anomalies': user_analysis.get_anomalies_count(),
+                    'anomaly_types_count': len(self._get_user_anomaly_type_summary(user_analysis.user_anomalies or [])),
+                    'anomaly_severity_distribution': self._get_user_anomaly_severity_distribution(user_analysis.user_anomalies or []),
+                    'top_anomalous_users_count': len(self._get_top_anomalous_users(user_analysis.user_anomalies or [], limit=5)),
+                    'anomaly_trends_summary': {
+                        'total_days': self._get_user_anomaly_trends(user_analysis.user_anomalies or []).get('total_days', 0),
+                        'avg_anomalies_per_day': self._get_user_anomaly_trends(user_analysis.user_anomalies or []).get('avg_anomalies_per_day', 0)
+                    }
+                },
+                
+                # User Risk Assessment Statistics
+                'user_risk_assessment': {
+                    'high_risk_users_count': user_analysis.get_high_risk_users_count(),
+                    'risk_distribution': self._get_user_risk_distribution(user_analysis.user_risk_assessment),
+                    'risk_factors_count': len(self._extract_user_risk_factors(user_analysis.user_risk_assessment)),
+                    'top_risk_users_count': len(self._get_top_risk_users(user_analysis.user_risk_assessment, limit=5))
+                },
+                
+                # User Activity Pattern Statistics
+                'user_patterns': {
+                    'high_activity_users_count': len(self._analyze_user_transaction_patterns(user_analysis.user_transaction_summary or []).get('high_activity_users', [])),
+                    'low_activity_users_count': len(self._analyze_user_transaction_patterns(user_analysis.user_transaction_summary or []).get('low_activity_users', [])),
+                    'high_value_users_count': len(self._analyze_user_transaction_patterns(user_analysis.user_transaction_summary or []).get('high_value_users', [])),
+                    'multi_account_users_count': len(self._analyze_user_transaction_patterns(user_analysis.user_transaction_summary or []).get('multi_account_users', [])),
+                    'most_accessed_accounts_count': len(self._analyze_account_access_patterns(user_analysis.user_account_distribution or []).get('most_accessed_accounts', [])),
+                    'exclusive_accounts_count': len(self._analyze_account_access_patterns(user_analysis.user_account_distribution or []).get('exclusive_accounts', [])),
+                    'shared_accounts_count': len(self._analyze_account_access_patterns(user_analysis.user_account_distribution or []).get('shared_accounts', [])),
+                    'weekend_activity_percentage': self._analyze_temporal_patterns(transactions).get('weekend_activity', {}).get('weekend_percentage', 0)
+                }
+            }
+            
+            return enhanced_analysis
+            
+        except Exception as e:
+            logger.error(f"Error enhancing user analysis: {e}")
+            return {
+                'error': f'Error enhancing user analysis: {str(e)}',
+                'status': 'ERROR'
+            }
+    
+    def _get_user_anomaly_type_summary(self, user_anomalies):
+        """Get summary of user anomaly types"""
+        if not user_anomalies:
+            return {}
+        
+        anomaly_types = {}
+        for anomaly in user_anomalies:
+            if isinstance(anomaly, dict):
+                anomaly_type = anomaly.get('anomaly_type', 'unknown')
+                if anomaly_type not in anomaly_types:
+                    anomaly_types[anomaly_type] = {
+                        'count': 0,
+                        'users': set(),
+                        'severity_levels': set()
+                    }
+                
+                anomaly_types[anomaly_type]['count'] += 1
+                anomaly_types[anomaly_type]['users'].add(anomaly.get('user_name', 'unknown'))
+                anomaly_types[anomaly_type]['severity_levels'].add(anomaly.get('severity', 'medium'))
+        
+        # Convert sets to lists for JSON serialization
+        for anomaly_type in anomaly_types:
+            anomaly_types[anomaly_type]['users'] = list(anomaly_types[anomaly_type]['users'])
+            anomaly_types[anomaly_type]['severity_levels'] = list(anomaly_types[anomaly_type]['severity_levels'])
+        
+        return anomaly_types
+    
+    def _get_user_anomaly_severity_distribution(self, user_anomalies):
+        """Get distribution of user anomalies by severity"""
+        if not user_anomalies:
+            return {}
+        
+        severity_distribution = {
+            'low': 0,
+            'medium': 0,
+            'high': 0,
+            'critical': 0
+        }
+        
+        for anomaly in user_anomalies:
+            if isinstance(anomaly, dict):
+                severity = anomaly.get('severity', 'medium').lower()
+                if severity in severity_distribution:
+                    severity_distribution[severity] += 1
+        
+        return severity_distribution
+    
+    def _get_top_anomalous_users(self, user_anomalies, limit=10):
+        """Get top users with most anomalies"""
+        if not user_anomalies:
+            return []
+        
+        user_anomaly_counts = {}
+        for anomaly in user_anomalies:
+            if isinstance(anomaly, dict):
+                user_name = anomaly.get('user_name', 'unknown')
+                if user_name not in user_anomaly_counts:
+                    user_anomaly_counts[user_name] = {
+                        'user_name': user_name,
+                        'anomaly_count': 0,
+                        'anomaly_types': set(),
+                        'severity_levels': set(),
+                        'total_risk_score': 0
+                    }
+                
+                user_anomaly_counts[user_name]['anomaly_count'] += 1
+                user_anomaly_counts[user_name]['anomaly_types'].add(anomaly.get('anomaly_type', 'unknown'))
+                user_anomaly_counts[user_name]['severity_levels'].add(anomaly.get('severity', 'medium'))
+                user_anomaly_counts[user_name]['total_risk_score'] += anomaly.get('risk_score', 0)
+        
+        # Convert sets to lists and calculate average risk score
+        for user_data in user_anomaly_counts.values():
+            user_data['anomaly_types'] = list(user_data['anomaly_types'])
+            user_data['severity_levels'] = list(user_data['severity_levels'])
+            user_data['avg_risk_score'] = user_data['total_risk_score'] / user_data['anomaly_count'] if user_data['anomaly_count'] > 0 else 0
+        
+        # Sort by anomaly count and return top users
+        top_users = sorted(user_anomaly_counts.values(), key=lambda x: x['anomaly_count'], reverse=True)
+        return top_users[:limit]
+    
+    def _get_user_anomaly_trends(self, user_anomalies):
+        """Get trends in user anomalies over time"""
+        if not user_anomalies:
+            return {}
+        
+        # Group anomalies by date
+        date_anomalies = {}
+        for anomaly in user_anomalies:
+            if isinstance(anomaly, dict):
+                date_str = anomaly.get('date', 'unknown')
+                if date_str not in date_anomalies:
+                    date_anomalies[date_str] = {
+                        'date': date_str,
+                        'anomaly_count': 0,
+                        'unique_users': set(),
+                        'anomaly_types': set()
+                    }
+                
+                date_anomalies[date_str]['anomaly_count'] += 1
+                date_anomalies[date_str]['unique_users'].add(anomaly.get('user_name', 'unknown'))
+                date_anomalies[date_str]['anomaly_types'].add(anomaly.get('anomaly_type', 'unknown'))
+        
+        # Convert sets to lists
+        for date_data in date_anomalies.values():
+            date_data['unique_users'] = list(date_data['unique_users'])
+            date_data['anomaly_types'] = list(date_data['anomaly_types'])
+        
+        # Sort by date
+        sorted_dates = sorted(date_anomalies.values(), key=lambda x: x['date'])
+        
+        return {
+            'daily_trends': sorted_dates,
+            'total_days': len(sorted_dates),
+            'avg_anomalies_per_day': sum(d['anomaly_count'] for d in sorted_dates) / len(sorted_dates) if sorted_dates else 0
+        }
+    
+    def _get_user_risk_distribution(self, user_risk_assessment):
+        """Get distribution of user risk levels"""
+        if not user_risk_assessment:
+            return {}
+        
+        risk_distribution = {
+            'low': 0,
+            'medium': 0,
+            'high': 0,
+            'critical': 0
+        }
+        
+        # Handle list-based user risk assessment
+        if isinstance(user_risk_assessment, list):
+            for user in user_risk_assessment:
+                if isinstance(user, dict):
+                    risk_level = user.get('risk_level', 'low').lower()
+                    if risk_level in risk_distribution:
+                        risk_distribution[risk_level] += 1
+        
+        # Handle dictionary-based user risk assessment (legacy)
+        elif isinstance(user_risk_assessment, dict):
+            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
+            for user in user_risk_scores:
+                if isinstance(user, dict):
+                    risk_level = user.get('risk_level', 'low').lower()
+                    if risk_level in risk_distribution:
+                        risk_distribution[risk_level] += 1
+        
+        return risk_distribution
+    
+    def _extract_user_risk_factors(self, user_risk_assessment):
+        """Extract key risk factors from user risk assessment"""
+        if not user_risk_assessment:
+            return []
+        
+        risk_factors = []
+        
+        # Handle list-based user risk assessment
+        if isinstance(user_risk_assessment, list):
+            for user in user_risk_assessment:
+                if isinstance(user, dict):
+                    factors = user.get('risk_factors', [])
+                    if isinstance(factors, list):
+                        risk_factors.extend(factors)
+        
+        # Handle dictionary-based user risk assessment (legacy)
+        elif isinstance(user_risk_assessment, dict):
+            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
+            for user in user_risk_scores:
+                if isinstance(user, dict):
+                    factors = user.get('risk_factors', [])
+                    if isinstance(factors, list):
+                        risk_factors.extend(factors)
+        
+        # Count frequency of each risk factor
+        factor_counts = {}
+        for factor in risk_factors:
+            if isinstance(factor, dict):
+                factor_name = factor.get('factor', 'unknown')
+            else:
+                factor_name = str(factor)
+            
+            if factor_name not in factor_counts:
+                factor_counts[factor_name] = 0
+            factor_counts[factor_name] += 1
+        
+        # Return top risk factors
+        sorted_factors = sorted(factor_counts.items(), key=lambda x: x[1], reverse=True)
+        return [{'factor': factor, 'count': count} for factor, count in sorted_factors[:10]]
+    
+    def _get_top_risk_users(self, user_risk_assessment, limit=10):
+        """Get top users with highest risk scores"""
+        if not user_risk_assessment:
+            return []
+        
+        user_risk_data = []
+        
+        # Handle list-based user risk assessment
+        if isinstance(user_risk_assessment, list):
+            for user in user_risk_assessment:
+                if isinstance(user, dict):
+                    user_risk_data.append({
+                        'user_name': user.get('user_name', 'unknown'),
+                        'risk_score': user.get('risk_score', 0),
+                        'risk_level': user.get('risk_level', 'low'),
+                        'risk_factors': user.get('risk_factors', [])
+                    })
+        
+        # Handle dictionary-based user risk assessment (legacy)
+        elif isinstance(user_risk_assessment, dict):
+            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
+            for user in user_risk_scores:
+                if isinstance(user, dict):
+                    user_risk_data.append({
+                        'user_name': user.get('user_name', 'unknown'),
+                        'risk_score': user.get('risk_score', 0),
+                        'risk_level': user.get('risk_level', 'low'),
+                        'risk_factors': user.get('risk_factors', [])
+                    })
+        
+        # Sort by risk score and return top users
+        sorted_users = sorted(user_risk_data, key=lambda x: x['risk_score'], reverse=True)
+        return sorted_users[:limit]
+    
+    def _analyze_user_transaction_patterns(self, user_transaction_summary):
+        """Analyze patterns in user transaction behavior"""
+        if not user_transaction_summary:
+            return {}
+        
+        patterns = {
+            'high_activity_users': [],
+            'low_activity_users': [],
+            'high_value_users': [],
+            'multi_account_users': []
+        }
+        
+        for user in user_transaction_summary:
+            if isinstance(user, dict):
+                user_name = user.get('user_name', 'unknown')
+                transaction_count = user.get('transaction_count', 0)
+                total_amount = user.get('total_amount', 0)
+                account_count = user.get('account_count', 0)
+                
+                # High activity users (>10 transactions)
+                if transaction_count > 10:
+                    patterns['high_activity_users'].append({
+                        'user_name': user_name,
+                        'transaction_count': transaction_count,
+                        'total_amount': total_amount
+                    })
+                
+                # Low activity users (≤5 transactions)
+                if transaction_count <= 5:
+                    patterns['low_activity_users'].append({
+                        'user_name': user_name,
+                        'transaction_count': transaction_count,
+                        'total_amount': total_amount
+                    })
+                
+                # High value users (>1M total amount)
+                if total_amount > 1000000:
+                    patterns['high_value_users'].append({
+                        'user_name': user_name,
+                        'transaction_count': transaction_count,
+                        'total_amount': total_amount
+                    })
+                
+                # Multi-account users (>5 accounts)
+                if account_count > 5:
+                    patterns['multi_account_users'].append({
+                        'user_name': user_name,
+                        'account_count': account_count,
+                        'transaction_count': transaction_count
+                    })
+        
+        return patterns
+    
+    def _analyze_account_access_patterns(self, user_account_distribution):
+        """Analyze patterns in user account access"""
+        if not user_account_distribution:
+            return {}
+        
+        patterns = {
+            'most_accessed_accounts': [],
+            'exclusive_accounts': [],
+            'shared_accounts': []
+        }
+        
+        for account_data in user_account_distribution:
+            if isinstance(account_data, dict):
+                account = account_data.get('account', 'unknown')
+                user_count = account_data.get('user_count', 0)
+                transaction_count = account_data.get('transaction_count', 0)
+                
+                account_info = {
+                    'account': account,
+                    'user_count': user_count,
+                    'transaction_count': transaction_count
+                }
+                
+                # Most accessed accounts (high transaction count)
+                if transaction_count > 50:
+                    patterns['most_accessed_accounts'].append(account_info)
+                
+                # Exclusive accounts (only 1 user)
+                if user_count == 1:
+                    patterns['exclusive_accounts'].append(account_info)
+                
+                # Shared accounts (multiple users)
+                if user_count > 3:
+                    patterns['shared_accounts'].append(account_info)
+        
+        # Sort by relevant metrics
+        patterns['most_accessed_accounts'].sort(key=lambda x: x['transaction_count'], reverse=True)
+        patterns['exclusive_accounts'].sort(key=lambda x: x['transaction_count'], reverse=True)
+        patterns['shared_accounts'].sort(key=lambda x: x['user_count'], reverse=True)
+        
+        return patterns
+    
+    def _analyze_temporal_patterns(self, transactions):
+        """Analyze temporal patterns in user activity"""
+        if not transactions:
+            return {}
+        
+        # Group transactions by user and date
+        user_daily_activity = {}
+        for transaction in transactions:
+            user_name = transaction.user_name
+            date_str = transaction.posting_date.isoformat()
+            
+            if user_name not in user_daily_activity:
+                user_daily_activity[user_name] = {}
+            
+            if date_str not in user_daily_activity[user_name]:
+                user_daily_activity[user_name][date_str] = {
+                    'transaction_count': 0,
+                    'total_amount': 0,
+                    'accounts_accessed': set()
+                }
+            
+            user_daily_activity[user_name][date_str]['transaction_count'] += 1
+            user_daily_activity[user_name][date_str]['total_amount'] += float(transaction.amount_local_currency)
+            user_daily_activity[user_name][date_str]['accounts_accessed'].add(transaction.gl_account)
+        
+        # Convert sets to lists
+        for user_data in user_daily_activity.values():
+            for date_data in user_data.values():
+                date_data['accounts_accessed'] = list(date_data['accounts_accessed'])
+        
+        patterns = {
+            'user_daily_activity': user_daily_activity,
+            'peak_activity_days': self._find_peak_activity_days(transactions),
+            'weekend_activity': self._analyze_weekend_activity(transactions),
+            'monthly_trends': self._analyze_monthly_trends(transactions)
+        }
+        
+        return patterns
+    
+    def _find_peak_activity_days(self, transactions):
+        """Find days with peak transaction activity"""
+        daily_counts = {}
+        for transaction in transactions:
+            date_str = transaction.posting_date.isoformat()
+            daily_counts[date_str] = daily_counts.get(date_str, 0) + 1
+        
+        # Find top 5 busiest days
+        sorted_days = sorted(daily_counts.items(), key=lambda x: x[1], reverse=True)
+        return [{'date': date, 'transaction_count': count} for date, count in sorted_days[:5]]
+    
+    def _analyze_weekend_activity(self, transactions):
+        """Analyze weekend vs weekday activity"""
+        weekday_count = 0
+        weekend_count = 0
+        
+        for transaction in transactions:
+            if transaction.posting_date.weekday() < 5:  # Monday = 0, Friday = 4
+                weekday_count += 1
+            else:
+                weekend_count += 1
+        
+        return {
+            'weekday_transactions': weekday_count,
+            'weekend_transactions': weekend_count,
+            'weekend_percentage': (weekend_count / (weekday_count + weekend_count) * 100) if (weekday_count + weekend_count) > 0 else 0
+        }
+    
+    def _analyze_monthly_trends(self, transactions):
+        """Analyze monthly transaction trends"""
+        monthly_counts = {}
+        for transaction in transactions:
+            month_key = f"{transaction.posting_date.year}-{transaction.posting_date.month:02d}"
+            monthly_counts[month_key] = monthly_counts.get(month_key, 0) + 1
+        
+        # Sort by month
+        sorted_months = sorted(monthly_counts.items())
+        return [{'month': month, 'transaction_count': count} for month, count in sorted_months]
+    
+    def _prepare_user_anomaly_export(self, user_anomalies):
+        """Prepare user anomalies data for export"""
+        if not user_anomalies:
+            return []
+        
+        export_data = []
+        for anomaly in user_anomalies:
+            if isinstance(anomaly, dict):
+                export_data.append({
+                    'user_name': anomaly.get('user_name', ''),
+                    'anomaly_type': anomaly.get('anomaly_type', ''),
+                    'severity': anomaly.get('severity', ''),
+                    'risk_score': anomaly.get('risk_score', 0),
+                    'description': anomaly.get('description', ''),
+                    'date': anomaly.get('date', ''),
+                    'transaction_count': anomaly.get('transaction_count', 0),
+                    'total_amount': anomaly.get('total_amount', 0)
+                })
+        
+        return export_data
+    
+    def _prepare_user_risk_export(self, user_risk_assessment):
+        """Prepare user risk assessment data for export"""
+        if not user_risk_assessment:
+            return []
+        
+        export_data = []
+        
+        # Handle list-based user risk assessment
+        if isinstance(user_risk_assessment, list):
+            for user in user_risk_assessment:
+                if isinstance(user, dict):
+                    export_data.append({
+                        'user_name': user.get('user_name', ''),
+                        'risk_score': user.get('risk_score', 0),
+                        'risk_level': user.get('risk_level', ''),
+                        'risk_factors': user.get('risk_factors', []),
+                        'transaction_count': user.get('transaction_count', 0),
+                        'total_amount': user.get('total_amount', 0)
+                    })
+        
+        # Handle dictionary-based user risk assessment (legacy)
+        elif isinstance(user_risk_assessment, dict):
+            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
+            for user in user_risk_scores:
+                if isinstance(user, dict):
+                    export_data.append({
+                        'user_name': user.get('user_name', ''),
+                        'risk_score': user.get('risk_score', 0),
+                        'risk_level': user.get('risk_level', ''),
+                        'risk_factors': user.get('risk_factors', []),
+                        'transaction_count': user.get('transaction_count', 0),
+                        'total_amount': user.get('total_amount', 0)
+                    })
+        
+        return export_data
+    
+    def _prepare_user_summary_export(self, user_transaction_summary):
+        """Prepare user transaction summary data for export"""
+        if not user_transaction_summary:
+            return []
+        
+        export_data = []
+        for user in user_transaction_summary:
+            if isinstance(user, dict):
+                export_data.append({
+                    'user_name': user.get('user_name', ''),
+                    'transaction_count': user.get('transaction_count', 0),
+                    'total_amount': user.get('total_amount', 0),
+                    'account_count': user.get('account_count', 0),
+                    'avg_amount': user.get('avg_amount', 0),
+                    'min_amount': user.get('min_amount', 0),
+                    'max_amount': user.get('max_amount', 0),
+                    'first_transaction_date': user.get('first_transaction_date', ''),
+                    'last_transaction_date': user.get('last_transaction_date', '')
+                })
+        
+        return export_data
 
 class SAPGLPostingPagination(PageNumberPagination):
     page_size = 50
@@ -2325,88 +3012,35 @@ class FilterDropdownDataView(generics.GenericAPIView):
 class DuplicateAnalysisView(generics.GenericAPIView):
     """API view for retrieving duplicate analysis results by file ID.
     
-    Returns:
-    - Analysis metadata (ID, date, status, processing duration)
-    - Duplicate entries with detailed information
+    This view provides comprehensive duplicate analysis results including:
     - Summary statistics
-    - Risk assessment for duplicate transactions
+    - Detailed duplicate entries
+    - Chart data for visualizations
+    - Export-ready data
+    - Risk assessment
     """
     
     def get(self, request, file_id):
         """Get duplicate analysis results for a specific file"""
         try:
-            # Verify the file exists
-            data_file = DataFile.objects.get(id=file_id)
-            
             # Get the latest duplicate analysis result
-            try:
-                duplicate_analysis = DuplicateAnalysisResult.objects.filter(
-                    data_file=data_file,
-                    status='COMPLETED'
-                ).latest('analysis_date')
-            except DuplicateAnalysisResult.DoesNotExist:
-                return Response(
-                    {
-                        'error': 'No duplicate analysis results found for this file',
-                        'file_id': str(file_id),
-                        'file_name': data_file.file_name,
-                        'status': 'NOT_AVAILABLE',
-                        'suggestions': [
-                            'Run duplicate analysis for this file',
-                            'Check if duplicate analysis processing completed successfully'
-                        ]
-                    },
-                    status=status.HTTP_404_NOT_FOUND
-                )
+            from .models import DuplicateAnalysisResult
+            duplicate_analysis = DuplicateAnalysisResult.objects.filter(
+                data_file_id=file_id, status='COMPLETED'
+            ).order_by('-analysis_date').first()
             
-            # Get transactions for this file to enhance the analysis
-            transactions = SAPGLPosting.objects.filter(data_file=data_file)
-            
-            # Calculate enhanced statistics
-            total_transactions = transactions.count()
-            duplicate_transactions = transactions.filter(is_duplicate=True)
-            duplicate_count = duplicate_transactions.count()
-            
-            # Calculate risk statistics for duplicate transactions
-            if duplicate_transactions.exists():
-                avg_risk_score = duplicate_transactions.aggregate(avg=Avg('overall_risk_score'))['avg'] or 0
-                max_risk_score = duplicate_transactions.aggregate(max=Max('overall_risk_score'))['max'] or 0
-                min_risk_score = duplicate_transactions.aggregate(min=Min('overall_risk_score'))['min'] or 0
-                total_duplicate_amount = duplicate_transactions.aggregate(total=Sum('amount_local_currency'))['total'] or 0
-            else:
-                avg_risk_score = max_risk_score = min_risk_score = total_duplicate_amount = 0
-            
-            # Risk level distribution for duplicate transactions
-            risk_distribution = {
-                'low_risk': duplicate_transactions.filter(overall_risk_score__lt=30).count(),
-                'medium_risk': duplicate_transactions.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count(),
-                'high_risk': duplicate_transactions.filter(overall_risk_score__gte=60, overall_risk_score__lt=80).count(),
-                'critical_risk': duplicate_transactions.filter(overall_risk_score__gte=80).count()
-            }
-            
-            # Get high-risk duplicate transactions
-            high_risk_duplicates = duplicate_transactions.filter(
-                overall_risk_score__gte=60
-            ).values(
-                'id', 'document_number', 'gl_account', 'amount_local_currency',
-                'user_name', 'posting_date', 'overall_risk_score'
-            ).order_by('-overall_risk_score')[:10]
-            
-            # Generate comprehensive chart data
-            chart_data = self._generate_duplicate_chart_data(duplicate_transactions, transactions)
+            if not duplicate_analysis:
+                return Response({
+                    'error': 'No duplicate analysis results found for this file',
+                    'error_code': 'NO_DUPLICATE_ANALYSIS_FOUND',
+                    'suggestions': [
+                        'Run duplicate analysis for this file',
+                        'Check if duplicate analysis processing completed successfully'
+                    ]
+                }, status=404)
             
             # Prepare response data
             response_data = {
-                'file_info': {
-                    'file_id': str(file_id),
-                    'file_name': data_file.file_name,
-                    'engagement_id': data_file.engagement_id,
-                    'client_name': data_file.client_name,
-                    'company_name': data_file.company_name,
-                    'fiscal_year': data_file.fiscal_year,
-                    'uploaded_at': data_file.uploaded_at,
-                    'processed_at': data_file.processed_at
-                },
                 'analysis_info': {
                     'analysis_id': str(duplicate_analysis.id),
                     'analysis_date': duplicate_analysis.analysis_date,
@@ -2414,317 +3048,453 @@ class DuplicateAnalysisView(generics.GenericAPIView):
                     'status': duplicate_analysis.status,
                     'analysis_version': duplicate_analysis.analysis_version or '1.0.0'
                 },
-                'summary_statistics': {
-                    'total_transactions': total_transactions,
-                    'duplicate_transactions': duplicate_count,
-                    'duplicate_percentage': (duplicate_count / total_transactions * 100) if total_transactions > 0 else 0,
-                    'total_duplicate_amount': float(total_duplicate_amount),
-                    'avg_duplicate_amount': float(total_duplicate_amount / duplicate_count) if duplicate_count > 0 else 0,
-                    'avg_risk_score': float(avg_risk_score),
-                    'max_risk_score': float(max_risk_score),
-                    'min_risk_score': float(min_risk_score)
+                'summary': {
+                    'total_duplicates': len(duplicate_analysis.duplicate_list or []),
+                    'total_amount': duplicate_analysis.get_total_amount(),
+                    'risk_distribution': duplicate_analysis.get_risk_distribution(),
+                    'compliance_issues': duplicate_analysis.get_compliance_issues(),
+                    'high_priority_recommendations': duplicate_analysis.get_high_priority_recommendations()
                 },
-                'risk_assessment': {
-                    'risk_distribution': risk_distribution,
-                    'high_risk_duplicates': list(high_risk_duplicates),
-                    'risk_level': self._get_risk_level(avg_risk_score),
-                    'risk_color': self._get_risk_color(avg_risk_score),
-                    'overall_risk_score': float(avg_risk_score)
+                'detailed_results': {
+                    'duplicate_entries': duplicate_analysis.duplicate_list or [],
+                    'duplicate_patterns': duplicate_analysis.breakdowns or {},
+                    'audit_recommendations': duplicate_analysis.breakdowns.get('audit_recommendations', {}) if duplicate_analysis.breakdowns else {},
+                    'detection_methods': ['business_rules', 'comprehensive_analysis', 'risk_scoring'],
+                    'confidence_scores': self._generate_confidence_scores(duplicate_analysis),
+                    'false_positive_indicators': self._generate_false_positive_indicators(duplicate_analysis)
                 },
-                'chart_data': chart_data,
-                'duplicate_entries': duplicate_analysis.duplicate_list or [],
-                'duplicate_patterns': duplicate_analysis.breakdowns or {},
-                'analysis_metadata': {
-                    'detection_methods': duplicate_analysis.analysis_info.get('detection_methods', []),
-                    'confidence_scores': duplicate_analysis.analysis_info.get('confidence_scores', {}),
-                    'false_positive_indicators': duplicate_analysis.analysis_info.get('false_positive_indicators', [])
-                },
-                'recommendations': [
-                    {
-                        'priority': 'HIGH' if duplicate_count > 5 else 'MEDIUM',
-                        'action': 'Investigate duplicate transactions',
-                        'description': f'{duplicate_count} duplicate transactions detected',
-                        'count': duplicate_count
-                    },
-                    {
-                        'priority': 'HIGH' if avg_risk_score > 60 else 'MEDIUM',
-                        'action': 'Review high-risk duplicate transactions',
-                        'description': f'Average risk score: {avg_risk_score:.2f}',
-                        'risk_score': avg_risk_score
-                    },
-                    {
-                        'priority': 'MEDIUM',
-                        'action': 'Implement duplicate prevention controls',
-                        'description': 'Establish controls to prevent future duplicates'
+                'visualizations': {
+                    'chart_data': duplicate_analysis.chart_data or {},
+                    'slicer_filters': {
+                        'risk_levels': ['low', 'medium', 'high', 'critical'],
+                        'duplicate_types': ['type_1', 'type_2', 'type_3', 'type_4', 'type_5', 'type_6'],
+                        'amount_ranges': ['0-1000', '1000-10000', '10000-100000', '100000+'],
+                        'users': self._extract_unique_users(duplicate_analysis.duplicate_list or []),
+                        'accounts': self._extract_unique_accounts(duplicate_analysis.duplicate_list or [])
                     }
-                ],
-                'audit_implications': {
-                    'immediate_actions': [
-                        'Review all duplicate transactions for validity',
-                        'Investigate high-risk duplicate patterns',
-                        'Verify business justification for duplicates'
-                    ],
-                    'follow_up_actions': [
-                        'Implement duplicate detection controls',
-                        'Train staff on proper posting procedures',
-                        'Establish approval workflows for large transactions'
-                    ],
-                    'compliance_considerations': [
-                        'Ensure proper documentation for duplicate transactions',
-                        'Verify compliance with accounting standards',
-                        'Review internal control effectiveness'
-                    ]
+                },
+                'export_data': {
+                    'summary_table': self._generate_summary_table(duplicate_analysis),
+                    'detailed_export': duplicate_analysis.export_data or []
                 }
             }
             
-            # Add critical alerts if there are significant issues
-            critical_alerts = []
-            if duplicate_count > 10:
-                critical_alerts.append({
-                    'type': 'CRITICAL',
-                    'category': 'HIGH_DUPLICATE_COUNT',
-                    'message': f'High number of duplicate transactions detected ({duplicate_count})',
-                    'severity': 'HIGH',
-                    'action_required': 'Immediate investigation of duplicate patterns'
-                })
+            # Add compliance assessment if available
+            if duplicate_analysis.compliance_assessment:
+                response_data['compliance'] = duplicate_analysis.compliance_assessment
             
-            if avg_risk_score > 70:
-                critical_alerts.append({
-                    'type': 'CRITICAL',
-                    'category': 'HIGH_DUPLICATE_RISK',
-                    'message': f'High average risk score for duplicate transactions ({avg_risk_score:.2f})',
-                    'severity': 'CRITICAL',
-                    'action_required': 'Immediate review of high-risk duplicate transactions'
-                })
+            # Add financial statement impact if available
+            if duplicate_analysis.financial_statement_impact:
+                response_data['financial_impact'] = duplicate_analysis.financial_statement_impact
             
-            if total_duplicate_amount > 10000000:  # 10M SAR
-                critical_alerts.append({
-                    'type': 'WARNING',
-                    'category': 'HIGH_DUPLICATE_AMOUNT',
-                    'message': f'High total amount in duplicate transactions ({total_duplicate_amount:,.2f} SAR)',
-                    'severity': 'HIGH',
-                    'action_required': 'Review duplicate transactions for financial impact'
-                })
+            # Add detailed insights if available
+            if duplicate_analysis.detailed_insights:
+                response_data['insights'] = duplicate_analysis.detailed_insights
             
-            response_data['critical_alerts'] = critical_alerts
-            
-            # Log successful response
+            # Log successful retrieval
+            duplicate_count = len(duplicate_analysis.duplicate_list or [])
             logger.info(f"Successfully retrieved duplicate analysis for file {file_id} with {duplicate_count} duplicates")
             
-            return Response(response_data, status=status.HTTP_200_OK)
+            return Response(response_data)
             
-        except DataFile.DoesNotExist:
-            return Response(
-                {
-                    'error': f'Data file with ID {file_id} not found',
-                    'file_id': str(file_id)
-                },
-                status=status.HTTP_404_NOT_FOUND
-            )
         except Exception as e:
             logger.error(f"Error retrieving duplicate analysis for file {file_id}: {e}")
-            return Response(
-                {
-                    'error': 'Error occurred while retrieving duplicate analysis',
-                    'error_code': 'DUPLICATE_ANALYSIS_ERROR',
-                    'details': str(e),
-                    'file_id': str(file_id),
-                    'timestamp': timezone.now().isoformat()
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({
+                'error': 'Error occurred while retrieving duplicate analysis',
+                'error_code': 'DUPLICATE_ANALYSIS_ERROR',
+                'details': str(e)
+            }, status=500)
     
-    def _get_risk_level(self, risk_score):
-        """
-        Get risk level classification based on risk score
+    def _generate_confidence_scores(self, duplicate_analysis):
+        """Generate confidence scores for duplicate detection"""
+        if not duplicate_analysis.duplicate_list:
+            return {}
         
-        Risk Level Classification System:
-        - CRITICAL (80-100): Extremely high risk requiring immediate attention
-        - HIGH (60-79): High risk requiring prompt investigation  
-        - MEDIUM (30-59): Moderate risk with some concerns
-        - LOW (0-29): Low risk with normal transaction patterns
+        confidence_scores = {}
+        for duplicate in duplicate_analysis.duplicate_list:
+            if isinstance(duplicate, dict):
+                duplicate_type = duplicate.get('duplicate_type', 'unknown')
+                similarity_score = duplicate.get('similarity_score', 0.0)
+                risk_score = duplicate.get('risk_score', 0)
+                
+                if duplicate_type not in confidence_scores:
+                    confidence_scores[duplicate_type] = {
+                        'avg_similarity': 0.0,
+                        'avg_risk_score': 0.0,
+                        'count': 0
+                    }
+                
+                confidence_scores[duplicate_type]['avg_similarity'] += similarity_score
+                confidence_scores[duplicate_type]['avg_risk_score'] += risk_score
+                confidence_scores[duplicate_type]['count'] += 1
         
-        Args:
-            risk_score (float): Risk score between 0-100
-            
-        Returns:
-            str: Risk level classification
-        """
-        if risk_score >= 80:
-            return 'CRITICAL'
-        elif risk_score >= 60:
-            return 'HIGH'
-        elif risk_score >= 30:
-            return 'MEDIUM'
-        else:
-            return 'LOW'
-    
-    def _get_risk_color(self, risk_score):
-        """
-        Get color code for risk score visualization
-        
-        Color Coding System:
-        - Red (#FF6384): Critical risk (80-100)
-        - Orange (#FF9F40): High risk (60-79)
-        - Yellow (#FFCE56): Medium risk (30-59)
-        - Green (#4BC0C0): Low risk (0-29)
-        
-        Args:
-            risk_score (float): Risk score between 0-100
-            
-        Returns:
-            str: Hexadecimal color code for visualization
-        """
-        if risk_score >= 80:
-            return '#FF6384'  # Red for critical
-        elif risk_score >= 60:
-            return '#FF9F40'  # Orange for high
-        elif risk_score >= 30:
-            return '#FFCE56'  # Yellow for medium
-        else:
-            return '#4BC0C0'  # Green for low
-
-    def _generate_duplicate_chart_data(self, duplicate_transactions, all_transactions):
-        """
-        Generate comprehensive chart data for duplicate analysis
-        
-        Args:
-            duplicate_transactions: QuerySet of duplicate transactions
-            all_transactions: QuerySet of all transactions for context
-            
-        Returns:
-            dict: Chart data for various visualizations
-        """
-        if not duplicate_transactions.exists():
-            return {
-                'duplicate_types_distribution': {'labels': [], 'data': [], 'colors': []},
-                'risk_level_distribution': {'labels': [], 'data': [], 'colors': []},
-                'duplicate_activity_by_user': {'labels': [], 'data': [], 'colors': []},
-                'duplicate_amount_distribution': {'labels': [], 'data': [], 'colors': []},
-                'financial_statement_line_breakdown': {'labels': [], 'data': [], 'colors': []},
-                'monthly_duplicate_trend': {'labels': [], 'data': [], 'colors': []}
-            }
-        
-        # 1. Duplicate Types Distribution
-        duplicate_types_data = duplicate_transactions.values('duplicate_type').annotate(
-            count=Count('id')
-        ).order_by('-count')
-        
-        duplicate_types_chart = {
-            'labels': [item['duplicate_type'] or 'Unknown Type' for item in duplicate_types_data],
-            'data': [item['count'] for item in duplicate_types_data],
-            'colors': ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF', '#FF9F40']
-        }
-        
-        # 2. Risk Level Distribution
-        risk_levels = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
-        risk_level_data = []
-        risk_colors = ['#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384']
-        
-        for i, level in enumerate(risk_levels):
-            if level == 'LOW':
-                count = duplicate_transactions.filter(overall_risk_score__lt=30).count()
-            elif level == 'MEDIUM':
-                count = duplicate_transactions.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count()
-            elif level == 'HIGH':
-                count = duplicate_transactions.filter(overall_risk_score__gte=60, overall_risk_score__lt=80).count()
-            else:  # CRITICAL
-                count = duplicate_transactions.filter(overall_risk_score__gte=80).count()
-            
+        # Calculate averages
+        for dup_type in confidence_scores:
+            count = confidence_scores[dup_type]['count']
             if count > 0:
-                risk_level_data.append(count)
-            else:
-                risk_level_data.append(0)
+                confidence_scores[dup_type]['avg_similarity'] /= count
+                confidence_scores[dup_type]['avg_risk_score'] /= count
         
-        risk_level_chart = {
-            'labels': risk_levels,
-            'data': risk_level_data,
-            'colors': risk_colors
-        }
+        return confidence_scores
+    
+    def _generate_false_positive_indicators(self, duplicate_analysis):
+        """Generate false positive indicators"""
+        if not duplicate_analysis.duplicate_list:
+            return []
         
-        # 3. Duplicate Activity by User
-        user_activity_data = duplicate_transactions.values('user_name').annotate(
-            count=Count('id'),
-            total_amount=Sum('amount_local_currency')
-        ).order_by('-count')[:10]  # Top 10 users
+        false_positive_indicators = []
         
-        user_activity_chart = {
-            'labels': [item['user_name'] for item in user_activity_data],
-            'data': [item['count'] for item in user_activity_data],
-            'colors': ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF', '#FF9F40', '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0']
-        }
+        for duplicate in duplicate_analysis.duplicate_list:
+            if isinstance(duplicate, dict):
+                similarity_score = duplicate.get('similarity_score', 0.0)
+                risk_score = duplicate.get('risk_score', 0)
+                
+                # Low similarity but high risk might indicate false positive
+                if similarity_score < 0.5 and risk_score > 70:
+                    false_positive_indicators.append({
+                        'duplicate_id': duplicate.get('transaction1', {}).get('id', 'unknown'),
+                        'indicator': 'low_similarity_high_risk',
+                        'similarity_score': similarity_score,
+                        'risk_score': risk_score,
+                        'description': 'Low similarity score but high risk score - potential false positive'
+                    })
+                
+                # Very high similarity but low risk might indicate legitimate duplicates
+                if similarity_score > 0.9 and risk_score < 30:
+                    false_positive_indicators.append({
+                        'duplicate_id': duplicate.get('transaction1', {}).get('id', 'unknown'),
+                        'indicator': 'high_similarity_low_risk',
+                        'similarity_score': similarity_score,
+                        'risk_score': risk_score,
+                        'description': 'High similarity score but low risk score - likely legitimate duplicate'
+                    })
         
-        # 4. Duplicate Amount Distribution
-        amount_ranges = [
-            (0, 100000, '0-100K SAR'),
-            (100000, 1000000, '100K-1M SAR'),
-            (1000000, 10000000, '1M-10M SAR'),
-            (10000000, float('inf'), '10M+ SAR')
-        ]
+        return false_positive_indicators
+    
+    def _generate_summary_table(self, duplicate_analysis):
+        """Generate summary table data"""
+        if not duplicate_analysis.duplicate_list:
+            return []
         
-        amount_distribution_data = []
-        amount_labels = []
+        summary_table = []
         
-        for min_amount, max_amount, label in amount_ranges:
-            if max_amount == float('inf'):
-                count = duplicate_transactions.filter(amount_local_currency__gte=min_amount).count()
-            else:
-                count = duplicate_transactions.filter(
-                    amount_local_currency__gte=min_amount,
-                    amount_local_currency__lt=max_amount
-                ).count()
+        for duplicate in duplicate_analysis.duplicate_list:
+            if isinstance(duplicate, dict):
+                transaction1 = duplicate.get('transaction1', {})
+                transaction2 = duplicate.get('transaction2', {})
+                
+                summary_table.append({
+                    'duplicate_id': f"{transaction1.get('id', '')}_{transaction2.get('id', '')}",
+                    'duplicate_type': duplicate.get('duplicate_type', 'unknown'),
+                    'risk_score': duplicate.get('risk_score', 0),
+                    'similarity_score': duplicate.get('similarity_score', 0.0),
+                    'amount': transaction1.get('amount', 0),
+                    'user': transaction1.get('user', ''),
+                    'account': transaction1.get('account', ''),
+                    'date': transaction1.get('date', ''),
+                    'matching_fields': len(duplicate.get('matching_fields', [])),
+                    'status': 'high_risk' if duplicate.get('risk_score', 0) > 70 else 'medium_risk' if duplicate.get('risk_score', 0) > 40 else 'low_risk'
+                })
+        
+        return summary_table
+    
+    def _extract_unique_users(self, duplicate_list):
+        """Extract unique users from duplicate list"""
+        users = set()
+        for duplicate in duplicate_list:
+            if isinstance(duplicate, dict):
+                transaction1 = duplicate.get('transaction1', {})
+                transaction2 = duplicate.get('transaction2', {})
+                if transaction1.get('user'):
+                    users.add(transaction1.get('user'))
+                if transaction2.get('user'):
+                    users.add(transaction2.get('user'))
+        return list(users)
+    
+    def _extract_unique_accounts(self, duplicate_list):
+        """Extract unique accounts from duplicate list"""
+        accounts = set()
+        for duplicate in duplicate_list:
+            if isinstance(duplicate, dict):
+                transaction1 = duplicate.get('transaction1', {})
+                transaction2 = duplicate.get('transaction2', {})
+                if transaction1.get('account'):
+                    accounts.add(transaction1.get('account'))
+                if transaction2.get('account'):
+                    accounts.add(transaction2.get('account'))
+        return list(accounts)
+
+class UserAnalysisView(generics.GenericAPIView):
+    """API view for retrieving user analysis results by file ID.
+    
+    This view provides comprehensive user analysis results including:
+    - User transaction summaries
+    - User anomaly detection
+    - User risk assessment
+    - Chart data for visualizations
+    - Export-ready data
+    """
+    
+    def get(self, request, file_id):
+        """Get user analysis results for a specific file"""
+        try:
+            # Get the latest user analysis result
+            from .models import UserAnalysisResult
+            user_analysis = UserAnalysisResult.objects.filter(
+                data_file_id=file_id, status='COMPLETED'
+            ).order_by('-analysis_date').first()
             
-            amount_distribution_data.append(count)
-            amount_labels.append(label)
+            if not user_analysis:
+                return Response({
+                    'error': 'No user analysis results found for this file',
+                    'error_code': 'NO_USER_ANALYSIS_FOUND',
+                    'suggestions': [
+                        'Run user analysis for this file',
+                        'Check if user analysis processing completed successfully'
+                    ]
+                }, status=404)
+            
+            # Prepare response data
+            response_data = {
+                'analysis_info': {
+                    'analysis_id': str(user_analysis.id),
+                    'analysis_date': user_analysis.analysis_date,
+                    'processing_duration': user_analysis.processing_duration,
+                    'status': user_analysis.status,
+                    'analysis_version': user_analysis.analysis_version or '1.0.0'
+                },
+                'summary': {
+                    'total_users': user_analysis.get_total_users(),
+                    'total_transactions': user_analysis.get_total_transactions(),
+                    'anomalies_detected': user_analysis.get_anomalies_count(),
+                    'high_risk_users': user_analysis.get_high_risk_users_count(),
+                    'risk_distribution': self._get_risk_distribution_from_list(user_analysis.user_risk_assessment)
+                },
+                'user_analysis': {
+                    'user_transaction_summary': user_analysis.user_transaction_summary or [],
+                    'user_debit_analysis': user_analysis.user_debit_analysis or [],
+                    'user_account_distribution': user_analysis.user_account_distribution or [],
+                    'user_fs_line_distribution': user_analysis.user_fs_line_distribution or []
+                },
+                'anomaly_detection': {
+                    'user_anomalies': user_analysis.user_anomalies or [],
+                    'anomaly_types': self._get_anomaly_type_summary(user_analysis.user_anomalies or []),
+                    'ml_detected_anomalies': self._get_ml_anomalies(user_analysis.user_anomalies or [])
+                },
+                'risk_assessment': {
+                    'user_risk_scores': user_analysis.user_risk_assessment if isinstance(user_analysis.user_risk_assessment, list) else [],
+                    'high_risk_users': self._get_high_risk_users_from_list(user_analysis.user_risk_assessment),
+                    'risk_factors': self._extract_risk_factors_from_list(user_analysis.user_risk_assessment)
+                },
+                'patterns': {
+                    'user_patterns': user_analysis.user_patterns or {},
+                    'activity_trends': self._extract_activity_trends(user_analysis.user_transaction_summary or [])
+                },
+                'visualizations': {
+                    'chart_data': user_analysis.chart_data or {},
+                    'chart_types': [
+                        'transaction_vs_average',
+                        'debit_value_analysis', 
+                        'users_per_account',
+                        'users_per_fs_line',
+                        'anomaly_distribution'
+                    ]
+                },
+                'export_data': {
+                    'user_summary': self._prepare_user_summary_export(user_analysis.user_transaction_summary or []),
+                    'anomaly_export': self._prepare_anomaly_export(user_analysis.user_anomalies or []),
+                    'risk_export': self._prepare_risk_export_from_list(user_analysis.user_risk_assessment)
+                }
+            }
+            
+            # Log successful retrieval
+            user_count = user_analysis.get_total_users()
+            anomaly_count = user_analysis.get_anomalies_count()
+            logger.info(f"Successfully retrieved user analysis for file {file_id} with {user_count} users and {anomaly_count} anomalies")
+            
+            return Response(response_data)
+            
+        except Exception as e:
+            logger.error(f"Error retrieving user analysis for file {file_id}: {e}")
+            return Response({
+                'error': 'Error occurred while retrieving user analysis',
+                'error_code': 'USER_ANALYSIS_ERROR',
+                'details': str(e)
+            }, status=500)
+    
+    def _get_risk_distribution_from_list(self, user_risk_assessment):
+        """Get risk distribution from list-based user risk assessment"""
+        if not isinstance(user_risk_assessment, list):
+            return {}
         
-        amount_distribution_chart = {
-            'labels': amount_labels,
-            'data': amount_distribution_data,
-            'colors': ['#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384']
-        }
+        risk_distribution = {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
         
-        # 5. Financial Statement Line Breakdown (by GL Account)
-        gl_account_data = duplicate_transactions.values('gl_account').annotate(
-            count=Count('id'),
-            total_amount=Sum('amount_local_currency')
-        ).order_by('-total_amount')[:10]  # Top 10 accounts by amount
+        for user_risk in user_risk_assessment:
+            if isinstance(user_risk, dict):
+                risk_level = user_risk.get('risk_level', 'low')
+                if risk_level in risk_distribution:
+                    risk_distribution[risk_level] += 1
         
-        gl_account_chart = {
-            'labels': [f"GL {item['gl_account']}" for item in gl_account_data],
-            'data': [item['count'] for item in gl_account_data],
-            'colors': ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF', '#FF9F40', '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0']
-        }
+        return risk_distribution
+    
+    def _get_high_risk_users_from_list(self, user_risk_assessment):
+        """Get high risk users from list-based user risk assessment"""
+        if not isinstance(user_risk_assessment, list):
+            return []
         
-        # 6. Monthly Duplicate Trend
-        monthly_trend_data = duplicate_transactions.extra(
-            select={'month': "EXTRACT(month FROM posting_date)"}
-        ).values('month').annotate(
-            count=Count('id')
-        ).order_by('month')
+        high_risk_users = []
+        for user_risk in user_risk_assessment:
+            if isinstance(user_risk, dict) and user_risk.get('risk_level') in ['high', 'critical']:
+                high_risk_users.append(user_risk)
         
-        # Create complete month labels
-        month_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-        monthly_data = [0] * 12
+        return high_risk_users
+    
+    def _extract_risk_factors_from_list(self, user_risk_assessment):
+        """Extract key risk factors from list-based user risk assessment"""
+        risk_factors = []
         
-        for item in monthly_trend_data:
-            month_index = int(item['month']) - 1  # Convert Decimal to int, then to 0-based index
-            if 0 <= month_index < 12:
-                monthly_data[month_index] = item['count']
+        if not isinstance(user_risk_assessment, list):
+            return risk_factors
         
-        monthly_trend_chart = {
-            'labels': month_labels,
-            'data': monthly_data,
-            'colors': ['#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384', '#36A2EB', '#9966FF', '#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384', '#36A2EB', '#9966FF']
-        }
+        # High risk users
+        high_risk_users = [user for user in user_risk_assessment if isinstance(user, dict) and user.get('risk_level') in ['high', 'critical']]
+        if high_risk_users:
+            risk_factors.append({
+                'factor': 'High-risk users',
+                'count': len(high_risk_users),
+                'impact': 'HIGH',
+                'description': f'{len(high_risk_users)} users identified with high or critical risk levels'
+            })
+        
+        # Users with high risk scores
+        high_score_users = [user for user in user_risk_assessment if isinstance(user, dict) and user.get('risk_score', 0) > 70]
+        if high_score_users:
+            risk_factors.append({
+                'factor': 'Users with high risk scores',
+                'count': len(high_score_users),
+                'impact': 'MEDIUM',
+                'description': f'{len(high_score_users)} users have risk scores above 70'
+            })
+        
+        return risk_factors
+    
+    def _prepare_risk_export_from_list(self, user_risk_assessment):
+        """Prepare risk assessment data for export from list-based structure"""
+        if not isinstance(user_risk_assessment, list):
+            return []
+        return user_risk_assessment
+    
+    def _get_anomaly_type_summary(self, anomalies):
+        """Get summary of anomaly types"""
+        anomaly_types = {}
+        
+        if not anomalies or not isinstance(anomalies, list):
+            return anomaly_types
+        
+        for anomaly in anomalies:
+            if not isinstance(anomaly, dict):
+                continue
+                
+            anomaly_type = anomaly.get('anomaly_type', 'unknown')
+            if anomaly_type not in anomaly_types:
+                anomaly_types[anomaly_type] = {
+                    'count': 0,
+                    'severity_breakdown': {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+                }
+            anomaly_types[anomaly_type]['count'] += 1
+            severity = anomaly.get('severity', 'medium')
+            if severity in anomaly_types[anomaly_type]['severity_breakdown']:
+                anomaly_types[anomaly_type]['severity_breakdown'][severity] += 1
+        
+        return anomaly_types
+    
+    def _get_ml_anomalies(self, anomalies):
+        """Get ML-detected anomalies"""
+        if not anomalies or not isinstance(anomalies, list):
+            return []
+        return [anomaly for anomaly in anomalies if isinstance(anomaly, dict) and anomaly.get('ml_detected', False)]
+    
+    def _extract_risk_factors(self, risk_assessment):
+        """Extract key risk factors from user risk assessment"""
+        risk_factors = []
+        
+        # Ensure risk_assessment is a dictionary
+        if not isinstance(risk_assessment, dict):
+            return risk_factors
+        
+        user_risk_scores = risk_assessment.get('user_risk_scores', [])
+        
+        # Ensure user_risk_scores is a list
+        if not isinstance(user_risk_scores, list):
+            return risk_factors
+        
+        # High risk users
+        high_risk_users = [user for user in user_risk_scores if isinstance(user, dict) and user.get('risk_level') in ['high', 'critical']]
+        if high_risk_users:
+            risk_factors.append({
+                'factor': 'High-risk users',
+                'count': len(high_risk_users),
+                'impact': 'HIGH',
+                'description': f'{len(high_risk_users)} users identified with high or critical risk levels'
+            })
+        
+        # Users with anomalies
+        users_with_anomalies = [user for user in user_risk_scores if isinstance(user, dict) and user.get('anomaly_count', 0) > 0]
+        if users_with_anomalies:
+            risk_factors.append({
+                'factor': 'Users with anomalies',
+                'count': len(users_with_anomalies),
+                'impact': 'MEDIUM',
+                'description': f'{len(users_with_anomalies)} users have detected anomalies'
+            })
+        
+        return risk_factors
+    
+    def _extract_activity_trends(self, user_summary):
+        """Extract activity trends from user summary"""
+        if not user_summary or not isinstance(user_summary, list):
+            return {}
+        
+        # Filter out non-dictionary items
+        valid_users = [user for user in user_summary if isinstance(user, dict)]
+        
+        if not valid_users:
+            return {}
+        
+        # Calculate averages
+        total_transactions = sum(user.get('transaction_count', 0) for user in valid_users)
+        total_amount = sum(user.get('total_amount', 0) for user in valid_users)
+        avg_transactions = total_transactions / len(valid_users) if valid_users else 0
+        avg_amount = total_amount / len(valid_users) if valid_users else 0
+        
+        # Identify top performers
+        top_transaction_users = sorted(valid_users, key=lambda x: x.get('transaction_count', 0), reverse=True)[:5]
+        top_amount_users = sorted(valid_users, key=lambda x: x.get('total_amount', 0), reverse=True)[:5]
         
         return {
-            'duplicate_types_distribution': duplicate_types_chart,
-            'risk_level_distribution': risk_level_chart,
-            'duplicate_activity_by_user': user_activity_chart,
-            'duplicate_amount_distribution': amount_distribution_chart,
-            'financial_statement_line_breakdown': gl_account_chart,
-            'monthly_duplicate_trend': monthly_trend_chart
+            'averages': {
+                'avg_transactions_per_user': avg_transactions,
+                'avg_amount_per_user': avg_amount
+            },
+            'top_performers': {
+                'top_transaction_users': top_transaction_users,
+                'top_amount_users': top_amount_users
+            }
         }
+    
+    def _prepare_user_summary_export(self, user_summary):
+        """Prepare user summary data for export"""
+        return user_summary
+    
+    def _prepare_anomaly_export(self, anomalies):
+        """Prepare anomaly data for export"""
+        return anomalies
+    
+    def _prepare_risk_export(self, risk_assessment):
+        """Prepare risk assessment data for export"""
+        if not isinstance(risk_assessment, dict):
+            return []
+        return risk_assessment.get('user_risk_scores', [])
 
 class BackdatedAnalysisView(generics.GenericAPIView):
     """API view for retrieving backdated analysis results by file ID.
@@ -2845,13 +3615,13 @@ class BackdatedAnalysisView(generics.GenericAPIView):
         
         for i, level in enumerate(risk_levels):
             if level == 'LOW':
-                count = backdated_transactions.filter(overall_risk_score__lt=30).count()
+                count = backdated_transactions.filter(backdated_risk_score__lt=30).count()
             elif level == 'MEDIUM':
-                count = backdated_transactions.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count()
+                count = backdated_transactions.filter(backdated_risk_score__gte=30, backdated_risk_score__lt=60).count()
             elif level == 'HIGH':
-                count = backdated_transactions.filter(overall_risk_score__gte=60, overall_risk_score__lt=80).count()
+                count = backdated_transactions.filter(backdated_risk_score__gte=60, backdated_risk_score__lt=80).count()
             else:  # CRITICAL
-                count = backdated_transactions.filter(overall_risk_score__gte=80).count()
+                count = backdated_transactions.filter(backdated_risk_score__gte=80).count()
             
             if count > 0:
                 risk_level_data.append(count)
@@ -2987,9 +3757,9 @@ class BackdatedAnalysisView(generics.GenericAPIView):
             
             # Calculate risk statistics for backdated transactions
             if backdated_transactions.exists():
-                avg_risk_score = backdated_transactions.aggregate(avg=Avg('overall_risk_score'))['avg'] or 0
-                max_risk_score = backdated_transactions.aggregate(max=Max('overall_risk_score'))['max'] or 0
-                min_risk_score = backdated_transactions.aggregate(min=Min('overall_risk_score'))['min'] or 0
+                avg_risk_score = backdated_transactions.aggregate(avg=Avg('backdated_risk_score'))['avg'] or 0
+                max_risk_score = backdated_transactions.aggregate(max=Max('backdated_risk_score'))['max'] or 0
+                min_risk_score = backdated_transactions.aggregate(min=Min('backdated_risk_score'))['min'] or 0
                 total_backdated_amount = backdated_transactions.aggregate(total=Sum('amount_local_currency'))['total'] or 0
                 avg_backdated_days = backdated_transactions.aggregate(avg=Avg('backdated_days'))['avg'] or 0
                 max_backdated_days = backdated_transactions.aggregate(max=Max('backdated_days'))['max'] or 0
@@ -2998,19 +3768,19 @@ class BackdatedAnalysisView(generics.GenericAPIView):
             
             # Risk level distribution for backdated transactions
             risk_distribution = {
-                'low_risk': backdated_transactions.filter(overall_risk_score__lt=30).count(),
-                'medium_risk': backdated_transactions.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count(),
-                'high_risk': backdated_transactions.filter(overall_risk_score__gte=60, overall_risk_score__lt=80).count(),
-                'critical_risk': backdated_transactions.filter(overall_risk_score__gte=80).count()
+                'low_risk': backdated_transactions.filter(backdated_risk_score__lt=30).count(),
+                'medium_risk': backdated_transactions.filter(backdated_risk_score__gte=30, backdated_risk_score__lt=60).count(),
+                'high_risk': backdated_transactions.filter(backdated_risk_score__gte=60, backdated_risk_score__lt=80).count(),
+                'critical_risk': backdated_transactions.filter(backdated_risk_score__gte=80).count()
             }
             
             # Get high-risk backdated transactions
             high_risk_backdated = backdated_transactions.filter(
-                overall_risk_score__gte=60
+                backdated_risk_score__gte=60
             ).values(
                 'id', 'document_number', 'gl_account', 'amount_local_currency',
-                'user_name', 'posting_date', 'overall_risk_score', 'backdated_days'
-            ).order_by('-overall_risk_score')[:10]
+                'user_name', 'posting_date', 'backdated_risk_score', 'backdated_days'
+            ).order_by('-backdated_risk_score')[:10]
             
             # Generate comprehensive chart data
             chart_data = self._generate_backdated_chart_data(backdated_transactions, transactions)

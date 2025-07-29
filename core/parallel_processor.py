@@ -178,7 +178,7 @@ class ParallelProcessor:
                     })
     
     def _process_job(self, job_data, worker_id):
-        """Process a single job with full analysis pipeline"""
+        """Process a single job with full analysis pipeline using MLAnalysisOrchestrator"""
         
         # Setup Django
         os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'analytics.settings')
@@ -186,6 +186,7 @@ class ParallelProcessor:
         django.setup()
         
         from core.models import FileProcessingJob, SAPGLPosting
+        from core.ml_analysis_orchestrator import MLAnalysisOrchestrator
         
         job_id = job_data['job_id']
         start_time = timezone.now()
@@ -200,67 +201,317 @@ class ParallelProcessor:
             job.save()
             
             # Get transactions
-            transactions = SAPGLPosting.objects.filter(data_file=job.data_file)
+            transactions = list(SAPGLPosting.objects.filter(data_file=job.data_file))
             
-            # Import synchronous analysis functions
-            from core.sync_analysis import (
-                run_general_analysis_sync, run_duplicate_analysis_sync,
-                run_backdated_analysis_sync, run_overall_analysis_sync,
-                run_risk_analysis_sync
-            )
+            # Initialize the ML Analysis Orchestrator
+            orchestrator = MLAnalysisOrchestrator()
             
-            # Run all analysis tasks synchronously
+            # Run analysis pipeline with result sharing
             analysis_results = {}
             
             # 1. General Analysis
             try:
-                general_result = run_general_analysis_sync(job_id)
-                analysis_results['general_analysis'] = general_result
-                logger.info(f"General Analysis completed: {general_result.get('status', 'UNKNOWN')}")
+                logger.info(f"Worker {worker_id}: Starting General Analysis for {len(transactions)} transactions")
+                general_result = orchestrator.run_general_analysis(transactions)
+                analysis_results['general_analysis'] = {
+                    'status': 'COMPLETED',
+                    'result': general_result,
+                    'processing_duration': general_result.get('processing_duration', 0)
+                }
+                
+                # Save general analysis results to database
+                try:
+                    from .models import GeneralAnalysisResult
+                    general_analysis_result = GeneralAnalysisResult.objects.create(
+                        data_file=job.data_file,
+                        processing_job=job,
+                        analysis_type='general_analysis',
+                        analysis_version='1.0.0',
+                        trial_balance_summary=general_result.get('trial_balance_summary', {}),
+                        gl_account_summaries=general_result.get('gl_account_summaries', []),
+                        user_summaries=general_result.get('user_summaries', []),
+                        statistical_calculations=general_result.get('statistical_calculations', {}),
+                        chart_data=general_result.get('chart_data', {}),
+                        export_data=general_result.get('export_data', []),
+                        processing_duration=general_result.get('processing_duration', 0),
+                        status='COMPLETED'
+                    )
+                    logger.info(f"Worker {worker_id}: General analysis saved to database with ID: {general_analysis_result.id}")
+                except Exception as db_error:
+                    logger.error(f"Worker {worker_id}: Failed to save general analysis to database: {db_error}")
+                
+                logger.info(f"Worker {worker_id}: General Analysis completed successfully")
             except Exception as e:
                 analysis_results['general_analysis'] = {'error': str(e)}
-                logger.error(f"General Analysis failed: {e}")
+                logger.error(f"Worker {worker_id}: General Analysis failed: {e}")
             
             # 2. Duplicate Analysis
             try:
-                duplicate_result = run_duplicate_analysis_sync(job_id)
-                analysis_results['duplicate_analysis'] = duplicate_result
-                logger.info(f"Duplicate Analysis completed: {duplicate_result.get('status', 'UNKNOWN')}")
+                logger.info(f"Worker {worker_id}: Starting Duplicate Analysis")
+                duplicate_result = orchestrator.run_duplicate_analysis(transactions)
+                analysis_results['duplicate_analysis'] = {
+                    'status': 'COMPLETED',
+                    'result': duplicate_result,
+                    'processing_duration': duplicate_result.get('processing_duration', 0)
+                }
+                
+                # Save duplicate analysis results to database
+                try:
+                    from .models import DuplicateAnalysisResult
+                    duplicate_analysis_result = DuplicateAnalysisResult.objects.create(
+                        data_file=job.data_file,
+                        processing_job=job,
+                        analysis_type='comprehensive_duplicate',
+                        analysis_version='1.0.0',
+                        analysis_info=duplicate_result.get('analysis_info', {
+                            'total_transactions': len(transactions),
+                            'duplicates_found': duplicate_result.get('duplicates_found', 0),
+                            'duplicate_percentage': duplicate_result.get('compliance_assessment', {}).get('duplicate_percentage', 0)
+                        }),
+                        duplicate_list=duplicate_result.get('duplicate_pairs', []),
+                        breakdowns=duplicate_result.get('breakdowns', {
+                            'duplicate_by_document': [],
+                            'duplicate_by_account': [],
+                            'duplicate_by_user': [],
+                            'audit_recommendations': duplicate_result.get('audit_recommendations', {}),
+                            'compliance_assessment': duplicate_result.get('compliance_assessment', {}),
+                            'financial_statement_impact': duplicate_result.get('financial_statement_impact', {}),
+                            'risk_distribution': duplicate_result.get('breakdowns', {}).get('risk_distribution', {}),
+                            'compliance_issues': duplicate_result.get('breakdowns', {}).get('compliance_issues', []),
+                            'high_priority_recommendations': duplicate_result.get('breakdowns', {}).get('high_priority_recommendations', [])
+                        }),
+                        chart_data=duplicate_result.get('chart_data', {}),
+                        export_data=duplicate_result.get('export_data', []),
+                        processing_duration=duplicate_result.get('processing_duration', 0),
+                        status='COMPLETED'
+                    )
+                    logger.info(f"Worker {worker_id}: Duplicate analysis saved to database with ID: {duplicate_analysis_result.id}")
+                except Exception as db_error:
+                    logger.error(f"Worker {worker_id}: Failed to save duplicate analysis to database: {db_error}")
+                
+                logger.info(f"Worker {worker_id}: Duplicate Analysis completed successfully")
             except Exception as e:
                 analysis_results['duplicate_analysis'] = {'error': str(e)}
-                logger.error(f"Duplicate Analysis failed: {e}")
+                logger.error(f"Worker {worker_id}: Duplicate Analysis failed: {e}")
             
             # 3. Backdated Analysis
             try:
-                backdated_result = run_backdated_analysis_sync(job_id)
-                analysis_results['backdated_analysis'] = backdated_result
-                logger.info(f"Backdated Analysis completed: {backdated_result.get('status', 'UNKNOWN')}")
+                logger.info(f"Worker {worker_id}: Starting Backdated Analysis")
+                backdated_result = orchestrator.run_backdated_analysis(transactions)
+                analysis_results['backdated_analysis'] = {
+                    'status': 'COMPLETED',
+                    'result': backdated_result,
+                    'processing_duration': backdated_result.get('processing_duration', 0)
+                }
+                
+                # Save backdated analysis results to database
+                try:
+                    from .models import BackdatedAnalysisResult
+                    backdated_analysis_result = BackdatedAnalysisResult.objects.create(
+                        data_file=job.data_file,
+                        processing_job=job,
+                        analysis_type='enhanced_backdated',
+                        analysis_version='1.0.0',
+                        analysis_info={
+                            'total_transactions': len(transactions),
+                            'backdated_entries_found': backdated_result.get('backdated_entries_found', 0),
+                            'backdated_percentage': backdated_result.get('compliance_assessment', {}).get('backdated_percentage', 0)
+                        },
+                        backdated_entries=backdated_result.get('backdated_entries', []),
+                        backdated_by_document=backdated_result.get('backdated_by_document', []),
+                        backdated_by_account=backdated_result.get('backdated_by_account', []),
+                        backdated_by_user=backdated_result.get('backdated_by_user', []),
+                        audit_recommendations=backdated_result.get('audit_recommendations', {}),
+                        compliance_assessment=backdated_result.get('compliance_assessment', {}),
+                        financial_statement_impact=backdated_result.get('financial_statement_impact', {}),
+                        chart_data=backdated_result.get('chart_data', {}),
+                        export_data=backdated_result.get('export_data', []),
+                        processing_duration=backdated_result.get('processing_duration', 0),
+                        status='COMPLETED'
+                    )
+                    logger.info(f"Worker {worker_id}: Backdated analysis saved to database with ID: {backdated_analysis_result.id}")
+                except Exception as db_error:
+                    logger.error(f"Worker {worker_id}: Failed to save backdated analysis to database: {db_error}")
+                
+                logger.info(f"Worker {worker_id}: Backdated Analysis completed successfully")
             except Exception as e:
                 analysis_results['backdated_analysis'] = {'error': str(e)}
-                logger.error(f"Backdated Analysis failed: {e}")
+                logger.error(f"Worker {worker_id}: Backdated Analysis failed: {e}")
             
-            # 4. Overall Analysis
+            # 4. User Analysis
             try:
-                overall_result = run_overall_analysis_sync(job_id)
-                analysis_results['overall_analysis'] = overall_result
-                logger.info(f"Overall Analysis completed: {overall_result.get('status', 'UNKNOWN')}")
+                logger.info(f"Worker {worker_id}: Starting User Analysis")
+                user_result = orchestrator.run_user_analysis(transactions)
+                analysis_results['user_analysis'] = {
+                    'status': 'COMPLETED',
+                    'result': user_result,
+                    'processing_duration': user_result.get('processing_duration', 0)
+                }
+                
+                # Save user analysis results to database
+                try:
+                    from .models import UserAnalysisResult
+                    user_analysis_result = UserAnalysisResult.objects.create(
+                        data_file=job.data_file,
+                        processing_job=job,
+                        analysis_type='user_analysis',
+                        analysis_version='1.0.0',
+                        analysis_info={
+                            'total_transactions': len(transactions),
+                            'total_users': user_result.get('total_users', 0),
+                            'user_anomalies_found': user_result.get('user_anomalies_found', 0)
+                        },
+                        user_transaction_summary=user_result.get('user_transaction_summary', []),
+                        user_debit_analysis=user_result.get('user_debit_analysis', []),
+                        user_account_distribution=user_result.get('user_account_distribution', []),
+                        user_fs_line_distribution=user_result.get('user_fs_line_distribution', []),
+                        user_anomalies=user_result.get('user_anomalies', []),
+                        user_risk_assessment=user_result.get('user_risk_assessment', {}),
+                        user_patterns=user_result.get('user_patterns', {}),
+                        chart_data=user_result.get('chart_data', {}),
+                        export_data=user_result.get('export_data', []),
+                        processing_duration=user_result.get('processing_duration', 0),
+                        status='COMPLETED'
+                    )
+                    logger.info(f"Worker {worker_id}: User analysis saved to database with ID: {user_analysis_result.id}")
+                except Exception as db_error:
+                    logger.error(f"Worker {worker_id}: Failed to save user analysis to database: {db_error}")
+                
+                logger.info(f"Worker {worker_id}: User Analysis completed successfully")
+            except Exception as e:
+                analysis_results['user_analysis'] = {'error': str(e)}
+                logger.error(f"Worker {worker_id}: User Analysis failed: {e}")
+            
+            # 5. Overall Analysis (uses all previous results)
+            try:
+                logger.info(f"Worker {worker_id}: Starting Overall Analysis (using previous results)")
+                overall_result = orchestrator.run_overall_analysis(transactions)
+                analysis_results['overall_analysis'] = {
+                    'status': 'COMPLETED',
+                    'result': overall_result,
+                    'processing_duration': overall_result.get('processing_duration', 0)
+                }
+                
+                # Save overall analysis results to database
+                try:
+                    from .models import OverallAnalysisResult
+                    overall_analysis_result = OverallAnalysisResult.objects.create(
+                        data_file=job.data_file,
+                        processing_job=job,
+                        analysis_type='overall_analysis',
+                        analysis_version='1.0.0',
+                        transaction_summary=overall_result.get('transaction_summary', {}),
+                        flagged_transactions=overall_result.get('flagged_transactions', []),
+                        flag_summary=overall_result.get('flag_summary', {}),
+                        expense_analysis=overall_result.get('expense_analysis', {}),
+                        risk_assessment=overall_result.get('risk_assessment', {}),
+                        chart_data=overall_result.get('chart_data', {}),
+                        export_data=overall_result.get('export_data', []),
+                        processing_duration=overall_result.get('processing_duration', 0),
+                        status='COMPLETED'
+                    )
+                    logger.info(f"Worker {worker_id}: Overall analysis saved to database with ID: {overall_analysis_result.id}")
+                except Exception as db_error:
+                    logger.error(f"Worker {worker_id}: Failed to save overall analysis to database: {db_error}")
+                
+                logger.info(f"Worker {worker_id}: Overall Analysis completed successfully")
             except Exception as e:
                 analysis_results['overall_analysis'] = {'error': str(e)}
-                logger.error(f"Overall Analysis failed: {e}")
+                logger.error(f"Worker {worker_id}: Overall Analysis failed: {e}")
             
-            # 5. Risk Analysis
+            # 6. Risk Analysis (uses all previous results)
             try:
-                risk_result = run_risk_analysis_sync(job_id)
-                analysis_results['risk_analysis'] = risk_result
-                logger.info(f"Risk Analysis completed: {risk_result.get('status', 'UNKNOWN')}")
+                logger.info(f"Worker {worker_id}: Starting Risk Analysis (using all previous results)")
+                # Extract overall results from the overall analysis
+                overall_results = analysis_results.get('overall_analysis', {}).get('result', {}).get('ml_results', [])
+                risk_result = orchestrator.run_risk_analysis(transactions, overall_results=overall_results)
+                analysis_results['risk_analysis'] = {
+                    'status': 'COMPLETED',
+                    'result': risk_result,
+                    'processing_duration': risk_result.get('processing_duration', 0)
+                }
+                
+                # Save risk analysis results to RiskScoringDocument table
+                try:
+                    from .models import RiskScoringDocument
+                    from .models import GeneralAnalysisResult, DuplicateAnalysisResult, BackdatedAnalysisResult, OverallAnalysisResult
+                    
+                    # Get results from previous analyses for risk factors
+                    general_analysis = GeneralAnalysisResult.objects.filter(data_file=job.data_file).first()
+                    duplicate_analysis = DuplicateAnalysisResult.objects.filter(data_file=job.data_file).first()
+                    backdated_analysis = BackdatedAnalysisResult.objects.filter(data_file=job.data_file).first()
+                    overall_analysis = OverallAnalysisResult.objects.filter(data_file=job.data_file).first()
+                    
+                    # Calculate risk statistics from ML results
+                    risk_classification = risk_result.get('risk_classification', {})
+                    final_risk_scores = risk_result.get('final_risk_scores', {})
+                    high_risk_transactions = risk_result.get('high_risk_transactions', [])
+                    
+                    # Create risk scoring document
+                    risk_scoring_document = RiskScoringDocument.objects.create(
+                        data_file=job.data_file,
+                        processing_job=job,
+                        document_type='comprehensive_risk_scoring',
+                        document_version='1.0.0',
+                        methodology_overview={
+                            'description': 'Comprehensive risk scoring using ML models and analysis results',
+                            'models_used': ['risk_model', 'duplicate_model', 'backdated_model'],
+                            'analysis_sources': ['general_analysis', 'duplicate_analysis', 'backdated_analysis', 'overall_analysis']
+                        },
+                        risk_factors={
+                            'duplicate_risk': len(duplicate_analysis.duplicate_list) if duplicate_analysis else 0,
+                            'backdated_risk': len(backdated_analysis.backdated_entries) if backdated_analysis else 0,
+                            'high_value_risk': len([t for t in transactions if float(t.amount_local_currency) > 1000000]),
+                            'unusual_pattern_risk': len(overall_results) if overall_results else 0
+                        },
+                        scoring_criteria={
+                            'critical_risk_threshold': 80,
+                            'high_risk_threshold': 60,
+                            'medium_risk_threshold': 30,
+                            'low_risk_threshold': 0
+                        },
+                        risk_calculations=risk_result.get('ml_results', []),
+                        risk_distributions=risk_classification,
+                        recommendations={
+                            'high_priority': high_risk_transactions[:10],
+                            'medium_priority': [r for r in risk_result.get('ml_results', []) if r.get('risk_class') == 1][:10],
+                            'low_priority': [r for r in risk_result.get('ml_results', []) if r.get('risk_class') == 0][:10]
+                        },
+                        audit_implications={
+                            'focus_areas': ['high_risk_transactions', 'duplicate_entries', 'backdated_entries'],
+                            'sampling_strategy': 'risk_based',
+                            'follow_up_actions': ['detailed_review', 'documentation_verification', 'management_inquiry']
+                        },
+                        total_transactions=len(transactions),
+                        high_risk_transactions=risk_classification.get('high_risk', 0) + risk_classification.get('critical_risk', 0),
+                        medium_risk_transactions=risk_classification.get('medium_risk', 0),
+                        low_risk_transactions=risk_classification.get('low_risk', 0),
+                        overall_risk_score=final_risk_scores.get('average', 0.0),
+                        processing_duration=risk_result.get('processing_duration', 0),
+                        status='COMPLETED'
+                    )
+                    
+                    logger.info(f"Worker {worker_id}: Risk analysis saved to database with ID: {risk_scoring_document.id}")
+                    
+                except Exception as db_error:
+                    logger.error(f"Worker {worker_id}: Failed to save risk analysis to database: {db_error}")
+                
+                logger.info(f"Worker {worker_id}: Risk Analysis completed successfully")
             except Exception as e:
                 analysis_results['risk_analysis'] = {'error': str(e)}
-                logger.error(f"Risk Analysis failed: {e}")
+                logger.error(f"Worker {worker_id}: Risk Analysis failed: {e}")
             
             # Calculate basic summary
-            total_amount = sum(t.amount_local_currency for t in transactions)
+            total_amount = sum(float(t.amount_local_currency) for t in transactions)
             unique_users = len(set(t.user_name for t in transactions))
             unique_accounts = len(set(t.gl_account for t in transactions))
+            
+            # Calculate total processing duration
+            total_processing_duration = sum(
+                analysis_results.get(analysis_type, {}).get('processing_duration', 0)
+                for analysis_type in ['general_analysis', 'duplicate_analysis', 'backdated_analysis', 
+                                    'user_analysis', 'overall_analysis', 'risk_analysis']
+            )
             
             # Update job with results
             job.status = 'COMPLETED'
@@ -269,11 +520,12 @@ class ParallelProcessor:
             job.analytics_results = {
                 'summary': {
                     'total_transactions': len(transactions),
-                    'total_amount': float(total_amount),
+                    'total_amount': total_amount,
                     'unique_users': unique_users,
                     'unique_accounts': unique_accounts,
                     'processed_parallel': True,
                     'worker_id': worker_id,
+                    'total_processing_duration': total_processing_duration,
                     'analysis_results': analysis_results
                 }
             }
@@ -284,6 +536,7 @@ class ParallelProcessor:
                 'status': 'COMPLETED',
                 'worker_id': worker_id,
                 'processing_time': job.processing_duration,
+                'total_processing_duration': total_processing_duration,
                 'analysis_results': analysis_results
             }
             

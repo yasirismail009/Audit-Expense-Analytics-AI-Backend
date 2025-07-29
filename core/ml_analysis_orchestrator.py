@@ -5,6 +5,7 @@ Centralized system for efficient ML model training and analysis
 
 import os
 import django
+import uuid
 from django.utils import timezone
 import logging
 from typing import List, Dict, Any, Optional
@@ -210,7 +211,7 @@ class MLAnalysisOrchestrator:
     
     def run_general_analysis(self, transactions: List) -> Dict[str, Any]:
         """
-        Run general analysis with ML model and detailed GL account analysis
+        Run general analysis with ML model
         
         Args:
             transactions: List of transactions to analyze
@@ -334,7 +335,7 @@ class MLAnalysisOrchestrator:
                 'total_credits': float(total_credits),
                 'balance': trial_balance,
                 'is_balanced': abs(trial_balance) < 0.01,  # Consider balanced if difference is less than 0.01
-                'balance_percentage': (abs(trial_balance) / total_amount * 100) if total_amount > 0 else 0
+                'balance_percentage': (abs(trial_balance) / float(total_amount) * 100) if total_amount > 0 else 0
             },
             'gl_account_summaries': gl_account_summaries,
             'user_summaries': user_summaries,
@@ -388,15 +389,178 @@ class MLAnalysisOrchestrator:
     
     def run_duplicate_analysis(self, transactions: List) -> Dict[str, Any]:
         """
-        Run duplicate analysis based on business rules
+        Run comprehensive duplicate analysis based on business rules with enhanced information
         
         Args:
             transactions: List of transactions to analyze
             
         Returns:
-            Dict containing analysis results
+            Dict containing comprehensive analysis results
         """
-        logger.info(f"Running Duplicate Analysis with Business Rules for {len(transactions)} transactions")
+        logger.info(f"Running Comprehensive Duplicate Analysis with Business Rules for {len(transactions)} transactions")
+        
+        # Define duplicate types based on business rules (ordered from most specific to least specific)
+        duplicate_types = {
+            'type_6': {
+                'name': 'Account Number + Effective Date + Posted Date + User + Source + Amount',
+                'fields': ['gl_account', 'document_date', 'posting_date', 'user_name', 'source', 'amount_local_currency'],
+                'risk_score': 95
+            },
+            'type_5': {
+                'name': 'Account Number + Effective Date + Amount',
+                'fields': ['gl_account', 'document_date', 'amount_local_currency'],
+                'risk_score': 90
+            },
+            'type_4': {
+                'name': 'Account Number + Posted Date + Amount',
+                'fields': ['gl_account', 'posting_date', 'amount_local_currency'],
+                'risk_score': 85
+            },
+            'type_3': {
+                'name': 'Account Number + User + Amount',
+                'fields': ['gl_account', 'user_name', 'amount_local_currency'],
+                'risk_score': 80
+            },
+            'type_2': {
+                'name': 'Account Number + Source + Amount',
+                'fields': ['gl_account', 'source', 'amount_local_currency'],
+                'risk_score': 75
+            },
+            'type_1': {
+                'name': 'Account Number + Amount',
+                'fields': ['gl_account', 'amount_local_currency'],
+                'risk_score': 70
+            }
+        }
+        
+        # Find duplicates based on business rules (check most specific first)
+        duplicates = []
+        duplicate_counts = {duplicate_type: 0 for duplicate_type in duplicate_types.keys()}
+        
+        # Track which transaction pairs have already been classified to prevent duplicates across types
+        classified_pairs = set()
+        
+        for i, t1 in enumerate(transactions):
+            for j, t2 in enumerate(transactions[i+1:], i+1):
+                # Create a unique pair identifier
+                pair_id = tuple(sorted([str(t1.id), str(t2.id)]))
+                
+                # Skip if this pair has already been classified
+                if pair_id in classified_pairs:
+                    continue
+                
+                duplicate_found = False
+                duplicate_type = None
+                
+                # Check each duplicate type from most specific (type_6) to least specific (type_1)
+                for dup_type, config in duplicate_types.items():
+                    if self._check_duplicate_criteria(t1, t2, config['fields']):
+                        duplicate_found = True
+                        duplicate_type = dup_type
+                        # Mark this pair as classified so it won't be checked for other types
+                        classified_pairs.add(pair_id)
+                        break
+                
+                if duplicate_found:
+                    duplicate_counts[duplicate_type] += 1
+                    
+                    # Calculate similarity score based on matching fields
+                    similarity_score = self._calculate_similarity_score(t1, t2, duplicate_types[duplicate_type]['fields'])
+                    
+                    duplicates.append({
+                        'transaction1': {
+                            'id': str(t1.id),
+                            'document_number': t1.document_number,
+                            'amount': float(t1.amount_local_currency),
+                            'account': t1.gl_account,
+                            'date': t1.posting_date.isoformat() if t1.posting_date else None,
+                            'user': t1.user_name,
+                            'source': getattr(t1, 'source', ''),
+                            'effective_date': t1.document_date.isoformat() if t1.document_date else None
+                        },
+                        'transaction2': {
+                            'id': str(t2.id),
+                            'document_number': t2.document_number,
+                            'amount': float(t2.amount_local_currency),
+                            'account': t2.gl_account,
+                            'date': t2.posting_date.isoformat() if t2.posting_date else None,
+                            'user': t2.user_name,
+                            'source': getattr(t2, 'source', ''),
+                            'effective_date': t2.document_date.isoformat() if t2.document_date else None
+                        },
+                        'duplicate_type': duplicate_type,
+                        'duplicate_type_name': duplicate_types[duplicate_type]['name'],
+                        'similarity_score': similarity_score,
+                        'risk_score': duplicate_types[duplicate_type]['risk_score'],
+                        'matching_fields': duplicate_types[duplicate_type]['fields']
+                    })
+        
+        # Generate comprehensive analysis information
+        analysis_info = self._generate_comprehensive_analysis_info(transactions, duplicates)
+        breakdowns = self._generate_comprehensive_breakdowns(duplicates, transactions)
+        chart_data = self._generate_comprehensive_chart_data(duplicates, duplicate_counts)
+        detailed_insights = self._generate_detailed_insights(duplicates, transactions)
+        
+        # Group duplicates by type
+        duplicates_by_type = {}
+        for dup_type, config in duplicate_types.items():
+            type_duplicates = [d for d in duplicates if d['duplicate_type'] == dup_type]
+            duplicates_by_type[dup_type] = {
+                'name': config['name'],
+                'count': len(type_duplicates),
+                'risk_score': config['risk_score'],
+                'duplicates': type_duplicates
+            }
+        
+        # Create comprehensive analysis results
+        analysis_results = {
+            'duplicates_found': len(duplicates),
+            'duplicate_pairs': duplicates,
+            'duplicates_by_type': duplicates_by_type,
+            'duplicate_type_summary': {
+                'type_1_count': duplicate_counts['type_1'],
+                'type_2_count': duplicate_counts['type_2'],
+                'type_3_count': duplicate_counts['type_3'],
+                'type_4_count': duplicate_counts['type_4'],
+                'type_5_count': duplicate_counts['type_5'],
+                'type_6_count': duplicate_counts['type_6']
+            },
+            'audit_recommendations': breakdowns.get('audit_recommendations', {}),
+            'compliance_assessment': breakdowns.get('compliance_assessment', {}),
+            'financial_statement_impact': breakdowns.get('financial_statement_impact', {}),
+            'chart_data': chart_data,
+            'export_data': duplicates,
+            'processing_duration': 0.0,  # Will be set by caller
+            # Add comprehensive analysis results
+            'analysis_info': analysis_info,
+            'breakdowns': breakdowns,
+            'slicer_filters': self._generate_slicer_filters(duplicates, transactions),
+            'summary_table': self._generate_summary_table(duplicates),
+            'detailed_insights': detailed_insights
+        }
+        
+        # Cache results
+        cache_key = f"duplicate_{len(transactions)}_{hash(tuple(t.id for t in transactions))}"
+        self._analysis_cache[cache_key] = analysis_results
+        
+        # Update SAPGLPosting records with duplicate information
+        self._update_transactions_with_duplicate_analysis(transactions, duplicates)
+        
+        logger.info(f"Comprehensive duplicate analysis completed. Found {len(duplicates)} duplicate entries.")
+        
+        return analysis_results
+    
+    def _run_basic_duplicate_analysis(self, transactions: List) -> Dict[str, Any]:
+        """
+        Fallback basic duplicate analysis using business rules
+        
+        Args:
+            transactions: List of transactions to analyze
+            
+        Returns:
+            Dict containing basic analysis results
+        """
+        logger.info(f"Running Basic Duplicate Analysis for {len(transactions)} transactions")
         
         # Define duplicate types based on business rules (ordered from most specific to least specific)
         duplicate_types = {
@@ -544,18 +708,183 @@ class MLAnalysisOrchestrator:
             'processing_duration': 0.0  # Will be set by caller
         }
         
-        # Cache results
-        cache_key = f"duplicate_{len(transactions)}_{hash(tuple(t.id for t in transactions))}"
-        self._analysis_cache[cache_key] = analysis_results
-        
         # Update SAPGLPosting records with duplicate information
         self._update_transactions_with_duplicate_analysis(transactions, duplicates)
         
-        # Cache results
-        cache_key = f"duplicate_{len(transactions)}_{hash(tuple(t.id for t in transactions))}"
-        self._analysis_cache[cache_key] = analysis_results
-        
         return analysis_results
+    
+    def _generate_comprehensive_analysis_info(self, transactions: List, duplicates: List) -> Dict[str, Any]:
+        """Generate comprehensive analysis information"""
+        total_amount = sum(float(t.amount_local_currency) for t in transactions)
+        duplicate_amount = sum(d['transaction1']['amount'] for d in duplicates)
+        
+        return {
+            'analysis_id': str(uuid.uuid4()),
+            'analysis_date': timezone.now().isoformat(),
+            'processing_duration': 0,
+            'status': 'COMPLETED',
+            'analysis_version': '1.0.0',
+            'total_transactions': len(transactions),
+            'total_duplicates': len(duplicates),
+            'total_amount': total_amount,
+            'duplicate_amount': duplicate_amount,
+            'duplicate_percentage': (len(duplicates) / len(transactions)) * 100 if transactions else 0
+        }
+    
+    def _generate_comprehensive_breakdowns(self, duplicates: List, transactions: List) -> Dict[str, Any]:
+        """Generate comprehensive breakdowns"""
+        # Risk distribution
+        risk_distribution = {
+            'Critical': len([d for d in duplicates if d['risk_score'] >= 90]),
+            'High': len([d for d in duplicates if 80 <= d['risk_score'] < 90]),
+            'Medium': len([d for d in duplicates if 70 <= d['risk_score'] < 80]),
+            'Low': len([d for d in duplicates if d['risk_score'] < 70])
+        }
+        
+        # Compliance issues
+        compliance_issues = []
+        high_risk_duplicates = [d for d in duplicates if d['risk_score'] >= 80]
+        large_amount_duplicates = [d for d in duplicates if d['transaction1']['amount'] > 1000000]
+        
+        if high_risk_duplicates:
+            compliance_issues.append({
+                'type': 'high_risk_duplicates',
+                'severity': 'HIGH',
+                'description': f'Found {len(high_risk_duplicates)} high-risk duplicate transactions',
+                'count': len(high_risk_duplicates),
+                'total_amount': sum(d['transaction1']['amount'] for d in high_risk_duplicates)
+            })
+        
+        if large_amount_duplicates:
+            compliance_issues.append({
+                'type': 'large_amount_duplicates',
+                'severity': 'HIGH',
+                'description': f'Found {len(large_amount_duplicates)} duplicate transactions with amounts over 1M SAR',
+                'count': len(large_amount_duplicates),
+                'total_amount': sum(d['transaction1']['amount'] for d in large_amount_duplicates)
+            })
+        
+        # High priority recommendations
+        high_priority_recommendations = []
+        
+        critical_duplicates = [d for d in duplicates if d['risk_score'] >= 90]
+        if critical_duplicates:
+            high_priority_recommendations.append({
+                'priority': 'CRITICAL',
+                'action': 'Immediate investigation required',
+                'description': f'Found {len(critical_duplicates)} critical-risk duplicate transactions',
+                'count': len(critical_duplicates),
+                'total_amount': sum(d['transaction1']['amount'] for d in critical_duplicates),
+                'recommendation': 'Review and investigate these transactions immediately for potential fraud or errors'
+            })
+        
+        high_risk_duplicates = [d for d in duplicates if 80 <= d['risk_score'] < 90]
+        if high_risk_duplicates:
+            high_priority_recommendations.append({
+                'priority': 'HIGH',
+                'action': 'Priority investigation',
+                'description': f'Found {len(high_risk_duplicates)} high-risk duplicate transactions',
+                'count': len(high_risk_duplicates),
+                'total_amount': sum(d['transaction1']['amount'] for d in high_risk_duplicates),
+                'recommendation': 'Investigate these transactions within 48 hours'
+            })
+        
+        if large_amount_duplicates:
+            high_priority_recommendations.append({
+                'priority': 'HIGH',
+                'action': 'Large amount duplicate review',
+                'description': f'Found {len(large_amount_duplicates)} duplicate transactions with amounts over 1M SAR',
+                'count': len(large_amount_duplicates),
+                'total_amount': sum(d['transaction1']['amount'] for d in large_amount_duplicates),
+                'recommendation': 'Review these large amount duplicates for potential financial statement impact'
+            })
+        
+        return {
+            'duplicate_by_user': [],
+            'duplicate_by_account': [],
+            'audit_recommendations': {
+                'low_risk_duplicates': len([d for d in duplicates if d['risk_score'] < 75]),
+                'high_risk_duplicates': len([d for d in duplicates if d['risk_score'] >= 85]),
+                'medium_risk_duplicates': len([d for d in duplicates if 75 <= d['risk_score'] < 85])
+            },
+            'compliance_assessment': {
+                'total_duplicates': len(duplicates),
+                'duplicate_percentage': (len(duplicates) / len(transactions)) * 100 if transactions else 0,
+                'duplicate_types_detected': len(set(d['duplicate_type'] for d in duplicates))
+            },
+            'duplicate_by_document': [],
+            'financial_statement_impact': {
+                'potential_duplicate_amount': sum(d['transaction1']['amount'] for d in duplicates),
+                'highest_risk_duplicate_amount': sum(d['transaction1']['amount'] for d in duplicates if d['risk_score'] >= 85)
+            },
+            'risk_distribution': risk_distribution,
+            'compliance_issues': compliance_issues,
+            'high_priority_recommendations': high_priority_recommendations
+        }
+    
+    def _generate_comprehensive_chart_data(self, duplicates: List, duplicate_counts: Dict) -> Dict[str, Any]:
+        """Generate comprehensive chart data"""
+        # Risk levels chart
+        risk_levels = {
+            'low_risk': len([d for d in duplicates if d['risk_score'] < 75]),
+            'high_risk': len([d for d in duplicates if d['risk_score'] >= 85]),
+            'medium_risk': len([d for d in duplicates if 75 <= d['risk_score'] < 85])
+        }
+        
+        # Duplicate distribution chart
+        duplicate_distribution = {
+            'type_1': duplicate_counts.get('type_1', 0),
+            'type_2': duplicate_counts.get('type_2', 0),
+            'type_3': duplicate_counts.get('type_3', 0),
+            'type_4': duplicate_counts.get('type_4', 0),
+            'type_5': duplicate_counts.get('type_5', 0),
+            'type_6': duplicate_counts.get('type_6', 0)
+        }
+        
+        return {
+            'risk_levels': risk_levels,
+            'duplicate_distribution': duplicate_distribution
+        }
+    
+    def _generate_detailed_insights(self, duplicates: List, transactions: List) -> Dict[str, Any]:
+        """Generate detailed insights"""
+        # Analyze duplicate patterns
+        duplicate_patterns = {
+            'duplicate_entries': duplicates,
+            'duplicate_patterns': {
+                'duplicate_by_user': [],
+                'duplicate_by_account': [],
+                'audit_recommendations': {
+                    'low_risk_duplicates': len([d for d in duplicates if d['risk_score'] < 75]),
+                    'high_risk_duplicates': len([d for d in duplicates if d['risk_score'] >= 85]),
+                    'medium_risk_duplicates': len([d for d in duplicates if 75 <= d['risk_score'] < 85])
+                },
+                'compliance_assessment': {
+                    'total_duplicates': len(duplicates),
+                    'duplicate_percentage': (len(duplicates) / len(transactions)) * 100 if transactions else 0,
+                    'duplicate_types_detected': len(set(d['duplicate_type'] for d in duplicates))
+                },
+                'duplicate_by_document': [],
+                'financial_statement_impact': {
+                    'potential_duplicate_amount': sum(d['transaction1']['amount'] for d in duplicates),
+                    'highest_risk_duplicate_amount': sum(d['transaction1']['amount'] for d in duplicates if d['risk_score'] >= 85)
+                }
+            },
+            'audit_recommendations': {},
+            'detection_methods': [],
+            'confidence_scores': {},
+            'false_positive_indicators': []
+        }
+        
+        return duplicate_patterns
+    
+    def _generate_slicer_filters(self, duplicates: List, transactions: List) -> Dict[str, Any]:
+        """Generate slicer filters"""
+        return {}
+    
+    def _generate_summary_table(self, duplicates: List) -> List:
+        """Generate summary table"""
+        return []
     
     def _update_transactions_with_duplicate_analysis(self, transactions: List, duplicates: List) -> None:
         """
@@ -654,6 +983,8 @@ class MLAnalysisOrchestrator:
                         transaction.backdated_risk_score = details['risk_score']
                         transaction.backdated_analysis_details = details
                         transaction.anomaly_types = list(set(transaction.anomaly_types + ['backdated']))
+                        
+
                     else:
                         # Reset backdated flags for non-backdated transactions
                         transaction.is_backdated = False
@@ -843,9 +1174,296 @@ class MLAnalysisOrchestrator:
         
         # Update SAPGLPosting records with backdated information
         self._update_transactions_with_backdated_analysis(transactions, backdated_entries)
-        
         # Cache results
         cache_key = f"backdated_{len(transactions)}_{hash(tuple(t.id for t in transactions))}"
+        self._analysis_cache[cache_key] = analysis_results
+        
+        return analysis_results
+    
+    def run_user_analysis(self, transactions: List) -> Dict[str, Any]:
+        """
+        Run user analysis with comprehensive user behavior analysis
+        
+        Args:
+            transactions: List of transactions to analyze
+            
+        Returns:
+            Dict containing analysis results
+        """
+        logger.info(f"Running User Analysis for {len(transactions)} transactions")
+        
+        # Get unique users
+        unique_users = list(set(t.user_name for t in transactions))
+        
+        # 1. User Transaction Summary
+        user_transaction_summary = {}
+        for user in unique_users:
+            user_transactions = [t for t in transactions if t.user_name == user]
+            total_amount = sum(float(t.amount_local_currency) for t in user_transactions)
+            debit_amount = sum(float(t.amount_local_currency) for t in user_transactions if t.transaction_type == 'DEBIT')
+            credit_amount = sum(float(t.amount_local_currency) for t in user_transactions if t.transaction_type == 'CREDIT')
+            
+            user_transaction_summary[user] = {
+                'user': user,
+                'total_transactions': len(user_transactions),
+                'total_amount': total_amount,
+                'debit_amount': debit_amount,
+                'credit_amount': credit_amount,
+                'balance': debit_amount - credit_amount,
+                'unique_accounts': len(set(t.gl_account for t in user_transactions)),
+                'average_transaction_amount': float(total_amount) / len(user_transactions) if user_transactions else 0,
+                'transaction_types': {
+                    'debit_count': len([t for t in user_transactions if t.transaction_type == 'DEBIT']),
+                    'credit_count': len([t for t in user_transactions if t.transaction_type == 'CREDIT'])
+                }
+            }
+        
+        # 2. User Debit Analysis
+        user_debit_analysis = {}
+        for user in unique_users:
+            user_transactions = [t for t in transactions if t.user_name == user]
+            debit_transactions = [t for t in user_transactions if t.transaction_type == 'DEBIT']
+            
+            if debit_transactions:
+                debit_amounts = [float(t.amount_local_currency) for t in debit_transactions]
+                user_debit_analysis[user] = {
+                    'user': user,
+                    'total_debit_amount': sum(debit_amounts),
+                    'debit_count': len(debit_transactions),
+                    'average_debit_amount': float(sum(debit_amounts)) / len(debit_amounts),
+                    'max_debit_amount': max(debit_amounts),
+                    'min_debit_amount': min(debit_amounts),
+                    'debit_accounts': list(set(t.gl_account for t in debit_transactions))
+                }
+            else:
+                user_debit_analysis[user] = {
+                    'user': user,
+                    'total_debit_amount': 0,
+                    'debit_count': 0,
+                    'average_debit_amount': 0,
+                    'max_debit_amount': 0,
+                    'min_debit_amount': 0,
+                    'debit_accounts': []
+                }
+        
+        # 3. User Account Distribution
+        user_account_distribution = {}
+        for user in unique_users:
+            user_transactions = [t for t in transactions if t.user_name == user]
+            account_counts = {}
+            
+            for transaction in user_transactions:
+                account = transaction.gl_account
+                if account not in account_counts:
+                    account_counts[account] = {
+                        'count': 0,
+                        'total_amount': 0,
+                        'debit_amount': 0,
+                        'credit_amount': 0
+                    }
+                
+                amount = float(transaction.amount_local_currency)
+                account_counts[account]['count'] += 1
+                account_counts[account]['total_amount'] += amount
+                
+                if transaction.transaction_type == 'DEBIT':
+                    account_counts[account]['debit_amount'] += amount
+                else:
+                    account_counts[account]['credit_amount'] += amount
+            
+            user_account_distribution[user] = {
+                'user': user,
+                'total_accounts': len(account_counts),
+                'account_details': [
+                    {
+                        'account': account,
+                        'count': details['count'],
+                        'total_amount': details['total_amount'],
+                        'debit_amount': details['debit_amount'],
+                        'credit_amount': details['credit_amount']
+                    }
+                    for account, details in account_counts.items()
+                ]
+            }
+        
+        # 4. User Anomalies Detection
+        user_anomalies = {}
+        for user in unique_users:
+            user_transactions = [t for t in transactions if t.user_name == user]
+            user_summary = user_transaction_summary[user]
+            
+            anomalies = []
+            
+            # High transaction count anomaly
+            if user_summary['total_transactions'] > 100:  # Threshold for high activity
+                anomalies.append({
+                    'type': 'high_transaction_count',
+                    'severity': 'medium',
+                    'description': f'User has {user_summary["total_transactions"]} transactions',
+                    'value': user_summary['total_transactions']
+                })
+            
+            # High amount anomaly
+            if user_summary['total_amount'] > 1000000:  # Threshold for high amount
+                anomalies.append({
+                    'type': 'high_amount',
+                    'severity': 'high',
+                    'description': f'User total amount: {user_summary["total_amount"]:,.2f}',
+                    'value': user_summary['total_amount']
+                })
+            
+            # Unusual balance anomaly
+            balance_ratio = abs(user_summary['balance']) / user_summary['total_amount'] if user_summary['total_amount'] > 0 else 0
+            if balance_ratio > 0.8:  # Threshold for unusual balance
+                anomalies.append({
+                    'type': 'unusual_balance',
+                    'severity': 'medium',
+                    'description': f'Unusual balance ratio: {balance_ratio:.2%}',
+                    'value': balance_ratio
+                })
+            
+            # Account concentration anomaly
+            if user_summary['unique_accounts'] == 1 and user_summary['total_transactions'] > 10:
+                anomalies.append({
+                    'type': 'account_concentration',
+                    'severity': 'low',
+                    'description': f'User uses only 1 account for {user_summary["total_transactions"]} transactions',
+                    'value': user_summary['unique_accounts']
+                })
+            
+            user_anomalies[user] = {
+                'user': user,
+                'anomalies': anomalies,
+                'anomaly_count': len(anomalies),
+                'risk_level': 'high' if len([a for a in anomalies if a['severity'] == 'high']) > 0 else 'medium' if len(anomalies) > 0 else 'low'
+            }
+        
+        # 5. User Risk Assessment
+        user_risk_assessment = {}
+        for user in unique_users:
+            user_transactions = [t for t in transactions if t.user_name == user]
+            user_summary = user_transaction_summary[user]
+            user_anomaly = user_anomalies[user]
+            
+            # Calculate risk score based on various factors
+            risk_score = 0
+            
+            # Transaction count risk
+            if user_summary['total_transactions'] > 100:
+                risk_score += 20
+            elif user_summary['total_transactions'] > 50:
+                risk_score += 10
+            
+            # Amount risk
+            if user_summary['total_amount'] > 1000000:
+                risk_score += 30
+            elif user_summary['total_amount'] > 500000:
+                risk_score += 20
+            elif user_summary['total_amount'] > 100000:
+                risk_score += 10
+            
+            # Balance risk
+            balance_ratio = abs(user_summary['balance']) / float(user_summary['total_amount']) if user_summary['total_amount'] > 0 else 0
+            if balance_ratio > 0.8:
+                risk_score += 15
+            elif balance_ratio > 0.5:
+                risk_score += 10
+            
+            # Anomaly risk
+            risk_score += len(user_anomaly['anomalies']) * 5
+            
+            # Account diversity risk (lower diversity = higher risk)
+            account_diversity = user_summary['unique_accounts'] / float(user_summary['total_transactions']) if user_summary['total_transactions'] > 0 else 0
+            if account_diversity < 0.1:
+                risk_score += 15
+            elif account_diversity < 0.2:
+                risk_score += 10
+            
+            # Cap risk score at 100
+            risk_score = min(risk_score, 100)
+            
+            # Determine risk level
+            if risk_score >= 80:
+                risk_level = 'critical'
+            elif risk_score >= 60:
+                risk_level = 'high'
+            elif risk_score >= 40:
+                risk_level = 'medium'
+            else:
+                risk_level = 'low'
+            
+            user_risk_assessment[user] = {
+                'user': user,
+                'risk_score': risk_score,
+                'risk_level': risk_level,
+                'risk_factors': {
+                    'transaction_count_risk': 20 if user_summary['total_transactions'] > 100 else 10 if user_summary['total_transactions'] > 50 else 0,
+                    'amount_risk': 30 if user_summary['total_amount'] > 1000000 else 20 if user_summary['total_amount'] > 500000 else 10 if user_summary['total_amount'] > 100000 else 0,
+                    'balance_risk': 15 if balance_ratio > 0.8 else 10 if balance_ratio > 0.5 else 0,
+                    'anomaly_risk': len(user_anomaly['anomalies']) * 5,
+                    'account_diversity_risk': 15 if account_diversity < 0.1 else 10 if account_diversity < 0.2 else 0
+                },
+                'recommendations': [
+                    'Review high transaction volume' if user_summary['total_transactions'] > 100 else None,
+                    'Investigate large amounts' if user_summary['total_amount'] > 1000000 else None,
+                    'Check unusual balance patterns' if balance_ratio > 0.8 else None,
+                    'Review account concentration' if account_diversity < 0.1 else None
+                ]
+            }
+            # Remove None values from recommendations
+            user_risk_assessment[user]['recommendations'] = [r for r in user_risk_assessment[user]['recommendations'] if r is not None]
+        
+        # 6. Chart Data Generation
+        chart_data = {
+            'user_activity': {user: user_transaction_summary[user]['total_transactions'] for user in unique_users},
+            'user_amounts': {user: float(user_transaction_summary[user]['total_amount']) for user in unique_users},
+            'user_risk_scores': {user: user_risk_assessment[user]['risk_score'] for user in unique_users},
+            'risk_distribution': {
+                'critical': len([u for u in unique_users if user_risk_assessment[u]['risk_level'] == 'critical']),
+                'high': len([u for u in unique_users if user_risk_assessment[u]['risk_level'] == 'high']),
+                'medium': len([u for u in unique_users if user_risk_assessment[u]['risk_level'] == 'medium']),
+                'low': len([u for u in unique_users if user_risk_assessment[u]['risk_level'] == 'low'])
+            },
+            'anomaly_distribution': {
+                'high_anomalies': len([u for u in unique_users if user_anomalies[u]['anomaly_count'] > 3]),
+                'medium_anomalies': len([u for u in unique_users if 1 <= user_anomalies[u]['anomaly_count'] <= 3]),
+                'no_anomalies': len([u for u in unique_users if user_anomalies[u]['anomaly_count'] == 0])
+            }
+        }
+        
+        # 7. Export Data
+        export_data = []
+        for user in unique_users:
+            export_data.append({
+                'user': user,
+                'transaction_summary': user_transaction_summary[user],
+                'debit_analysis': user_debit_analysis[user],
+                'account_distribution': user_account_distribution[user],
+                'anomalies': user_anomalies[user],
+                'risk_assessment': user_risk_assessment[user]
+            })
+        
+        # Create analysis results
+        analysis_results = {
+            'total_users': len(unique_users),
+            'user_transaction_summary': list(user_transaction_summary.values()),
+            'user_debit_analysis': list(user_debit_analysis.values()),
+            'user_account_distribution': list(user_account_distribution.values()),
+            'user_anomalies': list(user_anomalies.values()),
+            'user_risk_assessment': list(user_risk_assessment.values()),
+            'statistical_summary': {
+                'average_transactions_per_user': sum(u['total_transactions'] for u in user_transaction_summary.values()) / len(unique_users) if unique_users else 0,
+                'average_amount_per_user': sum(float(u['total_amount']) for u in user_transaction_summary.values()) / len(unique_users) if unique_users else 0,
+                'high_risk_users': len([u for u in user_risk_assessment.values() if u['risk_level'] in ['high', 'critical']]),
+                'users_with_anomalies': len([u for u in user_anomalies.values() if u['anomaly_count'] > 0])
+            },
+            'chart_data': chart_data,
+            'export_data': export_data,
+            'processing_duration': 0.0  # Will be set by caller
+        }
+        
+        # Cache results
+        cache_key = f"user_{len(transactions)}_{hash(tuple(t.id for t in transactions))}"
         self._analysis_cache[cache_key] = analysis_results
         
         return analysis_results
@@ -864,7 +1482,7 @@ class MLAnalysisOrchestrator:
         """
         for field in fields:
             if field == 'amount_local_currency':
-                if abs(t1.amount_local_currency - t2.amount_local_currency) > 0.01:  # Allow small rounding differences
+                if abs(float(t1.amount_local_currency) - float(t2.amount_local_currency)) > 0.01:  # Allow small rounding differences
                     return False
             elif field == 'posting_date':
                 if t1.posting_date != t2.posting_date:
@@ -918,7 +1536,7 @@ class MLAnalysisOrchestrator:
         for field in all_fields:
             if field not in matching_fields:
                 if field == 'amount_local_currency':
-                    if abs(t1.amount_local_currency - t2.amount_local_currency) <= 0.01:
+                    if abs(float(t1.amount_local_currency) - float(t2.amount_local_currency)) <= 0.01:
                         additional_matches += 1
                 elif getattr(t1, field, None) == getattr(t2, field, None):
                     additional_matches += 1
@@ -1057,20 +1675,25 @@ class MLAnalysisOrchestrator:
         except Exception as e:
             logger.error(f"Error updating transactions with overall analysis: {e}")
     
-    def run_risk_analysis(self, transactions: List) -> Dict[str, Any]:
+    def run_risk_analysis(self, transactions: List, overall_results: List = None) -> Dict[str, Any]:
         """
         Run risk analysis with ML model
         
         Args:
             transactions: List of transactions to analyze
+            overall_results: Optional overall analysis results to reuse (prevents duplicate calls)
             
         Returns:
             Dict containing analysis results
         """
         logger.info(f"Running Risk Analysis with ML for {len(transactions)} transactions")
         
-        # Get overall analysis results first
-        overall_results = self.model_manager.predict_with_model('overall', transactions)
+        # Get overall analysis results first (only if not provided)
+        if overall_results is None:
+            logger.info("Risk Analysis: Calling overall model prediction (no results provided)")
+            overall_results = self.model_manager.predict_with_model('overall', transactions)
+        else:
+            logger.info(f"Risk Analysis: Reusing {len(overall_results)} overall results (preventing duplicate calls)")
         
         # Get risk analysis predictions
         risk_results = self.model_manager.predict_with_model('risk', transactions, 
@@ -1163,9 +1786,12 @@ class MLAnalysisOrchestrator:
         results['overall'] = self.run_overall_analysis(transactions)
         results['overall']['processing_duration'] = (timezone.now() - overall_start).total_seconds()
         
-        # Risk Analysis
+        # Risk Analysis (reuse overall results to prevent duplicate calls)
         risk_start = timezone.now()
-        results['risk'] = self.run_risk_analysis(transactions)
+        # Extract overall results from the overall analysis
+        overall_results = results['overall'].get('ml_results', [])
+        logger.info(f"Running Risk Analysis with {len(overall_results)} overall results from previous analysis")
+        results['risk'] = self.run_risk_analysis(transactions, overall_results=overall_results)
         results['risk']['processing_duration'] = (timezone.now() - risk_start).total_seconds()
         
         # Overall processing duration

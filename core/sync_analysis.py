@@ -43,18 +43,23 @@ def run_general_analysis_sync(job_id):
         except Exception as e:
             logger.warning(f"ML analysis failed, using fallback analysis: {e}")
             # Fallback to basic analysis without ML
+            total_amount = float(sum(t.amount_local_currency for t in transactions))
+            total_debits = float(sum(t.amount_local_currency for t in transactions if t.transaction_type == 'DEBIT'))
+            total_credits = float(sum(t.amount_local_currency for t in transactions if t.transaction_type == 'CREDIT'))
+            trial_balance = total_debits - total_credits
+            
             analysis_results = {
                 'trial_balance_summary': {
-                    'total_debits': float(sum(t.amount_local_currency for t in transactions if t.transaction_type == 'DEBIT')),
-                    'total_credits': float(sum(t.amount_local_currency for t in transactions if t.transaction_type == 'CREDIT')),
-                    'balance': 0.0,
-                    'is_balanced': True,
-                    'balance_percentage': 0.0
+                    'total_debits': total_debits,
+                    'total_credits': total_credits,
+                    'balance': trial_balance,
+                    'is_balanced': abs(trial_balance) < 0.01,
+                    'balance_percentage': (abs(trial_balance) / float(total_amount) * 100) if total_amount > 0 else 0.0
                 },
                 'gl_account_summaries': [],
                 'user_summaries': [],
                 'statistical_calculations': {
-                    'average_transaction_amount': float(sum(t.amount_local_currency for t in transactions) / len(transactions)) if transactions else 0,
+                    'average_transaction_amount': float(total_amount) / len(transactions) if transactions else 0.0,
                     'total_transactions': len(transactions),
                     'unique_users': len(set(t.user_name for t in transactions)),
                     'unique_accounts': len(set(t.gl_account for t in transactions)),
@@ -239,19 +244,19 @@ def run_backdated_analysis_sync(job_id):
             analysis_version='1.0.0',
             analysis_info={
                 'total_transactions': len(transactions),
-                'backdated_entries_found': backdated_results['backdated_entries_found'],
-                'backdated_percentage': backdated_results['compliance_assessment']['backdated_percentage']
+                'backdated_entries_found': backdated_results.get('backdated_entries_found', 0),
+                'backdated_percentage': backdated_results.get('compliance_assessment', {}).get('backdated_percentage', 0)
             },
-            backdated_entries=backdated_results['backdated_entries'],
-            backdated_by_document=backdated_results['backdated_by_document'],
-            backdated_by_account=backdated_results['backdated_by_account'],
-            backdated_by_user=backdated_results['backdated_by_user'],
-            audit_recommendations=backdated_results['audit_recommendations'],
-            compliance_assessment=backdated_results['compliance_assessment'],
-            financial_statement_impact=backdated_results['financial_statement_impact'],
-            chart_data=backdated_results['chart_data'],
-            export_data=backdated_results['export_data'],
-            processing_duration=backdated_results['processing_duration'],
+            backdated_entries=backdated_results.get('backdated_entries', []),
+            backdated_by_document=backdated_results.get('backdated_by_document', []),
+            backdated_by_account=backdated_results.get('backdated_by_account', []),
+            backdated_by_user=backdated_results.get('backdated_by_user', []),
+            audit_recommendations=backdated_results.get('audit_recommendations', {}),
+            compliance_assessment=backdated_results.get('compliance_assessment', {}),
+            financial_statement_impact=backdated_results.get('financial_statement_impact', {}),
+            chart_data=backdated_results.get('chart_data', {}),
+            export_data=backdated_results.get('export_data', []),
+            processing_duration=backdated_results.get('processing_duration', 0),
             status='COMPLETED'
         )
         
@@ -263,7 +268,7 @@ def run_backdated_analysis_sync(job_id):
             'analysis_id': str(backdated_analysis_result.id),
             'status': 'COMPLETED',
             'processing_duration': processing_duration,
-            'backdated_entries_found': backdated_results['backdated_entries_found'],
+            'backdated_entries_found': backdated_results.get('backdated_entries_found', 0),
             'table': 'BackdatedAnalysisResult'
         }
         
@@ -277,6 +282,89 @@ def run_backdated_analysis_sync(job_id):
                 data_file=data_file,
                 processing_job=job,
                 analysis_type='enhanced_backdated',
+                analysis_version='1.0.0',
+                status='FAILED',
+                error_message=error_msg
+            )
+        except:
+            pass
+        
+        return {'error': error_msg}
+
+def run_user_analysis_sync(job_id):
+    """Run User Analysis synchronously and save to database"""
+    
+    # Setup Django
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'analytics.settings')
+    django.setup()
+    
+    from core.models import FileProcessingJob, SAPGLPosting, UserAnalysisResult
+    
+    start_time = timezone.now()
+    
+    try:
+        # Get the processing job and data file
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        # Get transactions for this file
+        transactions = SAPGLPosting.objects.filter(data_file=data_file)
+        
+        logger.info(f"Running User Analysis for {len(transactions)} transactions")
+        
+        # Use centralized ML orchestrator for efficient analysis
+        from .ml_analysis_orchestrator import MLAnalysisOrchestrator
+        orchestrator = MLAnalysisOrchestrator()
+        
+        # Run user analysis with ML
+        user_results = orchestrator.run_user_analysis(transactions)
+        user_results['processing_duration'] = (timezone.now() - start_time).total_seconds()
+        
+        # Save to UserAnalysisResult table
+        user_analysis_result = UserAnalysisResult.objects.create(
+            data_file=data_file,
+            processing_job=job,
+            analysis_type='user_analysis',
+            analysis_version='1.0.0',
+            analysis_info={
+                'total_users': user_results.get('total_users', 0),
+                'total_transactions': len(transactions),
+                'high_risk_users': user_results.get('statistical_summary', {}).get('high_risk_users', 0),
+                'users_with_anomalies': user_results.get('statistical_summary', {}).get('users_with_anomalies', 0)
+            },
+            user_transaction_summary=user_results.get('user_transaction_summary', []),
+            user_debit_analysis=user_results.get('user_debit_analysis', []),
+            user_account_distribution=user_results.get('user_account_distribution', []),
+            user_anomalies=user_results.get('user_anomalies', []),
+            user_risk_assessment=user_results.get('user_risk_assessment', []),
+            chart_data=user_results.get('chart_data', {}),
+            export_data=user_results.get('export_data', []),
+            processing_duration=user_results.get('processing_duration', 0),
+            status='COMPLETED'
+        )
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        
+        logger.info(f"User Analysis completed and saved to database in {processing_duration:.2f} seconds")
+        
+        return {
+            'analysis_id': str(user_analysis_result.id),
+            'status': 'COMPLETED',
+            'processing_duration': processing_duration,
+            'total_users': user_results.get('total_users', 0),
+            'table': 'UserAnalysisResult'
+        }
+        
+    except Exception as e:
+        error_msg = f"Error in User Analysis: {str(e)}"
+        logger.error(error_msg)
+        
+        # Save failed result to database
+        try:
+            UserAnalysisResult.objects.create(
+                data_file=data_file,
+                processing_job=job,
+                analysis_type='user_analysis',
                 analysis_version='1.0.0',
                 status='FAILED',
                 error_message=error_msg

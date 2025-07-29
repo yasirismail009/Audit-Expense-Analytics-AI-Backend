@@ -1098,3 +1098,265 @@ class EnhancedDuplicateAnalyzer:
         }
         
         return comparative 
+
+    """
+    Enhanced Backdated Analysis with business rules implementation
+    
+    Business Rule: Identify all Document numbers for which the Posting Date is after the Effective Date (Document Date).
+    Both date fields are required to be present in the GL data for this test.
+    """
+    
+    def __init__(self):
+        self.risk_levels = {
+            'critical': {'min_days': 31, 'risk_score': 100.0},
+            'high': {'min_days': 15, 'max_days': 30, 'risk_score': 85.0},
+            'medium': {'min_days': 8, 'max_days': 14, 'risk_score': 70.0},
+            'low': {'min_days': 1, 'max_days': 7, 'risk_score': 50.0}
+        }
+    
+    def run_backdated_analysis(self, data_file, processing_job):
+        """
+        Run backdated analysis based on business rules
+        
+        Args:
+            data_file: DataFile instance
+            processing_job: FileProcessingJob instance
+            
+        Returns:
+            Dict containing analysis results with analysis_id
+        """
+        from core.models import SAPGLPosting, BackdatedAnalysisResult
+        from django.utils import timezone
+        
+        start_time = timezone.now()
+        
+        try:
+            # Get transactions for this file
+            transactions = SAPGLPosting.objects.filter(data_file=data_file)
+            
+            logger.info(f"Running Backdated Analysis for {len(transactions)} transactions")
+            
+            # Find backdated entries based on business rule: posting_date > document_date
+            backdated_entries = []
+            backdated_by_document = {}
+            backdated_by_account = {}
+            backdated_by_user = {}
+            
+            for transaction in transactions:
+                # Both date fields must be present (business rule requirement)
+                if transaction.document_date and transaction.posting_date:
+                    days_difference = (transaction.posting_date - transaction.document_date).days
+                    
+                    # Check if posting date is after document date (backdated entry)
+                    if days_difference > 0:
+                        # Calculate risk score based on days difference
+                        risk_score, risk_level = self._calculate_risk_score(days_difference)
+                        
+                        backdated_entry = {
+                            'transaction_id': str(transaction.id),
+                            'document_number': transaction.document_number,
+                            'document_date': transaction.document_date.isoformat(),
+                            'posting_date': transaction.posting_date.isoformat(),
+                            'days_difference': days_difference,
+                            'amount': float(transaction.amount_local_currency),
+                            'account': transaction.gl_account,
+                            'user': transaction.user_name,
+                            'is_backdated': True,
+                            'risk_score': risk_score,
+                            'risk_level': risk_level,
+                            'transaction_type': transaction.transaction_type,
+                            'fiscal_year': transaction.fiscal_year,
+                            'posting_period': transaction.posting_period
+                        }
+                        
+                        backdated_entries.append(backdated_entry)
+                        
+                        # Group by document
+                        if transaction.document_number not in backdated_by_document:
+                            backdated_by_document[transaction.document_number] = {
+                                'document_number': transaction.document_number,
+                                'entries': [],
+                                'total_amount': 0,
+                                'count': 0,
+                                'max_days_difference': 0,
+                                'risk_levels': set()
+                            }
+                        
+                        backdated_by_document[transaction.document_number]['entries'].append(backdated_entry)
+                        backdated_by_document[transaction.document_number]['total_amount'] += float(transaction.amount_local_currency)
+                        backdated_by_document[transaction.document_number]['count'] += 1
+                        backdated_by_document[transaction.document_number]['max_days_difference'] = max(
+                            backdated_by_document[transaction.document_number]['max_days_difference'], 
+                            days_difference
+                        )
+                        backdated_by_document[transaction.document_number]['risk_levels'].add(risk_level)
+                        
+                        # Group by account
+                        if transaction.gl_account not in backdated_by_account:
+                            backdated_by_account[transaction.gl_account] = {
+                                'account': transaction.gl_account,
+                                'entries': [],
+                                'total_amount': 0,
+                                'count': 0,
+                                'users': set()
+                            }
+                        
+                        backdated_by_account[transaction.gl_account]['entries'].append(backdated_entry)
+                        backdated_by_account[transaction.gl_account]['total_amount'] += float(transaction.amount_local_currency)
+                        backdated_by_account[transaction.gl_account]['count'] += 1
+                        backdated_by_account[transaction.gl_account]['users'].add(transaction.user_name)
+                        
+                        # Group by user
+                        if transaction.user_name not in backdated_by_user:
+                            backdated_by_user[transaction.user_name] = {
+                                'user': transaction.user_name,
+                                'entries': [],
+                                'total_amount': 0,
+                                'count': 0,
+                                'accounts': set()
+                            }
+                        
+                        backdated_by_user[transaction.user_name]['entries'].append(backdated_entry)
+                        backdated_by_user[transaction.user_name]['total_amount'] += float(transaction.amount_local_currency)
+                        backdated_by_user[transaction.user_name]['count'] += 1
+                        backdated_by_user[transaction.user_name]['accounts'].add(transaction.gl_account)
+            
+            # Convert sets to lists for JSON serialization
+            for doc_data in backdated_by_document.values():
+                doc_data['risk_levels'] = list(doc_data['risk_levels'])
+            
+            for account_data in backdated_by_account.values():
+                account_data['users'] = list(account_data['users'])
+            
+            for user_data in backdated_by_user.values():
+                user_data['accounts'] = list(user_data['accounts'])
+            
+            # Create analysis results
+            analysis_results = {
+                'backdated_entries_found': len(backdated_entries),
+                'backdated_entries': backdated_entries,
+                'backdated_by_document': list(backdated_by_document.values()),
+                'backdated_by_account': list(backdated_by_account.values()),
+                'backdated_by_user': list(backdated_by_user.values()),
+                'audit_recommendations': {
+                    'critical_risk_backdated': len([b for b in backdated_entries if b['risk_level'] == 'critical']),
+                    'high_risk_backdated': len([b for b in backdated_entries if b['risk_level'] == 'high']),
+                    'medium_risk_backdated': len([b for b in backdated_entries if b['risk_level'] == 'medium']),
+                    'low_risk_backdated': len([b for b in backdated_entries if b['risk_level'] == 'low'])
+                },
+                'compliance_assessment': {
+                    'total_backdated': len(backdated_entries),
+                    'backdated_percentage': (len(backdated_entries) / len(transactions)) * 100 if transactions else 0,
+                    'documents_with_backdated_entries': len(backdated_by_document),
+                    'accounts_with_backdated_entries': len(backdated_by_account),
+                    'users_with_backdated_entries': len(backdated_by_user)
+                },
+                'financial_statement_impact': {
+                    'backdated_amount': sum(b['amount'] for b in backdated_entries),
+                    'critical_risk_amount': sum(b['amount'] for b in backdated_entries if b['risk_level'] == 'critical'),
+                    'high_risk_amount': sum(b['amount'] for b in backdated_entries if b['risk_level'] == 'high')
+                },
+                'chart_data': {
+                    'backdated_distribution': {
+                        'by_days_difference': {
+                            '1-7_days': len([b for b in backdated_entries if 1 <= b['days_difference'] <= 7]),
+                            '8-14_days': len([b for b in backdated_entries if 8 <= b['days_difference'] <= 14]),
+                            '15-30_days': len([b for b in backdated_entries if 15 <= b['days_difference'] <= 30]),
+                            'over_30_days': len([b for b in backdated_entries if b['days_difference'] > 30])
+                        }
+                    },
+                    'risk_levels': {
+                        'critical': len([b for b in backdated_entries if b['risk_level'] == 'critical']),
+                        'high': len([b for b in backdated_entries if b['risk_level'] == 'high']),
+                        'medium': len([b for b in backdated_entries if b['risk_level'] == 'medium']),
+                        'low': len([b for b in backdated_entries if b['risk_level'] == 'low'])
+                    }
+                },
+                'export_data': backdated_entries,
+                'processing_duration': (timezone.now() - start_time).total_seconds()
+            }
+            
+            # Save to database
+            backdated_analysis_result = BackdatedAnalysisResult.objects.create(
+                data_file=data_file,
+                processing_job=processing_job,
+                analysis_type='enhanced_backdated',
+                analysis_version='1.0.0',
+                analysis_info={
+                    'total_transactions': len(transactions),
+                    'backdated_entries_found': len(backdated_entries),
+                    'backdated_percentage': (len(backdated_entries) / len(transactions)) * 100 if transactions else 0
+                },
+                backdated_entries=backdated_entries,
+                backdated_by_document=list(backdated_by_document.values()),
+                backdated_by_account=list(backdated_by_account.values()),
+                backdated_by_user=list(backdated_by_user.values()),
+                audit_recommendations=analysis_results['audit_recommendations'],
+                compliance_assessment=analysis_results['compliance_assessment'],
+                financial_statement_impact=analysis_results['financial_statement_impact'],
+                chart_data=analysis_results['chart_data'],
+                export_data=analysis_results['export_data'],
+                processing_duration=analysis_results['processing_duration'],
+                status='COMPLETED'
+            )
+            
+            # Update SAPGLPosting records with backdated flags
+            self._update_transactions_with_backdated_analysis(transactions, backdated_entries)
+            
+            logger.info(f"Backdated Analysis completed and saved to database in {analysis_results['processing_duration']:.2f} seconds")
+            
+            return {
+                'analysis_id': str(backdated_analysis_result.id),
+                'status': 'COMPLETED',
+                'processing_duration': analysis_results['processing_duration'],
+                'backdated_entries_found': len(backdated_entries),
+                'table': 'BackdatedAnalysisResult'
+            }
+            
+        except Exception as e:
+            error_msg = f"Error in Backdated Analysis: {str(e)}"
+            logger.error(error_msg)
+            
+            # Save failed result to database
+            try:
+                BackdatedAnalysisResult.objects.create(
+                    data_file=data_file,
+                    processing_job=processing_job,
+                    analysis_type='enhanced_backdated',
+                    analysis_version='1.0.0',
+                    status='FAILED',
+                    error_message=error_msg
+                )
+            except:
+                pass
+            
+            return {'error': error_msg}
+    
+    def _calculate_risk_score(self, days_difference):
+        """Calculate risk score and level based on days difference"""
+        if days_difference > 30:
+            return 100.0, 'critical'
+        elif days_difference > 14:
+            return 85.0, 'high'
+        elif days_difference > 7:
+            return 70.0, 'medium'
+        else:
+            return 50.0, 'low'
+    
+    def _update_transactions_with_backdated_analysis(self, transactions, backdated_entries):
+        """
+        Updates the SAPGLPosting records with the is_backdated flag
+        based on the backdated_entries found in the analysis.
+        """
+        from core.models import SAPGLPosting
+        
+        for backdated_entry in backdated_entries:
+            try:
+                transaction = SAPGLPosting.objects.get(id=backdated_entry['transaction_id'])
+                transaction.is_backdated = True
+                transaction.save()
+                logger.info(f"Updated transaction {transaction.id} with is_backdated=True")
+            except SAPGLPosting.DoesNotExist:
+                logger.warning(f"Transaction with ID {backdated_entry['transaction_id']} not found in data_file.")
+            except Exception as e:
+                logger.error(f"Error updating transaction {backdated_entry['transaction_id']}: {e}") 

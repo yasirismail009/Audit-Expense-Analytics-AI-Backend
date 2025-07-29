@@ -25,6 +25,9 @@ urlpatterns = [
     path('filter-dropdowns/<uuid:file_id>/', views.FilterDropdownDataView.as_view(), name='filter-dropdowns'),
     # Duplicate analysis endpoint
     path('duplicate-analysis/<uuid:file_id>/', views.DuplicateAnalysisView.as_view(), name='duplicate-analysis'),
+
+    # User analysis endpoint
+    path('user-analysis/<uuid:file_id>/', views.UserAnalysisView.as_view(), name='user-analysis'),
     # Backdated analysis endpoint
     path('backdated-analysis/<uuid:file_id>/', views.BackdatedAnalysisView.as_view(), name='backdated-analysis'),
 ] 

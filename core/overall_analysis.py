@@ -511,6 +511,15 @@ class OverallAnalyzer:
         total_risk_score = sum(t['risk_score'] for t in flagged_transactions)
         overall_risk_score = total_risk_score / len(flagged_transactions) if flagged_transactions else 0
         
+        # Get user analysis risk factors if available
+        user_risk_factors = self._get_user_analysis_risk_factors(all_transactions)
+        
+        # Add user risk factors to overall score
+        if user_risk_factors:
+            user_risk_score = user_risk_factors.get('average_user_risk_score', 0)
+            # Weight user risk at 20% of overall risk
+            overall_risk_score = (overall_risk_score * 0.8) + (user_risk_score * 0.2)
+        
         # Determine risk level
         if overall_risk_score >= 80:
             risk_level = 'CRITICAL'
@@ -547,6 +556,24 @@ class OverallAnalyzer:
                     'impact': 'MEDIUM'
                 })
         
+        # Add user risk factors
+        if user_risk_factors:
+            high_risk_users = user_risk_factors.get('high_risk_users_count', 0)
+            if high_risk_users > 0:
+                risk_factors.append({
+                    'factor': 'High-risk user activity',
+                    'count': high_risk_users,
+                    'impact': 'HIGH'
+                })
+            
+            user_anomalies = user_risk_factors.get('user_anomalies_count', 0)
+            if user_anomalies > 0:
+                risk_factors.append({
+                    'factor': 'User activity anomalies',
+                    'count': user_anomalies,
+                    'impact': 'MEDIUM'
+                })
+        
         # Risk distribution
         risk_distribution = {
             'low_risk': len([t for t in flagged_transactions if t['risk_score'] < 30]),
@@ -579,13 +606,78 @@ class OverallAnalyzer:
                 'description': f'{risk_distribution["critical_risk"]} critical risk transactions found'
             })
         
+        # Add user-specific recommendations
+        if user_risk_factors:
+            high_risk_users = user_risk_factors.get('high_risk_users_count', 0)
+            if high_risk_users > 0:
+                recommendations.append({
+                    'priority': 'HIGH',
+                    'action': 'Review high-risk user activities',
+                    'description': f'{high_risk_users} users identified with high-risk activity patterns'
+                })
+        
         return {
             'overall_risk_score': float(overall_risk_score),
             'risk_level': risk_level,
             'risk_factors': risk_factors,
             'risk_distribution': risk_distribution,
-            'recommendations': recommendations
+            'recommendations': recommendations,
+            'user_risk_factors': user_risk_factors
         }
+    
+    def _get_user_analysis_risk_factors(self, all_transactions):
+        """Get user analysis risk factors for risk calculation"""
+        try:
+            if not all_transactions:
+                return {}
+            
+            # Get the data file from transactions
+            data_file = all_transactions.first().data_file if all_transactions.exists() else None
+            if not data_file:
+                return {}
+            
+            # Check if user analysis exists
+            from .models import UserAnalysisResult
+            user_analysis = UserAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            if not user_analysis:
+                return {}
+            
+            # Extract risk factors from user analysis
+            user_risk_assessment = user_analysis.user_risk_assessment
+            user_anomalies = user_analysis.user_anomalies
+            
+            risk_factors = {
+                'high_risk_users_count': len(user_risk_assessment.get('high_risk_users', [])),
+                'user_anomalies_count': len(user_anomalies),
+                'average_user_risk_score': 0,
+                'critical_risk_users': 0,
+                'high_risk_users': 0
+            }
+            
+            # Calculate average risk score
+            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
+            if user_risk_scores:
+                risk_factors['average_user_risk_score'] = sum(
+                    user['risk_score'] for user in user_risk_scores
+                ) / len(user_risk_scores)
+                
+                # Count risk levels
+                for user in user_risk_scores:
+                    risk_level = user.get('risk_level', 'low')
+                    if risk_level == 'critical':
+                        risk_factors['critical_risk_users'] += 1
+                    elif risk_level == 'high':
+                        risk_factors['high_risk_users'] += 1
+            
+            return risk_factors
+            
+        except Exception as e:
+            logger.warning(f"Error getting user analysis risk factors: {e}")
+            return {}
     
     def _generate_chart_data(self, flagged_transactions, flag_summary, risk_assessment, all_transactions=None):
         """Generate chart data for visualizations"""
