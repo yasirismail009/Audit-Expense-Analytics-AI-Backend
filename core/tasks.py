@@ -150,7 +150,22 @@ def run_restructured_analysis(self, job_id):
         backdated_result = run_backdated_analysis.delay(job_id)
         analysis_results['backdated_analysis'] = backdated_result
         
-        # 4. RUN OVERALL ANALYSIS → Save to OverallAnalysisResult
+        # 4. RUN USER ANALYSIS → Save to UserAnalysisResult
+        debug_task_state(task_name, job_id, "USER_ANALYSIS", "Starting User Analysis...")
+        user_result = run_user_analysis.delay(job_id)
+        analysis_results['user_analysis'] = user_result
+        
+        # 5. RUN UNUSUAL DAYS ANALYSIS → Save to UnusualDaysAnalysisResult
+        debug_task_state(task_name, job_id, "UNUSUAL_DAYS_ANALYSIS", "Starting Unusual Days Analysis...")
+        unusual_days_result = run_unusual_days_analysis.delay(job_id)
+        analysis_results['unusual_days_analysis'] = unusual_days_result
+        
+        # 6. RUN CLOSING ENTRIES ANALYSIS → Save to ClosingEntriesAnalysisResult
+        debug_task_state(task_name, job_id, "CLOSING_ENTRIES_ANALYSIS", "Starting Closing Entries Analysis...")
+        closing_entries_result = run_closing_entries_analysis.delay(job_id)
+        analysis_results['closing_entries_analysis'] = closing_entries_result
+        
+        # 7. RUN OVERALL ANALYSIS → Save to OverallAnalysisResult
         debug_task_state(task_name, job_id, "OVERALL_ANALYSIS", "Starting Overall Analysis...")
         overall_result = run_overall_analysis.delay(job_id)
         analysis_results['overall_analysis'] = overall_result
@@ -177,6 +192,9 @@ def run_restructured_analysis(self, job_id):
                 'general_analysis_task_id': str(general_result.id),
                 'duplicate_analysis_task_id': str(duplicate_result.id),
                 'backdated_analysis_task_id': str(backdated_result.id),
+                'user_analysis_task_id': str(user_result.id),
+                'unusual_days_analysis_task_id': str(unusual_days_result.id),
+                'closing_entries_analysis_task_id': str(closing_entries_result.id),
                 'overall_analysis_task_id': str(overall_result.id),
                 'risk_analysis_task_id': str(risk_result.id),
                 'ml_training_task_id': str(ml_training_result.id),
@@ -185,6 +203,9 @@ def run_restructured_analysis(self, job_id):
                 'general_analysis': 'GeneralAnalysisResult',
                 'duplicate_analysis': 'DuplicateAnalysisResult',
                 'backdated_analysis': 'BackdatedAnalysisResult',
+                'user_analysis': 'UserAnalysisResult',
+                'unusual_days_analysis': 'UnusualDaysAnalysisResult',
+                'closing_entries_analysis': 'ClosingEntriesAnalysisResult',
                 'overall_analysis': 'OverallAnalysisResult',
                 'risk_analysis': 'RiskScoringDocument',
                 'ml_training': 'MLModelTraining',
@@ -488,6 +509,171 @@ def run_backdated_analysis(self, job_id):
         return {'error': error_msg}
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
+def run_user_analysis(self, job_id):
+    """
+    Run User Analysis and save results to UserAnalysisResult table
+    
+    Args:
+        job_id (str): UUID of the FileProcessingJob to process
+    """
+    task_name = "run_user_analysis"
+    start_time = timezone.now()
+    
+    debug_task_state(task_name, job_id, "STARTED", f"Task ID: {self.request.id}")
+    
+    try:
+        # Get the processing job and data file
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        # Run User Analysis
+        from .user_analysis import UserAnalyzer
+        user_analyzer = UserAnalyzer()
+        user_results = user_analyzer.run_user_analysis(data_file, job)
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        
+        debug_task_state(task_name, job_id, "COMPLETED", 
+                        f"User Analysis completed and saved to database in {processing_duration:.2f} seconds")
+        
+        return {
+            'analysis_id': str(user_results['analysis_id']),
+            'status': 'COMPLETED',
+            'processing_duration': processing_duration,
+            'table': 'UserAnalysisResult'
+        }
+        
+    except Exception as e:
+        error_msg = f"Error in User Analysis: {str(e)}"
+        debug_task_exception(task_name, job_id, e, "USER_ANALYSIS_ERROR")
+        
+        # Save failed result to database
+        try:
+            from .models import UserAnalysisResult
+            UserAnalysisResult.objects.create(
+                data_file=data_file,
+                processing_job=job,
+                analysis_type='user_analysis',
+                analysis_version='1.0.0',
+                status='FAILED',
+                error_message=error_msg
+            )
+        except:
+            pass
+        
+        return {'error': error_msg}
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
+def run_unusual_days_analysis(self, job_id):
+    """
+    Run Unusual Days Analysis and save results to UnusualDaysAnalysisResult table
+    
+    Args:
+        job_id (str): UUID of the FileProcessingJob to process
+    """
+    task_name = "run_unusual_days_analysis"
+    start_time = timezone.now()
+    
+    debug_task_state(task_name, job_id, "STARTED", f"Task ID: {self.request.id}")
+    
+    try:
+        # Get the processing job and data file
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        # Run Unusual Days Analysis
+        from .unusual_days_analysis import UnusualDaysAnalyzer
+        unusual_days_analyzer = UnusualDaysAnalyzer()
+        unusual_days_results = unusual_days_analyzer.run_unusual_days_analysis(data_file, job)
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        
+        debug_task_state(task_name, job_id, "COMPLETED", 
+                        f"Unusual Days Analysis completed and saved to database in {processing_duration:.2f} seconds")
+        
+        return {
+            'analysis_id': str(unusual_days_results['analysis_id']),
+            'status': 'COMPLETED',
+            'processing_duration': processing_duration,
+            'table': 'UnusualDaysAnalysisResult'
+        }
+        
+    except Exception as e:
+        error_msg = f"Error in Unusual Days Analysis: {str(e)}"
+        debug_task_exception(task_name, job_id, e, "UNUSUAL_DAYS_ANALYSIS_ERROR")
+        
+        # Save failed result to database
+        try:
+            from .models import UnusualDaysAnalysisResult
+            UnusualDaysAnalysisResult.objects.create(
+                data_file=data_file,
+                processing_job=job,
+                analysis_type='unusual_days_analysis',
+                analysis_version='1.0.0',
+                status='FAILED',
+                error_message=error_msg
+            )
+        except:
+            pass
+        
+        return {'error': error_msg}
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
+def run_closing_entries_analysis(self, job_id):
+    """
+    Run Closing Entries Analysis and save results to ClosingEntriesAnalysisResult table
+    
+    Args:
+        job_id (str): UUID of the FileProcessingJob to process
+    """
+    task_name = "run_closing_entries_analysis"
+    start_time = timezone.now()
+    
+    debug_task_state(task_name, job_id, "STARTED", f"Task ID: {self.request.id}")
+    
+    try:
+        # Get the processing job and data file
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        # Run Closing Entries Analysis
+        from .closing_entries_analysis import ClosingEntriesAnalyzer
+        closing_entries_analyzer = ClosingEntriesAnalyzer()
+        closing_entries_results = closing_entries_analyzer.run_closing_entries_analysis(data_file, job)
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        
+        debug_task_state(task_name, job_id, "COMPLETED", 
+                        f"Closing Entries Analysis completed and saved to database in {processing_duration:.2f} seconds")
+        
+        return {
+            'analysis_id': str(closing_entries_results['analysis_id']),
+            'status': 'COMPLETED',
+            'processing_duration': processing_duration,
+            'table': 'ClosingEntriesAnalysisResult'
+        }
+        
+    except Exception as e:
+        error_msg = f"Error in Closing Entries Analysis: {str(e)}"
+        debug_task_exception(task_name, job_id, e, "CLOSING_ENTRIES_ANALYSIS_ERROR")
+        
+        # Save failed result to database
+        try:
+            from .models import ClosingEntriesAnalysisResult
+            ClosingEntriesAnalysisResult.objects.create(
+                data_file=data_file,
+                processing_job=job,
+                analysis_type='closing_entries_analysis',
+                analysis_version='1.0.0',
+                status='FAILED',
+                error_message=error_msg
+            )
+        except:
+            pass
+        
+        return {'error': error_msg}
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
 def run_overall_analysis(self, job_id):
     """
     Run Overall Analysis and save results to OverallAnalysisResult table
@@ -587,11 +773,14 @@ def run_risk_analysis(self, job_id):
         debug_task_data(task_name, job_id, "TRANSACTIONS", f"Found {len(transactions)} transactions")
         
         # Get results from previous analyses
-        from .models import GeneralAnalysisResult, DuplicateAnalysisResult, BackdatedAnalysisResult, OverallAnalysisResult
+        from .models import GeneralAnalysisResult, DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, UnusualDaysAnalysisResult, ClosingEntriesAnalysisResult, OverallAnalysisResult
         
         general_analysis = GeneralAnalysisResult.objects.filter(data_file=data_file).first()
         duplicate_analysis = DuplicateAnalysisResult.objects.filter(data_file=data_file).first()
         backdated_analysis = BackdatedAnalysisResult.objects.filter(data_file=data_file).first()
+        user_analysis = UserAnalysisResult.objects.filter(data_file=data_file).first()
+        unusual_days_analysis = UnusualDaysAnalysisResult.objects.filter(data_file=data_file).first()
+        closing_entries_analysis = ClosingEntriesAnalysisResult.objects.filter(data_file=data_file).first()
         overall_analysis = OverallAnalysisResult.objects.filter(data_file=data_file).first()
         
         # Run Risk Analysis with ML model
@@ -633,6 +822,9 @@ def run_risk_analysis(self, job_id):
             risk_factors={
                 'duplicate_risk': len(duplicate_analysis.duplicate_list) if duplicate_analysis else 0,
                 'backdated_risk': len(backdated_analysis.backdated_entries) if backdated_analysis else 0,
+                'user_risk': len(user_analysis.user_anomalies) if user_analysis else 0,
+                'unusual_days_risk': len(unusual_days_analysis.weekend_postings) if unusual_days_analysis else 0,
+                'closing_entries_risk': len(closing_entries_analysis.closing_entries) if closing_entries_analysis else 0,
                 'high_value_risk': len([t for t in transactions if float(t.amount_local_currency) > 1000000]),
                 'unusual_pattern_risk': len(flagged_transactions)
             },

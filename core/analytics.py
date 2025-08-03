@@ -1126,7 +1126,25 @@ class SAPGLAnalyzer:
         for t in transactions:
             if t.posting_date:
                 # Get last day of the month
-                last_day = monthrange(t.posting_date.year, t.posting_date.month)[1]
+                month_range = monthrange(t.posting_date.year, t.posting_date.month)
+                if isinstance(month_range, tuple) and len(month_range) >= 2:
+                    last_day = month_range[1]
+                else:
+                    # Fallback: calculate last day manually
+                    month = t.posting_date.month
+                    year = t.posting_date.year
+                    if month == 12:
+                        last_day = 31
+                    elif month in [4, 6, 9, 11]:
+                        last_day = 30
+                    elif month == 2:
+                        # Leap year calculation
+                        if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0):
+                            last_day = 29
+                        else:
+                            last_day = 28
+                    else:
+                        last_day = 31
                 month_end = datetime(t.posting_date.year, t.posting_date.month, last_day).date()
             
                 # Check if posting is within closing period

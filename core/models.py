@@ -136,6 +136,13 @@ class SAPGLPosting(models.Model):
     anomaly_types = models.JSONField(default=list, help_text='List of anomaly types detected for this transaction')
     anomaly_analysis_summary = models.JSONField(default=dict, help_text='Summary of all anomaly analyses for this transaction')
     
+    # Holiday analysis tracking
+    is_holiday_posting = models.BooleanField(default=False, help_text='Flagged as holiday posting')
+    holiday_name = models.CharField(max_length=255, blank=True, null=True, help_text='Name of the holiday')
+    holiday_type = models.CharField(max_length=50, blank=True, null=True, help_text='Type of holiday (Public holiday, Observance, etc.)')
+    holiday_risk_score = models.FloatField(default=0.0, help_text='Risk score for holiday detection (0-100)')
+    holiday_analysis_details = models.JSONField(default=dict, help_text='Detailed holiday analysis results')
+    
     # Metadata
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -948,7 +955,305 @@ class UserAnalysisResult(models.Model):
         return 0
 
 
+class UnusualDaysAnalysisResult(models.Model):
+    """Model to store Unusual Days Analysis results for identifying weekend and unusual day postings"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='unusual_days_analyses', help_text='Reference to the data file')
+    
+    # Analysis metadata
+    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
+    analysis_type = models.CharField(max_length=50, default='unusual_days_analysis', help_text='Type of analysis performed')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
+    
+    # Analysis results - stored as JSON for flexibility
+    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total transactions, weekend postings, etc.)')
+    weekend_postings = models.JSONField(default=list, help_text='List of weekend postings (Friday/Saturday)')
+    day_of_week_activity = models.JSONField(default=dict, help_text='Activity patterns by day of week')
+    user_day_patterns = models.JSONField(default=list, help_text='User posting patterns by day of week')
+    fs_line_day_patterns = models.JSONField(default=list, help_text='FS line activity by day of week')
+    unusual_days = models.JSONField(default=list, help_text='List of unusual day patterns detected')
+    risk_assessment = models.JSONField(default=dict, help_text='Risk assessment for unusual days')
+    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='unusual_days_results', help_text='Reference to the processing job that generated this analysis')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Analysis status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'unusual_days_analysis_results'
+        ordering = ['-analysis_date']
+        indexes = [
+            models.Index(fields=['data_file', 'analysis_date']),
+            models.Index(fields=['analysis_type', 'status']),
+            models.Index(fields=['processing_job', 'status']),
+        ]
+    
+    def __str__(self):
+        return f"Unusual Days Analysis for {self.data_file.file_name} - {self.analysis_date}"
+    
+    def get_analysis_summary(self):
+        """Get summary of unusual days analysis results"""
+        return {
+            'total_transactions': self.get_total_transactions(),
+            'weekend_transactions': self.get_weekend_transactions_count(),
+            'unusual_days_detected': self.get_unusual_days_count(),
+            'risk_level': self.get_risk_level(),
+            'processing_duration': self.processing_duration,
+            'analysis_date': self.analysis_date.isoformat()
+        }
+    
+    def get_total_transactions(self):
+        """Get total number of transactions"""
+        return self.analysis_info.get('total_transactions', 0)
+    
+    def get_weekend_transactions_count(self):
+        """Get count of weekend transactions"""
+        return len(self.weekend_postings) if self.weekend_postings else 0
+    
+    def get_unusual_days_count(self):
+        """Get count of unusual days detected"""
+        return len(self.unusual_days) if self.unusual_days else 0
+    
+    def get_risk_level(self):
+        """Get overall risk level"""
+        if not self.risk_assessment:
+            return 'LOW'
+        return self.risk_assessment.get('risk_level', 'LOW')
+    
+    def get_weekend_risk_score(self):
+        """Get weekend risk score"""
+        if not self.risk_assessment:
+            return 0.0
+        return self.risk_assessment.get('weekend_risk_score', 0.0)
+    
+    def get_unusual_pattern_risk_score(self):
+        """Get unusual pattern risk score"""
+        if not self.risk_assessment:
+            return 0.0
+        return self.risk_assessment.get('unusual_pattern_risk_score', 0.0)
+    
+    def get_high_value_weekend_risk_score(self):
+        """Get high value weekend risk score"""
+        if not self.risk_assessment:
+            return 0.0
+        return self.risk_assessment.get('high_value_weekend_risk_score', 0.0)
+    
+    def get_overall_risk_score(self):
+        """Get overall risk score"""
+        if not self.risk_assessment:
+            return 0.0
+        return self.risk_assessment.get('overall_risk_score', 0.0)
+    
+    def get_recommendations(self):
+        """Get risk-based recommendations"""
+        if not self.risk_assessment:
+            return []
+        return self.risk_assessment.get('recommendations', [])
+    
+    def get_weekend_postings_by_day(self):
+        """Get weekend postings grouped by day"""
+        if not self.weekend_postings:
+            return {}
+        
+        by_day = {}
+        for posting in self.weekend_postings:
+            day_name = posting.get('day_name', 'Unknown')
+            if day_name not in by_day:
+                by_day[day_name] = []
+            by_day[day_name].append(posting)
+        
+        return by_day
+    
+    def get_weekend_postings_by_user(self):
+        """Get weekend postings grouped by user"""
+        if not self.weekend_postings:
+            return {}
+        
+        by_user = {}
+        for posting in self.weekend_postings:
+            user_name = posting.get('user_name', 'Unknown')
+            if user_name not in by_user:
+                by_user[user_name] = []
+            by_user[user_name].append(posting)
+        
+        return by_user
+    
+    def get_high_value_weekend_postings(self, threshold=1000000):
+        """Get high value weekend postings"""
+        if not self.weekend_postings:
+            return []
+        
+        return [posting for posting in self.weekend_postings 
+                if posting.get('amount', 0) > threshold]
+    
+    def get_day_of_week_activity_summary(self):
+        """Get summary of day of week activity"""
+        if not self.day_of_week_activity:
+            return {}
+        
+        summary = {}
+        for day_num, day_data in self.day_of_week_activity.items():
+            summary[day_data.get('day_name', f'Day {day_num}')] = {
+                'total_transactions': day_data.get('total_transactions', 0),
+                'total_amount': day_data.get('total_amount', 0),
+                'is_weekend': day_data.get('is_weekend', False)
+            }
+        
+        return summary
 
+class ClosingEntriesAnalysisResult(models.Model):
+    """Model to store Closing Entries Analysis results for identifying month-end closing transactions"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='closing_entries_analyses', help_text='Reference to the data file')
+    
+    # Analysis metadata
+    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
+    analysis_type = models.CharField(max_length=50, default='closing_entries_analysis', help_text='Type of analysis performed')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
+    
+    # Analysis results - stored as JSON for flexibility
+    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total transactions, closing entries, etc.)')
+    closing_entries = models.JSONField(default=list, help_text='List of closing entries detected')
+    post_close_analysis = models.JSONField(default=dict, help_text='Post-close flag analysis')
+    fs_line_closing = models.JSONField(default=dict, help_text='Closing entries by financial statement line')
+    user_closing = models.JSONField(default=dict, help_text='Closing entries by user')
+    month_end_patterns = models.JSONField(default=dict, help_text='Month-end activity patterns')
+    closing_window_analysis = models.JSONField(default=dict, help_text='Analysis of closing windows')
+    risk_assessment = models.JSONField(default=dict, help_text='Risk assessment for closing entries')
+    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='closing_entries_results', help_text='Reference to the processing job that generated this analysis')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Analysis status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'closing_entries_analysis_results'
+        ordering = ['-analysis_date']
+        indexes = [
+            models.Index(fields=['data_file', 'analysis_date']),
+            models.Index(fields=['analysis_type', 'status']),
+            models.Index(fields=['processing_job', 'status']),
+        ]
+    
+    def __str__(self):
+        return f"Closing Entries Analysis for {self.data_file.file_name} - {self.analysis_date}"
+    
+    def get_analysis_summary(self):
+        """Get summary of closing entries analysis results"""
+        return {
+            'total_transactions': self.get_total_transactions(),
+            'closing_entries_count': self.get_closing_entries_count(),
+            'post_close_entries_count': self.get_post_close_entries_count(),
+            'risk_level': self.get_risk_level(),
+            'processing_duration': self.processing_duration,
+            'analysis_date': self.analysis_date.isoformat()
+        }
+    
+    def get_total_transactions(self):
+        """Get total number of transactions"""
+        return self.analysis_info.get('total_transactions', 0)
+    
+    def get_closing_entries_count(self):
+        """Get count of closing entries"""
+        return len(self.closing_entries) if self.closing_entries else 0
+    
+    def get_post_close_entries_count(self):
+        """Get count of post-close entries"""
+        if not self.post_close_analysis:
+            return 0
+        return self.post_close_analysis.get('total_post_close_entries', 0)
+    
+    def get_risk_level(self):
+        """Get overall risk level"""
+        if not self.risk_assessment:
+            return 'LOW'
+        return self.risk_assessment.get('risk_level', 'LOW')
+    
+    def get_closing_entries_risk_score(self):
+        """Get closing entries risk score"""
+        if not self.risk_assessment:
+            return 0.0
+        return self.risk_assessment.get('closing_entries_risk_score', 0.0)
+    
+    def get_post_close_risk_score(self):
+        """Get post-close risk score"""
+        if not self.risk_assessment:
+            return 0.0
+        return self.risk_assessment.get('post_close_risk_score', 0.0)
+    
+    def get_high_value_post_close_risk_score(self):
+        """Get high value post-close risk score"""
+        if not self.risk_assessment:
+            return 0.0
+        return self.risk_assessment.get('high_value_post_close_risk_score', 0.0)
+    
+    def get_overall_risk_score(self):
+        """Get overall risk score"""
+        if not self.risk_assessment:
+            return 0.0
+        return self.risk_assessment.get('overall_risk_score', 0.0)
+    
+    def get_recommendations(self):
+        """Get risk-based recommendations"""
+        if not self.risk_assessment:
+            return []
+        return self.risk_assessment.get('recommendations', [])
+    
+
+    
+    def get_post_close_entries_by_fs_line(self):
+        """Get post-close entries grouped by FS line"""
+        if not self.post_close_analysis:
+            return {}
+        return self.post_close_analysis.get('post_close_by_fs_line', {})
+    
+    def get_post_close_entries_by_user(self):
+        """Get post-close entries grouped by user"""
+        if not self.post_close_analysis:
+            return {}
+        return self.post_close_analysis.get('post_close_by_user', {})
+    
+    def get_high_value_post_close_entries(self):
+        """Get high value post-close entries"""
+        if not self.post_close_analysis:
+            return []
+        return self.post_close_analysis.get('high_value_post_close', [])
 
 class MLModelTraining(models.Model):
     """Model to track ML model training sessions and performance"""
@@ -1499,3 +1804,211 @@ class RiskScoringDocument(models.Model):
             'medium_risk_percentage': (self.medium_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
             'low_risk_percentage': (self.low_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
         }
+
+class HolidayAnalysisResult(models.Model):
+    """Model to store Holiday Analysis results for identifying transactions posted on holidays"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='holiday_analyses', help_text='Reference to the data file')
+    
+    # Analysis metadata
+    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
+    analysis_type = models.CharField(max_length=50, default='holiday_analysis', help_text='Type of analysis performed')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
+    
+    # Analysis results - stored as JSON for flexibility
+    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total transactions, holiday postings, etc.)')
+    holiday_postings = models.JSONField(default=list, help_text='List of transactions posted on holidays')
+    holiday_by_fs_line = models.JSONField(default=list, help_text='Holiday postings grouped by financial statement line')
+    holiday_by_account = models.JSONField(default=list, help_text='Holiday postings grouped by GL account')
+    holiday_by_user = models.JSONField(default=list, help_text='Holiday postings grouped by user')
+    holiday_by_holiday_type = models.JSONField(default=dict, help_text='Holiday postings grouped by holiday type')
+    gl_activity_by_holiday = models.JSONField(default=dict, help_text='GL activity patterns by holiday')
+    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
+    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
+    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
+    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='holiday_results', help_text='Reference to the processing job that generated this analysis')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Analysis status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'holiday_analysis_results'
+        ordering = ['-analysis_date']
+        indexes = [
+            models.Index(fields=['data_file', 'analysis_date']),
+            models.Index(fields=['analysis_type', 'status']),
+            models.Index(fields=['processing_job', 'created_at']),
+        ]
+    
+    def __str__(self):
+        return f"Holiday Analysis for {self.data_file.file_name} - {self.analysis_date}"
+    
+    def get_analysis_summary(self):
+        """Get summary of holiday analysis results"""
+        return {
+            'total_transactions': self.analysis_info.get('total_transactions', 0),
+            'holiday_postings_count': self.analysis_info.get('holiday_postings_count', 0),
+            'holiday_percentage': self.analysis_info.get('holiday_percentage', 0),
+            'unique_holidays': self.analysis_info.get('unique_holidays', 0),
+            'country_code': self.analysis_info.get('country_code', 'saudiarabian'),
+            'fiscal_year': self.analysis_info.get('fiscal_year', ''),
+            'analysis_date': self.analysis_date.isoformat(),
+            'processing_duration': self.processing_duration
+        }
+    
+    def get_total_transactions(self):
+        """Get total transactions analyzed"""
+        return self.analysis_info.get('total_transactions', 0)
+    
+    def get_holiday_postings_count(self):
+        """Get number of holiday postings found"""
+        return self.analysis_info.get('holiday_postings_count', 0)
+    
+    def get_holiday_percentage(self):
+        """Get percentage of transactions posted on holidays"""
+        return self.analysis_info.get('holiday_percentage', 0)
+    
+    def get_unique_holidays(self):
+        """Get number of unique holidays with postings"""
+        return self.analysis_info.get('unique_holidays', 0)
+    
+    def get_risk_level(self):
+        """Get risk level based on holiday postings"""
+        holiday_percentage = self.get_holiday_percentage()
+        if holiday_percentage > 5.0:
+            return 'HIGH'
+        elif holiday_percentage > 2.0:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    
+    def get_holiday_risk_score(self):
+        """Get holiday risk score"""
+        if not self.audit_recommendations:
+            return 0.0
+        return self.audit_recommendations.get('holiday_risk_score', 0.0)
+    
+    def get_high_value_holiday_risk_score(self):
+        """Get high value holiday risk score"""
+        if not self.audit_recommendations:
+            return 0.0
+        return self.audit_recommendations.get('high_value_holiday_risk_score', 0.0)
+    
+    def get_overall_risk_score(self):
+        """Get overall risk score"""
+        if not self.audit_recommendations:
+            return 0.0
+        return self.audit_recommendations.get('overall_risk_score', 0.0)
+    
+    def get_recommendations(self):
+        """Get risk-based recommendations"""
+        if not self.audit_recommendations:
+            return []
+        return self.audit_recommendations.get('recommendations', [])
+    
+    def get_holiday_postings_by_fs_line(self):
+        """Get holiday postings grouped by FS line"""
+        if not self.holiday_by_fs_line:
+            return {}
+        
+        by_fs_line = {}
+        for entry in self.holiday_by_fs_line:
+            fs_line = entry.get('fs_line', 'Unknown')
+            if fs_line not in by_fs_line:
+                by_fs_line[fs_line] = []
+            by_fs_line[fs_line].append(entry)
+        
+        return by_fs_line
+    
+    def get_holiday_postings_by_account(self):
+        """Get holiday postings grouped by account"""
+        if not self.holiday_by_account:
+            return {}
+        
+        by_account = {}
+        for entry in self.holiday_by_account:
+            account = entry.get('account', 'Unknown')
+            if account not in by_account:
+                by_account[account] = []
+            by_account[account].append(entry)
+        
+        return by_account
+    
+    def get_holiday_postings_by_user(self):
+        """Get holiday postings grouped by user"""
+        if not self.holiday_by_user:
+            return {}
+        
+        by_user = {}
+        for entry in self.holiday_by_user:
+            user = entry.get('user', 'Unknown')
+            if user not in by_user:
+                by_user[user] = []
+            by_user[user].append(entry)
+        
+        return by_user
+    
+    def get_high_value_holiday_postings(self, threshold=1000000):
+        """Get high value holiday postings"""
+        if not self.holiday_postings:
+            return []
+        return [p for p in self.holiday_postings if p.get('amount', 0) > threshold]
+    
+    def get_holiday_activity_summary(self):
+        """Get summary of holiday activity patterns"""
+        if not self.gl_activity_by_holiday:
+            return {}
+        
+        summary = {
+            'total_holidays': len(self.gl_activity_by_holiday),
+            'holidays_with_activity': 0,
+            'most_active_holiday': None,
+            'highest_amount_holiday': None,
+            'holiday_activity_breakdown': {}
+        }
+        
+        max_activity = 0
+        max_amount = 0
+        
+        for holiday, data in self.gl_activity_by_holiday.items():
+            activity_count = data.get('total_transactions', 0)
+            total_amount = data.get('total_amount', 0)
+            
+            if activity_count > 0:
+                summary['holidays_with_activity'] += 1
+            
+            if activity_count > max_activity:
+                max_activity = activity_count
+                summary['most_active_holiday'] = holiday
+            
+            if total_amount > max_amount:
+                max_amount = total_amount
+                summary['highest_amount_holiday'] = holiday
+            
+            summary['holiday_activity_breakdown'][holiday] = {
+                'transactions': activity_count,
+                'amount': total_amount,
+                'users': data.get('unique_users', 0),
+                'accounts': data.get('unique_accounts', 0)
+            }
+        
+        return summary

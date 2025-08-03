@@ -76,6 +76,9 @@ class EnhancedDuplicateAnalyzer:
                 'description': 'Identical account number, effective date, posting date, user, source, and amount'
             }
         ]
+        
+        # Initialize backdated analysis settings
+        self._init_backdated_analysis()
     
     def analyze_duplicates(self, transactions):
         """
@@ -96,10 +99,13 @@ class EnhancedDuplicateAnalyzer:
             return self._get_empty_analysis()
         
         # Convert transactions to DataFrame
+        logger.info(f"Preparing DataFrame for {len(transactions)} transactions...")
         df = self._prepare_dataframe(transactions)
         
         # Detect duplicates by type
+        logger.info("Detecting duplicate groups...")
         duplicate_groups = self._detect_duplicate_groups(df)
+        logger.info(f"Found {len(duplicate_groups)} duplicate groups")
         
         # Generate comprehensive analysis
         analysis = {
@@ -193,8 +199,11 @@ class EnhancedDuplicateAnalyzer:
         duplicate_groups = []
         processed_transactions = set()  # Track which transactions have been processed
         
+        logger.info(f"Starting duplicate detection for {len(df)} transactions...")
+        
         # Process duplicate types from most specific (Type 6) to least specific (Type 1)
-        for dup_type in self.duplicate_types:
+        for i, dup_type in enumerate(self.duplicate_types):
+            logger.info(f"Processing {dup_type['type']} ({i+1}/{len(self.duplicate_types)})...")
             groupby_cols = []
             for col in dup_type['groupby_cols']:
                 if col in ['posting_date', 'document_date']:
@@ -240,6 +249,7 @@ class EnhancedDuplicateAnalyzer:
                     }
                     duplicate_groups.append(duplicate_group)
         
+        logger.info(f"Duplicate detection completed. Found {len(duplicate_groups)} duplicate groups.")
         return duplicate_groups
     
     def _generate_duplicate_list(self, duplicate_groups, df):
@@ -1106,7 +1116,8 @@ class EnhancedDuplicateAnalyzer:
     Both date fields are required to be present in the GL data for this test.
     """
     
-    def __init__(self):
+    def _init_backdated_analysis(self):
+        """Initialize backdated analysis settings"""
         self.risk_levels = {
             'critical': {'min_days': 31, 'risk_score': 100.0},
             'high': {'min_days': 15, 'max_days': 30, 'risk_score': 85.0},

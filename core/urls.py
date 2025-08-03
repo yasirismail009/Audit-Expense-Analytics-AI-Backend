@@ -21,13 +21,21 @@ urlpatterns = [
     path('file-analysis-statistics/<uuid:file_id>/', views.FileAnalysisStatisticsView.as_view(), name='file-analysis-statistics'),
     # SAPGLPosting listing endpoint
     path('sapgl-postings/<uuid:file_id>/', views.SAPGLPostingListView.as_view(), name='sapgl-postings-list'),
-    # Filter dropdown data endpoint
+    # Filter dropdown data endpointktL
     path('filter-dropdowns/<uuid:file_id>/', views.FilterDropdownDataView.as_view(), name='filter-dropdowns'),
     # Duplicate analysis endpoint
     path('duplicate-analysis/<uuid:file_id>/', views.DuplicateAnalysisView.as_view(), name='duplicate-analysis'),
 
     # User analysis endpoint
     path('user-analysis/<uuid:file_id>/', views.UserAnalysisView.as_view(), name='user-analysis'),
+    # Unusual days analysis endpoint
+    path('unusual-days-analysis/<uuid:file_id>/', views.UnusualDaysAnalysisView.as_view(), name='unusual-days-analysis'),
+    # Closing entries analysis endpoint
+    path('closing-entries-analysis/<uuid:file_id>/', views.ClosingEntriesAnalysisView.as_view(), name='closing-entries-analysis'),
     # Backdated analysis endpoint
     path('backdated-analysis/<uuid:file_id>/', views.BackdatedAnalysisView.as_view(), name='backdated-analysis'),
+    # Holiday analysis endpoint
+    path('holiday-analysis/<uuid:file_id>/', views.HolidayAnalysisView.as_view(), name='holiday-analysis'),
+    # File GL accounts endpoint
+    path('file-gl-accounts/<uuid:file_id>/', views.FileGLAccountsView.as_view(), name='file-gl-accounts'),
 ] 

@@ -1,0 +1,28 @@
+
+================================================================================
+HOLIDAY ANALYSIS REPORT
+================================================================================
+
+📊 ANALYSIS SUMMARY:
+   Total Transactions Analyzed: 63
+   Holiday Postings Found: 0
+   Holiday Percentage: 0.00%
+   Unique Holidays: 0
+   Country Code: saudiarabian
+   Fiscal Year: 2025
+   Analysis Date: 2025-08-03T06:38:40.320361+00:00
+
+⚠️  RISK ASSESSMENT:
+   Overall Risk Score: 0.00/100
+   Holiday Risk Score: 0.00/100
+   High Value Holiday Risk: 0.00/100
+   Unusual Pattern Risk: 0.00/100
+   Risk Level: LOW
+
+💡 RECOMMENDATIONS:
+   1. LOW: Normal holiday posting activity detected
+   2. Continue monitoring for unusual patterns
+
+================================================================================
+REPORT COMPLETED
+================================================================================

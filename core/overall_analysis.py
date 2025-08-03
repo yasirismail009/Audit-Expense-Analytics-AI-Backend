@@ -234,6 +234,93 @@ class OverallAnalyzer:
         except BackdatedAnalysisResult.DoesNotExist:
             logger.warning(f"No backdated analysis results found for file: {data_file.file_name}")
         
+        # Get user analysis results
+        try:
+            user_results = UserAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).latest('analysis_date')
+            
+            if user_results.user_anomalies:
+                # Add user anomalies to flagged transactions
+                seen_user_anomaly_ids = set()
+                for user_anomaly in user_results.user_anomalies:
+                    anomaly_id = user_anomaly.get('transaction_id')
+                    if anomaly_id not in seen_user_anomaly_ids:
+                        flagged_transactions.append({
+                            'transaction_id': anomaly_id,
+                            'document_number': user_anomaly.get('document_number'),
+                            'gl_account': user_anomaly.get('gl_account'),
+                            'amount': user_anomaly.get('amount', 0),
+                            'user_name': user_anomaly.get('user_name'),
+                            'posting_date': user_anomaly.get('posting_date'),
+                            'flag_type': 'user_anomaly',
+                            'flag_details': f"User anomaly: {user_anomaly.get('anomaly_type', 'Unknown')}",
+                            'risk_score': user_anomaly.get('risk_score', 0),
+                            'source_analysis': 'user_analysis'
+                        })
+                        seen_user_anomaly_ids.add(anomaly_id)
+        except UserAnalysisResult.DoesNotExist:
+            logger.warning(f"No user analysis results found for file: {data_file.file_name}")
+        
+        # Get unusual days analysis results
+        try:
+            unusual_days_results = UnusualDaysAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).latest('analysis_date')
+            
+            if unusual_days_results.weekend_postings:
+                # Add weekend postings to flagged transactions
+                seen_weekend_ids = set()
+                for weekend_posting in unusual_days_results.weekend_postings:
+                    posting_id = weekend_posting.get('transaction_id')
+                    if posting_id not in seen_weekend_ids:
+                        flagged_transactions.append({
+                            'transaction_id': posting_id,
+                            'document_number': weekend_posting.get('document_number'),
+                            'gl_account': weekend_posting.get('gl_account'),
+                            'amount': weekend_posting.get('amount', 0),
+                            'user_name': weekend_posting.get('user_name'),
+                            'posting_date': weekend_posting.get('posting_date'),
+                            'flag_type': 'weekend_posting',
+                            'flag_details': f"Weekend posting: {weekend_posting.get('day_name', 'Unknown')}",
+                            'risk_score': weekend_posting.get('risk_score', 0),
+                            'source_analysis': 'unusual_days_analysis'
+                        })
+                        seen_weekend_ids.add(posting_id)
+        except UnusualDaysAnalysisResult.DoesNotExist:
+            logger.warning(f"No unusual days analysis results found for file: {data_file.file_name}")
+        
+        # Get closing entries analysis results
+        try:
+            closing_entries_results = ClosingEntriesAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).latest('analysis_date')
+            
+            if closing_entries_results.closing_entries:
+                # Add closing entries to flagged transactions
+                seen_closing_ids = set()
+                for closing_entry in closing_entries_results.closing_entries:
+                    entry_id = closing_entry.get('transaction_id')
+                    if entry_id not in seen_closing_ids:
+                        flagged_transactions.append({
+                            'transaction_id': entry_id,
+                            'document_number': closing_entry.get('document_number'),
+                            'gl_account': closing_entry.get('gl_account'),
+                            'amount': closing_entry.get('amount', 0),
+                            'user_name': closing_entry.get('user_name'),
+                            'posting_date': closing_entry.get('posting_date'),
+                            'flag_type': 'closing_entry',
+                            'flag_details': f"Closing entry: {closing_entry.get('closing_window_type', 'Unknown')} - {closing_entry.get('days_from_month_end', 0)} days from month end",
+                            'risk_score': closing_entry.get('risk_score', 0),
+                            'source_analysis': 'closing_entries_analysis'
+                        })
+                        seen_closing_ids.add(entry_id)
+        except ClosingEntriesAnalysisResult.DoesNotExist:
+            logger.warning(f"No closing entries analysis results found for file: {data_file.file_name}")
+        
         # Add fiscal year validation flags
         try:
             # Get all transactions for this file
