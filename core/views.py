@@ -19,11 +19,12 @@ from rest_framework.pagination import PageNumberPagination
 from django.db.models import Q
 from rest_framework.views import APIView
 
-from .models import SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult
+from .models import SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult, HolidayAnalysisResult, GeneralAnalysisResult
 from .serializers import (
     DataFileSerializer, DataFileUploadSerializer, DataUploadResponseSerializer,
     FileProcessingJobSerializer, MLModelTrainingSerializer, TargetedAnomalyUploadSerializer,
-    SAPGLPostingListSerializer
+    SAPGLPostingListSerializer, ClosingEntriesListSerializer, BackdatedEntriesListSerializer,
+    UnusualDaysListSerializer,HolidayListSerializer
 )
 from .tasks import run_restructured_analysis
 
@@ -541,6 +542,145 @@ class CeleryDebugViewSet(viewsets.ViewSet):
                 {'error': str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+    
+    @action(detail=False, methods=['get'])
+    def list_queued_tasks(self, request):
+        """List all queued tasks"""
+        try:
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            queued_tasks = []
+            
+            # Get all queued task keys
+            pattern = "queued_task:*"
+            keys = r.keys(pattern)
+            
+            for key in keys:
+                task_data = r.get(key)
+                if task_data:
+                    task_info = json.loads(task_data)
+                    queued_tasks.append(task_info)
+            
+            return Response({
+                'status': 'success',
+                'queued_tasks': queued_tasks,
+                'count': len(queued_tasks)
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'])
+    def execute_queued_task(self, request):
+        """Execute a specific queued task"""
+        try:
+            job_id = request.data.get('job_id')
+            if not job_id:
+                return Response({
+                    'status': 'error',
+                    'message': 'job_id is required'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            queue_key = f"queued_task:{job_id}"
+            
+            # Get task info from Redis
+            task_data = r.get(queue_key)
+            if not task_data:
+                return Response({
+                    'status': 'error',
+                    'message': f'No queued task found for job_id: {job_id}'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            task_info = json.loads(task_data)
+            
+            # Execute the task
+            from .tasks import run_restructured_analysis
+            result = run_restructured_analysis.delay(job_id)
+            
+            # Remove from queue
+            r.delete(queue_key)
+            
+            # Update job status
+            from .models import FileProcessingJob
+            try:
+                job = FileProcessingJob.objects.get(id=job_id)
+                job.status = 'PROCESSING'
+                job.save()
+            except FileProcessingJob.DoesNotExist:
+                pass
+            
+            return Response({
+                'status': 'success',
+                'message': f'Task executed for job_id: {job_id}',
+                'task_id': result.id
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'])
+    def execute_all_queued_tasks(self, request):
+        """Execute all queued tasks"""
+        try:
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            pattern = "queued_task:*"
+            keys = r.keys(pattern)
+            
+            executed_tasks = []
+            
+            for key in keys:
+                task_data = r.get(key)
+                if task_data:
+                    task_info = json.loads(task_data)
+                    job_id = task_info['job_id']
+                    
+                    # Execute the task
+                    from .tasks import run_restructured_analysis
+                    result = run_restructured_analysis.delay(job_id)
+                    
+                    # Remove from queue
+                    r.delete(key)
+                    
+                    # Update job status
+                    from .models import FileProcessingJob
+                    try:
+                        job = FileProcessingJob.objects.get(id=job_id)
+                        job.status = 'PROCESSING'
+                        job.save()
+                    except FileProcessingJob.DoesNotExist:
+                        pass
+                    
+                    executed_tasks.append({
+                        'job_id': job_id,
+                        'task_id': result.id
+                    })
+            
+            return Response({
+                'status': 'success',
+                'message': f'Executed {len(executed_tasks)} tasks',
+                'executed_tasks': executed_tasks
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # ============================================================================
 # UPLOAD AND PROCESSING VIEWS
@@ -773,14 +913,33 @@ class TargetedAnomalyUploadView(generics.CreateAPIView):
                 file_hash=file_hash,
                 run_anomalies=run_anomalies,
                 requested_anomalies=anomalies or [],
-                status='PENDING'
+                status='QUEUED'  # Changed from 'PENDING' to 'QUEUED' to indicate it's in queue
             )
             
-            # Trigger the analysis task
+            # Add task to queue without executing it
             from .tasks import run_restructured_analysis
-            run_restructured_analysis.delay(str(processing_job.id))
+            # Store task info but don't execute immediately
+            task_info = {
+                'job_id': str(processing_job.id),
+                'task_name': 'run_restructured_analysis',
+                'status': 'QUEUED',
+                'created_at': timezone.now().isoformat()
+            }
             
-            logger.info(f"Created processing job {processing_job.id} for file {data_file.file_name}")
+            # Store task info in Redis for manual execution later
+            import json
+            import redis
+            from django.conf import settings
+            
+            try:
+                r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+                queue_key = f"queued_task:{processing_job.id}"
+                r.setex(queue_key, 86400, json.dumps(task_info))  # Store for 24 hours
+                logger.info(f"Task queued for job {processing_job.id} - ready for manual execution")
+            except Exception as redis_error:
+                logger.warning(f"Could not store task in Redis: {redis_error}")
+            
+            logger.info(f"Created processing job {processing_job.id} for file {data_file.file_name} - task queued for manual execution")
             return processing_job
             
         except Exception as e:
@@ -791,7 +950,23 @@ class TargetedAnomalyUploadView(generics.CreateAPIView):
 
 
 class FileListingAPIView(generics.GenericAPIView):
-    """View for listing all files with processing status"""
+    """View for listing all files with processing status
+    
+    Query Parameters:
+    - status: Filter by file status
+    - engagement_id: Filter by engagement ID
+    - client_name: Filter by client name
+    - company_name: Filter by company name
+    - fiscal_year: Filter by fiscal year
+    - date_from: Filter by upload date from
+    - date_to: Filter by upload date to
+    - celery_status: Filter by celery processing status
+        - 'processed': Files with PROCESSING or COMPLETED status
+        - 'completed': Files with COMPLETED status only
+        - 'processing': Files with PROCESSING status only
+        - 'failed': Files with FAILED or CELERY_ERROR status
+        - 'pending': Files with PENDING or QUEUED status
+    """
     
     def get(self, request):
         try:
@@ -803,6 +978,7 @@ class FileListingAPIView(generics.GenericAPIView):
             fiscal_year = request.query_params.get('fiscal_year', None)
             date_from = request.query_params.get('date_from', None)
             date_to = request.query_params.get('date_to', None)
+            celery_status_filter = request.query_params.get('celery_status', None)
             
             # Start with all files
             files = DataFile.objects.all().order_by('-uploaded_at')
@@ -834,6 +1010,29 @@ class FileListingAPIView(generics.GenericAPIView):
             for file_obj in files:
                 # Get processing job for this file
                 processing_job = FileProcessingJob.objects.filter(data_file=file_obj).first()
+                
+                # Apply celery status filter if specified
+                if celery_status_filter:
+                    if not processing_job:
+                        # If no processing job exists, skip this file
+                        continue
+                    
+                    # Filter by celery status
+                    if celery_status_filter == 'processed':
+                        if processing_job.status not in ['PROCESSING', 'COMPLETED']:
+                            continue
+                    elif celery_status_filter == 'completed':
+                        if processing_job.status != 'COMPLETED':
+                            continue
+                    elif celery_status_filter == 'processing':
+                        if processing_job.status != 'PROCESSING':
+                            continue
+                    elif celery_status_filter == 'failed':
+                        if processing_job.status not in ['FAILED', 'CELERY_ERROR']:
+                            continue
+                    elif celery_status_filter == 'pending':
+                        if processing_job.status not in ['PENDING', 'QUEUED']:
+                            continue
                 
                 file_data = {
                     'id': str(file_obj.id),
@@ -879,6 +1078,12 @@ class FileListingAPIView(generics.GenericAPIView):
             failed_files = len([f for f in file_list if f['file_status'] == 'FAILED'])
             processing_files = len([f for f in file_list if f['processing_status'] in ['PROCESSING', 'QUEUED']])
             
+            # Add celery status statistics
+            celery_completed = len([f for f in file_list if f['processing_status'] == 'COMPLETED'])
+            celery_processing = len([f for f in file_list if f['processing_status'] == 'PROCESSING'])
+            celery_failed = len([f for f in file_list if f['processing_status'] in ['FAILED', 'CELERY_ERROR']])
+            celery_pending = len([f for f in file_list if f['processing_status'] in ['PENDING', 'QUEUED']])
+            
             return Response({
                 'files': file_list,
                 'summary': {
@@ -886,7 +1091,11 @@ class FileListingAPIView(generics.GenericAPIView):
                     'processed_files': processed_files,
                     'pending_files': pending_files,
                     'failed_files': failed_files,
-                    'processing_files': processing_files
+                    'processing_files': processing_files,
+                    'celery_completed': celery_completed,
+                    'celery_processing': celery_processing,
+                    'celery_failed': celery_failed,
+                    'celery_pending': celery_pending
                 },
                 'filters_applied': {
                     'status': status_filter,
@@ -895,7 +1104,8 @@ class FileListingAPIView(generics.GenericAPIView):
                     'company_name': company_name,
                     'fiscal_year': fiscal_year,
                     'date_from': date_from,
-                    'date_to': date_to
+                    'date_to': date_to,
+                    'celery_status': celery_status_filter
                 }
             })
             
@@ -912,15 +1122,18 @@ class FileListingAPIView(generics.GenericAPIView):
 
 class FileAnalysisStatisticsView(generics.GenericAPIView):
     """
-    Critical view for retrieving comprehensive file analysis statistics and chart data
+    Enhanced view for retrieving comprehensive file analysis statistics and chart data
     
-    OPTIMIZATION: For large datasets (>5000 records), this view uses original analysis data
-    without enhancement to prevent memory issues and broken pipe errors.
+    This view provides:
+    - Overall analysis statistics from the new data structure
+    - Risk analysis data and distributions
+    - Chart data for visualizations
+    - No listing functionality - only statistics and chart data
     """
     
     def get(self, request, file_id):
         """
-        Get comprehensive overall and risk analysis statistics and chart data for a specific file
+        Get comprehensive overall analysis statistics and chart data for a specific file
         
         Args:
             file_id (str): UUID of the DataFile to get analysis for
@@ -929,7 +1142,7 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
             JSON response with comprehensive statistics and chart data
         """
         try:
-            # Validate file exists with enhanced error handling
+            # Validate file exists
             try:
                 data_file = DataFile.objects.select_related().get(id=file_id)
             except DataFile.DoesNotExist:
@@ -952,60 +1165,56 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
             
-            # Get the latest overall analysis result for this file with enhanced validation
+            # Get the latest overall analysis result for this file
             overall_analysis = OverallAnalysisResult.objects.filter(
                 data_file=data_file,
                 status='COMPLETED'
             ).order_by('-analysis_date').first()
             
-            if not overall_analysis:
-                logger.warning(f"No completed overall analysis found for file {file_id}")
-            
-            # Get the latest risk scoring document for this file with enhanced validation
+            # Get the latest risk scoring document for this file
             risk_document = RiskScoringDocument.objects.filter(
                 data_file=data_file,
                 status='COMPLETED'
             ).order_by('-document_date').first()
             
-            if not risk_document:
-                logger.warning(f"No completed risk analysis found for file {file_id}")
+            # Get the latest general analysis result for this file
+            general_analysis = GeneralAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
             
-            # Get the latest user analysis result for this file with enhanced validation
+            # Get all specific analysis results
+            duplicate_analysis = DuplicateAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            backdated_analysis = BackdatedAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
             user_analysis = UserAnalysisResult.objects.filter(
                 data_file=data_file,
                 status='COMPLETED'
             ).order_by('-analysis_date').first()
             
-            if not user_analysis:
-                logger.warning(f"No completed user analysis found for file {file_id}")
-            
-            # Get the latest closing entries analysis result for this file with enhanced validation
-            closing_entries_analysis = ClosingEntriesAnalysisResult.objects.filter(
-                data_file=data_file,
-                status='COMPLETED'
-            ).order_by('-analysis_date').first()
-            
-            if not closing_entries_analysis:
-                logger.warning(f"No completed closing entries analysis found for file {file_id}")
-            else:
-                logger.info(f"Found closing entries analysis for file {file_id}: {closing_entries_analysis.id}")
-            
-            # Get the latest unusual days analysis result for this file with enhanced validation
             unusual_days_analysis = UnusualDaysAnalysisResult.objects.filter(
                 data_file=data_file,
                 status='COMPLETED'
             ).order_by('-analysis_date').first()
             
-            if not unusual_days_analysis:
-                logger.warning(f"No completed unusual days analysis found for file {file_id}")
-            else:
-                logger.info(f"Found unusual days analysis for file {file_id}: {unusual_days_analysis.id}")
+            closing_entries_analysis = ClosingEntriesAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
             
-            # Validate file processing status
-            if data_file.status != 'COMPLETED':
-                logger.warning(f"File {file_id} is not in COMPLETED status. Current status: {data_file.status}")
+            holiday_analysis = HolidayAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
             
-            # Prepare response data with enhanced structure and validation
+            # Prepare response data structure
             response_data = {
                 'file_info': {
                     'file_id': str(data_file.id),
@@ -1022,2141 +1231,319 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'file_status': data_file.status,
                     'processing_success_rate': (data_file.processed_records / data_file.total_records * 100) if data_file.total_records > 0 else 0
                 },
-                'overall_analysis': {},
-                'risk_analysis': {},
-                'user_analysis': {},
-                'closing_entries_analysis': {},
-                'unusual_days_analysis': {},
-                'chart_data': {},
                 'analysis_metadata': {
                     'has_overall_analysis': bool(overall_analysis),
                     'has_risk_analysis': bool(risk_document),
+                    'has_general_analysis': bool(general_analysis),
+                    'has_duplicate_analysis': bool(duplicate_analysis),
+                    'has_backdated_analysis': bool(backdated_analysis),
                     'has_user_analysis': bool(user_analysis),
-                    'has_closing_entries_analysis': bool(closing_entries_analysis),
                     'has_unusual_days_analysis': bool(unusual_days_analysis),
+                    'has_closing_entries_analysis': bool(closing_entries_analysis),
+                    'has_holiday_analysis': bool(holiday_analysis),
                     'analysis_timestamp': timezone.now().isoformat(),
-                    'analysis_version': '2.1.0'
-                }
+                    'analysis_version': '3.0.0'
+                },
+                'overall_statistics': {},
+                'risk_statistics': {},
+                'general_statistics': {},
+                'anomaly_statistics': {},
+                'chart_data': {},
+                'summary_dashboard': {}
             }
             
-            # Overall Analysis Statistics with enhanced error handling
+            # Overall Analysis Statistics
             if overall_analysis:
-                try:
-                    # OPTIMIZATION: Use cached transaction data to avoid multiple queries
-                    # For large datasets, use aggregation queries instead of loading all data
-                    transaction_count = SAPGLPosting.objects.filter(data_file=data_file).count()
-                    
-                    # Only load transaction data if dataset is manageable (< 5000 records)
-                    if transaction_count < 5000:
-                        transactions = SAPGLPosting.objects.filter(data_file=data_file).select_related()
-                        enhanced_transaction_summary = self._enhance_transaction_summary(
-                            overall_analysis.transaction_summary, transactions
-                        )
-                        enhanced_flag_summary = self._enhance_flag_summary(
-                            overall_analysis.flag_summary, transactions
-                        )
-                    else:
-                        # For large datasets, use original data without enhancement to avoid memory issues
-                        logger.warning(f"Large dataset detected ({transaction_count} records). Using original analysis data without enhancement.")
-                        enhanced_transaction_summary = overall_analysis.transaction_summary or {}
-                        enhanced_flag_summary = overall_analysis.flag_summary or {}
-                    
-                    # Add debugging information for overall analysis
-                    debug_message = f'Overall analysis: {enhanced_flag_summary.get("backdated_anomalies", 0)} backdated, {enhanced_flag_summary.get("duplicate_anomalies", 0)} duplicates, {enhanced_flag_summary.get("high_value_anomalies", 0)} high value'
-                    
-                    # Add closing entries information to debug message
-                    if closing_entries_analysis:
-                        closing_entries_count = closing_entries_analysis.get_closing_entries_count()
-                        post_close_entries_count = closing_entries_analysis.get_post_close_entries_count()
-                        debug_message += f', {closing_entries_count} closing entries, {post_close_entries_count} post-close entries'
-                    
-                    # Add unusual days information to debug message
-                    if unusual_days_analysis:
-                        weekend_transactions_count = unusual_days_analysis.get_weekend_transactions_count()
-                        unusual_days_count = unusual_days_analysis.get_unusual_days_count()
-                        debug_message += f', {weekend_transactions_count} weekend transactions, {unusual_days_count} unusual day patterns'
-                    
-                    enhanced_flag_summary['debug_info'] = {
-                        'backdated_anomalies_count': enhanced_flag_summary.get('backdated_anomalies', 0),
-                        'duplicate_anomalies_count': enhanced_flag_summary.get('duplicate_anomalies', 0),
-                        'high_value_anomalies_count': enhanced_flag_summary.get('high_value_anomalies', 0),
-                        'total_anomalies': enhanced_flag_summary.get('total_anomalies', 0),
-                        'closing_entries_count': closing_entries_analysis.get_closing_entries_count() if closing_entries_analysis else 0,
-                        'post_close_entries_count': closing_entries_analysis.get_post_close_entries_count() if closing_entries_analysis else 0,
-                        'weekend_transactions_count': unusual_days_analysis.get_weekend_transactions_count() if unusual_days_analysis else 0,
-                        'unusual_days_count': unusual_days_analysis.get_unusual_days_count() if unusual_days_analysis else 0,
-                        'debug_message': debug_message,
-                        'clarification': 'Overall analysis now includes closing entries analysis (month-end patterns) and unusual days analysis (temporal patterns) in addition to transaction-based anomalies'
-                    }
-                
-                    # Enhanced risk assessment with real data and validation
-                    enhanced_risk_assessment = self._enhance_risk_assessment(
-                        overall_analysis.risk_assessment, transactions
-                    )
-                
-                    # Chart data removed from overall analysis to prevent duplication
-                    enhanced_chart_data = {}
-                    
-                    # Add critical alerts and warnings
-                    critical_alerts = self._generate_critical_alerts(enhanced_transaction_summary, enhanced_flag_summary, enhanced_risk_assessment)
-                    
-                    # Add closing entries analysis to overall analysis if available
-                    closing_entries_summary = {}
-                    if closing_entries_analysis:
-                        closing_entries_summary = {
-                            'total_closing_entries': closing_entries_analysis.get_closing_entries_count(),
-                            'post_close_entries': closing_entries_analysis.get_post_close_entries_count(),
-                            'total_transactions': closing_entries_analysis.get_total_transactions(),
-                            'closing_entries_percentage': (closing_entries_analysis.get_closing_entries_count() / closing_entries_analysis.get_total_transactions() * 100) if closing_entries_analysis.get_total_transactions() > 0 else 0,
-                            'post_close_percentage': (closing_entries_analysis.get_post_close_entries_count() / closing_entries_analysis.get_total_transactions() * 100) if closing_entries_analysis.get_total_transactions() > 0 else 0,
-                            'closing_entries_risk_score': closing_entries_analysis.get_closing_entries_risk_score(),
-                            'post_close_risk_score': closing_entries_analysis.get_post_close_risk_score(),
-                            'overall_risk_score': closing_entries_analysis.get_overall_risk_score(),
-                            'risk_level': closing_entries_analysis.get_risk_level(),
-                            'recommendations': closing_entries_analysis.get_recommendations()
-                        }
-                    
-                    # Add unusual days analysis to overall analysis if available
-                    unusual_days_summary = {}
-                    if unusual_days_analysis:
-                        unusual_days_summary = {
-                            'total_weekend_transactions': unusual_days_analysis.get_weekend_transactions_count(),
-                            'unusual_days_count': unusual_days_analysis.get_unusual_days_count(),
-                            'total_transactions': unusual_days_analysis.get_total_transactions(),
-                            'weekend_percentage': (unusual_days_analysis.get_weekend_transactions_count() / unusual_days_analysis.get_total_transactions() * 100) if unusual_days_analysis.get_total_transactions() > 0 else 0,
-                            'unusual_days_percentage': (unusual_days_analysis.get_unusual_days_count() / unusual_days_analysis.get_total_transactions() * 100) if unusual_days_analysis.get_total_transactions() > 0 else 0,
-                            'weekend_risk_score': unusual_days_analysis.get_weekend_risk_score(),
-                            'unusual_pattern_risk_score': unusual_days_analysis.get_unusual_pattern_risk_score(),
-                            'overall_risk_score': unusual_days_analysis.get_overall_risk_score(),
-                            'risk_level': unusual_days_analysis.get_risk_level(),
-                            'recommendations': unusual_days_analysis.get_recommendations()
-                        }
-                    
-                except Exception as e:
-                    logger.error(f"Error enhancing overall analysis for file {file_id}: {e}")
-                    enhanced_transaction_summary = overall_analysis.transaction_summary or {}
-                    enhanced_flag_summary = overall_analysis.flag_summary or {}
-                    enhanced_risk_assessment = overall_analysis.risk_assessment or {}
-                    enhanced_chart_data = overall_analysis.chart_data or {}
-                    critical_alerts = [{'type': 'ERROR', 'message': f'Error enhancing analysis: {str(e)}'}]
-                    closing_entries_summary = {}
-                    unusual_days_summary = {}
-                
-                response_data['overall_analysis'] = {
+                response_data['overall_statistics'] = {
                     'analysis_id': str(overall_analysis.id),
-                    'analysis_date': overall_analysis.analysis_date,
+                    'analysis_date': overall_analysis.analysis_date.isoformat(),
                     'processing_duration': overall_analysis.processing_duration,
-                    'status': overall_analysis.status,
-                    
-                    # Enhanced Transaction Summary Statistics
-                    'transaction_summary': enhanced_transaction_summary,
-                    
-                    # Enhanced Flag Summary Statistics
-                    'flag_summary': enhanced_flag_summary,
-                    
-                    # Expense Analysis Statistics
-                    'expense_analysis': overall_analysis.expense_analysis,
-                    
-                    # Enhanced Risk Assessment Statistics
-                    'risk_assessment': enhanced_risk_assessment,
-                    
-                    # Closing Entries Analysis Summary (if available)
-                    'closing_entries_summary': closing_entries_summary,
-                    
-                    # Unusual Days Analysis Summary (if available)
-                    'unusual_days_summary': unusual_days_summary,
-                    
-                    # Enhanced Chart Data (only for overall analysis)
-                    'chart_data': enhanced_chart_data,
-                    
-                    # Critical Alerts and Warnings
-                    'critical_alerts': critical_alerts
-                }
-            else:
-                response_data['overall_analysis'] = {
-                    'error': 'No overall analysis results found for this file',
-                    'status': 'NOT_AVAILABLE'
+                    'transaction_summary': overall_analysis.transaction_summary or {},
+                    'flag_summary': overall_analysis.flag_summary or {},
+                    'expense_analysis': overall_analysis.expense_analysis or {},
+                    'risk_assessment': overall_analysis.risk_assessment or {},
+                    'flagged_transactions_count': len(overall_analysis.flagged_transactions) if overall_analysis.flagged_transactions else 0
                 }
             
-            # Risk Analysis Statistics with enhanced error handling
+            # Risk Analysis Statistics
             if risk_document:
-                try:
-                    # OPTIMIZATION: Use transaction count to determine processing strategy
-                    transaction_count = SAPGLPosting.objects.filter(data_file=data_file).count()
-                    
-                    # Only enhance risk analysis for manageable datasets
-                    if transaction_count < 5000:
-                        transactions = SAPGLPosting.objects.filter(data_file=data_file).select_related()
-                        enhanced_risk_analysis = self._enhance_risk_analysis(risk_document, transactions)
-                    else:
-                        # For large datasets, use original risk analysis data
-                        logger.warning(f"Large dataset detected ({transaction_count} records). Using original risk analysis data without enhancement.")
-                        enhanced_risk_analysis = {
-                            'document_id': str(risk_document.id),
-                            'document_date': risk_document.document_date,
-                            'document_version': risk_document.document_version,
-                            'processing_duration': risk_document.processing_duration,
-                            'status': risk_document.status,
-                            'methodology_overview': risk_document.methodology_overview,
-                            'risk_factors': risk_document.risk_factors,
-                            'scoring_criteria': risk_document.scoring_criteria,
-                            'risk_calculations': risk_document.risk_calculations,
-                            'risk_distributions': risk_document.risk_distributions,
-                            'recommendations': risk_document.recommendations,
-                            'audit_implications': risk_document.audit_implications,
-                            'total_transactions': risk_document.total_transactions,
-                            'overall_risk_score': risk_document.overall_risk_score,
-                            'high_risk_transactions': risk_document.high_risk_transactions,
-                            'medium_risk_transactions': risk_document.medium_risk_transactions,
-                            'low_risk_transactions': risk_document.low_risk_transactions,
-                            'critical_risk_transactions': risk_document.critical_risk_transactions,
-                            'large_dataset_warning': True
-                        }
-                    logger.info(f"Enhanced risk analysis type after assignment: {type(enhanced_risk_analysis)}")
-                    logger.info(f"Enhanced risk analysis value after assignment: {enhanced_risk_analysis}")
-                    
-                    # Add debugging information for transaction-based anomalies
-                    # Use transaction count from risk document for large datasets
-                    if transaction_count < 5000:
-                        backdated_count = transactions.filter(is_backdated=True).count()
-                        duplicate_count = transactions.filter(is_duplicate=True).count()
-                        high_value_count = len([t for t in transactions if t.is_high_value])
-                        total_transactions = transactions.count()
-                    else:
-                        # For large datasets, use data from risk document
-                        backdated_count = enhanced_risk_analysis.get('medium_risk_transactions', 0)
-                        duplicate_count = enhanced_risk_analysis.get('high_risk_transactions', 0)
-                        high_value_count = 0  # Not available in large dataset mode
-                        total_transactions = enhanced_risk_analysis.get('total_transactions', 0)
-                    
-                    debug_info = {
-                        'backdated_anomalies_count': backdated_count,
-                        'duplicate_anomalies_count': duplicate_count,
-                        'high_value_anomalies_count': high_value_count,
-                        'total_transactions': total_transactions,
-                        'backdated_percentage': (backdated_count / total_transactions * 100) if total_transactions > 0 else 0,
-                        'debug_message': f'Found {backdated_count} backdated anomalies out of {total_transactions} total transactions',
-                        'clarification': 'Risk analysis is a comprehensive analysis that includes transaction-based and user-based anomalies'
-                    }
-                    
-                    # Add user anomalies information if available
-                    if user_analysis:
-                        user_anomalies_count = len(user_analysis.user_anomalies or [])
-                        high_risk_users_count = user_analysis.get_high_risk_users_count()
-                        total_users_count = user_analysis.get_total_users()
-                        
-                        debug_info.update({
-                            'user_anomalies_count': user_anomalies_count,
-                            'high_risk_users_count': high_risk_users_count,
-                            'total_users_count': total_users_count,
-                            'user_anomaly_percentage': (user_anomalies_count / total_users_count * 100) if total_users_count > 0 else 0,
-                            'debug_message': f'{debug_info["debug_message"]}, {user_anomalies_count} user anomalies out of {total_users_count} users',
-                            'clarification': 'Risk analysis includes both transaction-based anomalies (duplicates, backdated, high-value) and user-based anomalies (behavior patterns, risk factors)'
-                        })
-                        
-                        # Add user anomalies to risk analysis
-                        logger.info(f"Enhanced risk analysis type before user_anomalies: {type(enhanced_risk_analysis)}")
-                        logger.info("Creating user_anomalies dictionary...")
-                        user_anomaly_type_summary = self._get_user_anomaly_type_summary(user_analysis.user_anomalies or [])
-                        logger.info(f"User anomaly type summary: {user_anomaly_type_summary}")
-                        user_anomaly_severity_distribution = self._get_user_anomaly_severity_distribution(user_analysis.user_anomalies or [])
-                        logger.info(f"User anomaly severity distribution: {user_anomaly_severity_distribution}")
-                        user_risk_distribution = self._get_user_risk_distribution(user_analysis.user_risk_assessment)
-                        logger.info(f"User risk distribution: {user_risk_distribution}")
-                        
-                        enhanced_risk_analysis['user_anomalies'] = {
-                            'total_user_anomalies': user_anomalies_count,
-                            'high_risk_users_count': high_risk_users_count,
-                            'total_users_count': total_users_count,
-                            'user_anomaly_percentage': (user_anomalies_count / total_users_count * 100) if total_users_count > 0 else 0,
-                            'user_anomaly_types_count': len(user_anomaly_type_summary),
-                            'user_anomaly_severity_distribution': user_anomaly_severity_distribution,
-                            'user_risk_distribution': user_risk_distribution
-                        }
-                        
-                        # Update user behavior risk factor in risk_factors
-                        if 'risk_factors' in enhanced_risk_analysis:
-                            enhanced_risk_analysis['risk_factors']['user_behavior_risk'] = {
-                                'count': user_anomalies_count,
-                                'percentage': (user_anomalies_count / total_users_count * 100) if total_users_count > 0 else 0,
-                                'description': 'Risk associated with user behavior patterns and anomalies',
-                                'high_risk_users_count': high_risk_users_count,
-                                'high_risk_users_percentage': (high_risk_users_count / total_users_count * 100) if total_users_count > 0 else 0
-                            }
-                    
-                    # Add closing entries analysis information if available
-                    if closing_entries_analysis:
-                        closing_entries_count = closing_entries_analysis.get_closing_entries_count()
-                        post_close_entries_count = closing_entries_analysis.get_post_close_entries_count()
-                        total_transactions = closing_entries_analysis.get_total_transactions()
-                        closing_entries_risk_score = closing_entries_analysis.get_closing_entries_risk_score()
-                        post_close_risk_score = closing_entries_analysis.get_post_close_risk_score()
-                        
-                        debug_info.update({
-                            'closing_entries_count': closing_entries_count,
-                            'post_close_entries_count': post_close_entries_count,
-                            'closing_entries_percentage': (closing_entries_count / total_transactions * 100) if total_transactions > 0 else 0,
-                            'post_close_percentage': (post_close_entries_count / total_transactions * 100) if total_transactions > 0 else 0,
-                            'closing_entries_risk_score': closing_entries_risk_score,
-                            'post_close_risk_score': post_close_risk_score,
-                            'debug_message': f'{debug_info["debug_message"]}, {closing_entries_count} closing entries ({closing_entries_risk_score:.1f} risk score), {post_close_entries_count} post-close entries ({post_close_risk_score:.1f} risk score)',
-                            'clarification': 'Risk analysis now includes closing entries analysis (month-end closing patterns) and unusual days analysis (temporal patterns)'
-                        })
-                        
-                        # Add closing entries analysis to risk analysis
-                        enhanced_risk_analysis['closing_entries_analysis'] = {
-                            'total_closing_entries': closing_entries_count,
-                            'post_close_entries_count': post_close_entries_count,
-                            'total_transactions': total_transactions,
-                            'closing_entries_percentage': (closing_entries_count / total_transactions * 100) if total_transactions > 0 else 0,
-                            'post_close_percentage': (post_close_entries_count / total_transactions * 100) if total_transactions > 0 else 0,
-                            'closing_entries_risk_score': closing_entries_risk_score,
-                            'post_close_risk_score': post_close_risk_score,
-                            'risk_level': closing_entries_analysis.get_risk_level(),
-                            'recommendations': closing_entries_analysis.get_recommendations(),
-                            'post_close_entries_by_fs_line': closing_entries_analysis.get_post_close_entries_by_fs_line(),
-                            'post_close_entries_by_user': closing_entries_analysis.get_post_close_entries_by_user(),
-                            'high_value_post_close_entries': closing_entries_analysis.get_high_value_post_close_entries()
-                        }
-                        
-                        # Update closing entries risk factor in risk_factors
-                        if 'risk_factors' in enhanced_risk_analysis:
-                            enhanced_risk_analysis['risk_factors']['closing_entries_risk'] = {
-                                'count': closing_entries_count,
-                                'percentage': (closing_entries_count / total_transactions * 100) if total_transactions > 0 else 0,
-                                'description': 'Risk associated with month-end closing entries and post-close activities',
-                                'risk_score': closing_entries_risk_score,
-                                'post_close_count': post_close_entries_count,
-                                'post_close_percentage': (post_close_entries_count / total_transactions * 100) if total_transactions > 0 else 0,
-                                'post_close_risk_score': post_close_risk_score
-                            }
-                    
-                    # Add unusual days analysis information if available
-                    if unusual_days_analysis:
-                        weekend_transactions_count = unusual_days_analysis.get_weekend_transactions_count()
-                        unusual_days_count = unusual_days_analysis.get_unusual_days_count()
-                        total_transactions = unusual_days_analysis.get_total_transactions()
-                        weekend_risk_score = unusual_days_analysis.get_weekend_risk_score()
-                        unusual_pattern_risk_score = unusual_days_analysis.get_unusual_pattern_risk_score()
-                        
-                        debug_info.update({
-                            'weekend_transactions_count': weekend_transactions_count,
-                            'unusual_days_count': unusual_days_count,
-                            'weekend_percentage': (weekend_transactions_count / total_transactions * 100) if total_transactions > 0 else 0,
-                            'unusual_days_percentage': (unusual_days_count / total_transactions * 100) if total_transactions > 0 else 0,
-                            'weekend_risk_score': weekend_risk_score,
-                            'unusual_pattern_risk_score': unusual_pattern_risk_score,
-                            'debug_message': f'{debug_info["debug_message"]}, {weekend_transactions_count} weekend transactions ({weekend_risk_score:.1f} risk score), {unusual_days_count} unusual day patterns ({unusual_pattern_risk_score:.1f} risk score)',
-                            'clarification': 'Risk analysis now includes closing entries analysis (month-end closing patterns) and unusual days analysis (temporal patterns)'
-                        })
-                        
-                        # Add unusual days analysis to risk analysis
-                        enhanced_risk_analysis['unusual_days_analysis'] = {
-                            'total_weekend_transactions': weekend_transactions_count,
-                            'unusual_days_count': unusual_days_count,
-                            'total_transactions': total_transactions,
-                            'weekend_percentage': (weekend_transactions_count / total_transactions * 100) if total_transactions > 0 else 0,
-                            'unusual_days_percentage': (unusual_days_count / total_transactions * 100) if total_transactions > 0 else 0,
-                            'weekend_risk_score': weekend_risk_score,
-                            'unusual_pattern_risk_score': unusual_pattern_risk_score,
-                            'risk_level': unusual_days_analysis.get_risk_level(),
-                            'recommendations': unusual_days_analysis.get_recommendations(),
-                            'weekend_postings_by_day': unusual_days_analysis.get_weekend_postings_by_day(),
-                            'weekend_postings_by_user': unusual_days_analysis.get_weekend_postings_by_user(),
-                            'high_value_weekend_postings': unusual_days_analysis.get_high_value_weekend_postings(),
-                            'day_of_week_activity_summary': unusual_days_analysis.get_day_of_week_activity_summary()
-                        }
-                        
-                        # Update unusual days risk factor in risk_factors
-                        logger.info(f"Enhanced risk analysis type before risk_factors check: {type(enhanced_risk_analysis)}")
-                        logger.info(f"Enhanced risk analysis value before risk_factors check: {enhanced_risk_analysis}")
-                        if 'risk_factors' in enhanced_risk_analysis:
-                            enhanced_risk_analysis['risk_factors']['unusual_days_risk'] = {
-                                'count': weekend_transactions_count,
-                                'percentage': (weekend_transactions_count / total_transactions * 100) if total_transactions > 0 else 0,
-                                'description': 'Risk associated with weekend postings and unusual temporal patterns',
-                                'risk_score': weekend_risk_score,
-                                'unusual_days_count': unusual_days_count,
-                                'unusual_days_percentage': (unusual_days_count / total_transactions * 100) if total_transactions > 0 else 0,
-                                'unusual_pattern_risk_score': unusual_pattern_risk_score
-                            }
-                    
-                    logger.info(f"Enhanced risk analysis type before debug_info: {type(enhanced_risk_analysis)}")
-                    logger.info(f"Enhanced risk analysis keys before debug_info: {list(enhanced_risk_analysis.keys()) if isinstance(enhanced_risk_analysis, dict) else 'Not a dict'}")
-                    enhanced_risk_analysis['debug_info'] = debug_info
-                    logger.info(f"Enhanced risk analysis type after debug_info: {type(enhanced_risk_analysis)}")
-                
-                    response_data['risk_analysis'] = enhanced_risk_analysis
-                except Exception as e:
-                    logger.error(f"Error enhancing risk analysis for file {file_id}: {e}")
-                    response_data['risk_analysis'] = {
-                        'error': f'Error enhancing risk analysis: {str(e)}',
-                        'status': 'ERROR',
-                        'original_data': {
-                            'document_id': str(risk_document.id),
-                            'document_date': risk_document.document_date,
-                            'status': risk_document.status
-                        }
-                    }
-            else:
-                response_data['risk_analysis'] = {
-                    'error': 'No risk analysis document found for this file',
-                    'status': 'NOT_AVAILABLE',
-                    'suggestions': ['Run risk analysis for this file', 'Check if risk analysis processing completed successfully']
+                response_data['risk_statistics'] = {
+                    'document_id': str(risk_document.id),
+                    'document_date': risk_document.document_date.isoformat(),
+                    'total_transactions': risk_document.total_transactions,
+                    'high_risk_transactions': risk_document.high_risk_transactions,
+                    'medium_risk_transactions': risk_document.medium_risk_transactions,
+                    'low_risk_transactions': risk_document.low_risk_transactions,
+                    'critical_risk_transactions': risk_document.critical_risk_transactions,
+                    'overall_risk_score': risk_document.overall_risk_score,
+                    'risk_distributions': risk_document.risk_distributions or {},
+                    'methodology_overview': risk_document.methodology_overview or {},
+                    'recommendations': risk_document.recommendations or {},
+                    'audit_implications': risk_document.audit_implications or {}
                 }
             
-            # User Analysis Statistics with enhanced error handling
+            # General Analysis Statistics
+            if general_analysis:
+                response_data['general_statistics'] = {
+                    'analysis_id': str(general_analysis.id),
+                    'analysis_date': general_analysis.analysis_date.isoformat(),
+                    'trial_balance_summary': general_analysis.trial_balance_summary or {},
+                    'gl_account_summaries_count': len(general_analysis.gl_account_summaries) if general_analysis.gl_account_summaries else 0,
+                    'user_summaries_count': len(general_analysis.user_summaries) if general_analysis.user_summaries else 0,
+                    'statistical_calculations': general_analysis.statistical_calculations or {}
+                }
+            
+            # Anomaly Statistics - Combine all anomaly types
+            anomaly_stats = {
+                'duplicate_analysis': {},
+                'backdated_analysis': {},
+                'user_analysis': {},
+                'unusual_days_analysis': {},
+                'closing_entries_analysis': {},
+                'holiday_analysis': {},
+                'total_anomalies': 0,
+                'anomaly_types_detected': []
+            }
+            
+            # Duplicate Analysis
+            if duplicate_analysis:
+                try:
+                    duplicate_count = duplicate_analysis.get_duplicate_count()
+                    total_amount = duplicate_analysis.get_total_amount()
+                    risk_distribution = duplicate_analysis.get_risk_distribution()
+                except Exception as e:
+                    logger.warning(f"Error getting duplicate analysis data: {e}")
+                    duplicate_count = 0
+                    total_amount = 0
+                    risk_distribution = {}
+                
+                anomaly_stats['duplicate_analysis'] = {
+                    'analysis_id': str(duplicate_analysis.id),
+                    'analysis_date': duplicate_analysis.analysis_date.isoformat(),
+                    'duplicate_count': duplicate_count,
+                    'total_amount': total_amount,
+                    'risk_distribution': risk_distribution,
+                    'analysis_info': duplicate_analysis.analysis_info or {}
+                }
+                anomaly_stats['total_anomalies'] += duplicate_count
+                anomaly_stats['anomaly_types_detected'].append('duplicate')
+            
+            # Backdated Analysis
+            if backdated_analysis:
+                try:
+                    backdated_count = backdated_analysis.get_backdated_count()
+                    total_amount = backdated_analysis.get_total_amount()
+                    risk_distribution = backdated_analysis.get_risk_distribution()
+                except Exception as e:
+                    logger.warning(f"Error getting backdated analysis data: {e}")
+                    backdated_count = 0
+                    total_amount = 0
+                    risk_distribution = {}
+                
+                anomaly_stats['backdated_analysis'] = {
+                    'analysis_id': str(backdated_analysis.id),
+                    'analysis_date': backdated_analysis.analysis_date.isoformat(),
+                    'backdated_count': backdated_count,
+                    'total_amount': total_amount,
+                    'risk_distribution': risk_distribution,
+                    'analysis_info': backdated_analysis.analysis_info or {}
+                }
+                anomaly_stats['total_anomalies'] += backdated_count
+                anomaly_stats['anomaly_types_detected'].append('backdated')
+            
+            # User Analysis
             if user_analysis:
                 try:
-                    # OPTIMIZATION: Check dataset size before processing
-                    transaction_count = SAPGLPosting.objects.filter(data_file=data_file).count()
-                    
-                    # Only enhance user analysis for manageable datasets
-                    if transaction_count < 5000:
-                        transactions = SAPGLPosting.objects.filter(data_file=data_file).select_related()
-                        enhanced_user_analysis = self._enhance_user_analysis(user_analysis, transactions)
-                    else:
-                        # For large datasets, use original user analysis data
-                        logger.warning(f"Large dataset detected ({transaction_count} records). Using original user analysis data without enhancement.")
-                        enhanced_user_analysis = {
-                            'analysis_id': str(user_analysis.id),
-                            'analysis_date': user_analysis.analysis_date,
-                            'status': user_analysis.status,
-                            'user_anomalies': user_analysis.user_anomalies,
-                            'user_risk_assessment': user_analysis.user_risk_assessment,
-                            'user_transaction_summary': user_analysis.user_transaction_summary,
-                            'user_account_distribution': user_analysis.user_account_distribution,
-                            'large_dataset_warning': True
-                        }
-                    
-                    # Add debugging information for user anomalies
-                    user_anomalies_count = len(user_analysis.user_anomalies or [])
+                    anomalies_count = user_analysis.get_anomalies_count()
+                    total_users = user_analysis.get_total_users()
+                    total_transactions = user_analysis.get_total_transactions()
                     high_risk_users_count = user_analysis.get_high_risk_users_count()
-                    total_users_count = user_analysis.get_total_users()
-                    
-                    enhanced_user_analysis['debug_info'] = {
-                        'user_anomalies_count': user_anomalies_count,
-                        'high_risk_users_count': high_risk_users_count,
-                        'total_users_count': total_users_count,
-                        'anomaly_percentage': (user_anomalies_count / total_users_count * 100) if total_users_count > 0 else 0,
-                        'high_risk_percentage': (high_risk_users_count / total_users_count * 100) if total_users_count > 0 else 0,
-                        'debug_message': f'Found {user_anomalies_count} user anomalies out of {total_users_count} total users',
-                        'clarification': 'User analysis focuses on user behavior patterns and anomalies, complementing transaction-based anomaly detection'
-                    }
-                    
-                    response_data['user_analysis'] = enhanced_user_analysis
                 except Exception as e:
-                    logger.error(f"Error enhancing user analysis for file {file_id}: {e}")
-                    response_data['user_analysis'] = {
-                        'error': f'Error enhancing user analysis: {str(e)}',
-                        'status': 'ERROR',
-                        'original_data': {
-                            'analysis_id': str(user_analysis.id),
-                            'analysis_date': user_analysis.analysis_date,
-                            'status': user_analysis.status
-                        }
-                    }
-            else:
-                response_data['user_analysis'] = {
-                    'error': 'No user analysis results found for this file',
-                    'status': 'NOT_AVAILABLE',
-                    'suggestions': ['Run user analysis for this file', 'Check if user analysis processing completed successfully']
+                    logger.warning(f"Error getting user analysis data: {e}")
+                    anomalies_count = 0
+                    total_users = 0
+                    total_transactions = 0
+                    high_risk_users_count = 0
+                
+                anomaly_stats['user_analysis'] = {
+                    'analysis_id': str(user_analysis.id),
+                    'analysis_date': user_analysis.analysis_date.isoformat(),
+                    'total_users': total_users,
+                    'total_transactions': total_transactions,
+                    'anomalies_count': anomalies_count,
+                    'high_risk_users_count': high_risk_users_count,
+                    'analysis_info': user_analysis.analysis_info or {},
+                    'user_anomalies': user_analysis.user_anomalies or [],
+                    'user_risk_assessment': user_analysis.user_risk_assessment or {}
                 }
+                anomaly_stats['total_anomalies'] += anomalies_count
+                anomaly_stats['anomaly_types_detected'].append('user_anomaly')
             
-            # Closing Entries Analysis Statistics with enhanced error handling
-            if closing_entries_analysis:
-                try:
-                    # OPTIMIZATION: Check dataset size before processing
-                    transaction_count = SAPGLPosting.objects.filter(data_file=data_file).count()
-                    
-                    # Only enhance closing entries analysis for manageable datasets
-                    if transaction_count < 5000:
-                        transactions = SAPGLPosting.objects.filter(data_file=data_file).select_related()
-                        enhanced_closing_entries_analysis = self._enhance_closing_entries_analysis(closing_entries_analysis, transactions)
-                    else:
-                        # For large datasets, use original closing entries analysis data
-                        logger.warning(f"Large dataset detected ({transaction_count} records). Using original closing entries analysis data without enhancement.")
-                        enhanced_closing_entries_analysis = {
-                            'analysis_id': str(closing_entries_analysis.id),
-                            'analysis_date': closing_entries_analysis.analysis_date,
-                            'status': closing_entries_analysis.status,
-                            'analysis_info': closing_entries_analysis.analysis_info,
-                            'closing_entries': closing_entries_analysis.closing_entries,
-                            'post_close_analysis': closing_entries_analysis.post_close_analysis,
-                            'fs_line_closing': closing_entries_analysis.fs_line_closing,
-                            'user_closing': closing_entries_analysis.user_closing,
-                            'month_end_patterns': closing_entries_analysis.month_end_patterns,
-                            'closing_window_analysis': closing_entries_analysis.closing_window_analysis,
-                            'risk_assessment': closing_entries_analysis.risk_assessment,
-                            'chart_data': closing_entries_analysis.chart_data,
-                            'export_data': closing_entries_analysis.export_data,
-                            'large_dataset_warning': True
-                        }
-                    
-                    # Add debugging information for closing entries
-                    closing_entries_count = closing_entries_analysis.get_closing_entries_count()
-                    post_close_entries_count = closing_entries_analysis.get_post_close_entries_count()
-                    total_transactions = closing_entries_analysis.get_total_transactions()
-                    
-                    enhanced_closing_entries_analysis['debug_info'] = {
-                        'closing_entries_count': closing_entries_count,
-                        'post_close_entries_count': post_close_entries_count,
-                        'total_transactions': total_transactions,
-                        'closing_entries_percentage': (closing_entries_count / total_transactions * 100) if total_transactions > 0 else 0,
-                        'post_close_percentage': (post_close_entries_count / total_transactions * 100) if total_transactions > 0 else 0,
-                        'debug_message': f'Found {closing_entries_count} closing entries and {post_close_entries_count} post-close entries out of {total_transactions} total transactions',
-                        'clarification': 'Closing entries analysis identifies month-end closing transactions and post-close activities'
-                    }
-                    
-                    response_data['closing_entries_analysis'] = enhanced_closing_entries_analysis
-                except Exception as e:
-                    logger.error(f"Error enhancing closing entries analysis for file {file_id}: {e}")
-                    response_data['closing_entries_analysis'] = {
-                        'error': f'Error enhancing closing entries analysis: {str(e)}',
-                        'status': 'ERROR',
-                        'original_data': {
-                            'analysis_id': str(closing_entries_analysis.id),
-                            'analysis_date': closing_entries_analysis.analysis_date,
-                            'status': closing_entries_analysis.status
-                        }
-                    }
-            else:
-                response_data['closing_entries_analysis'] = {
-                    'error': 'No closing entries analysis results found for this file',
-                    'status': 'NOT_AVAILABLE',
-                    'suggestions': ['Run closing entries analysis for this file', 'Check if closing entries analysis processing completed successfully']
-                }
-            
-            # Unusual Days Analysis Statistics with enhanced error handling
+            # Unusual Days Analysis
             if unusual_days_analysis:
                 try:
-                    # OPTIMIZATION: Check dataset size before processing
-                    transaction_count = SAPGLPosting.objects.filter(data_file=data_file).count()
-                    
-                    # Only enhance unusual days analysis for manageable datasets
-                    if transaction_count < 5000:
-                        transactions = SAPGLPosting.objects.filter(data_file=data_file).select_related()
-                        enhanced_unusual_days_analysis = self._enhance_unusual_days_analysis(unusual_days_analysis, transactions)
-                    else:
-                        # For large datasets, use original unusual days analysis data
-                        logger.warning(f"Large dataset detected ({transaction_count} records). Using original unusual days analysis data without enhancement.")
-                        enhanced_unusual_days_analysis = {
-                            'analysis_id': str(unusual_days_analysis.id),
-                            'analysis_date': unusual_days_analysis.analysis_date,
-                            'status': unusual_days_analysis.status,
-                            'analysis_info': unusual_days_analysis.analysis_info,
-                            'weekend_postings': unusual_days_analysis.weekend_postings,
-                            'day_of_week_activity': unusual_days_analysis.day_of_week_activity,
-                            'user_day_patterns': unusual_days_analysis.user_day_patterns,
-                            'fs_line_day_patterns': unusual_days_analysis.fs_line_day_patterns,
-                            'unusual_days': unusual_days_analysis.unusual_days,
-                            'risk_assessment': unusual_days_analysis.risk_assessment,
-                            'chart_data': unusual_days_analysis.chart_data,
-                            'export_data': unusual_days_analysis.export_data,
-                            'large_dataset_warning': True
-                        }
-                    
-                    # Add debugging information for unusual days
-                    weekend_transactions_count = unusual_days_analysis.get_weekend_transactions_count()
+                    weekend_count = unusual_days_analysis.get_weekend_transactions_count()
                     unusual_days_count = unusual_days_analysis.get_unusual_days_count()
-                    total_transactions = unusual_days_analysis.get_total_transactions()
-                    
-                    enhanced_unusual_days_analysis['debug_info'] = {
-                        'weekend_transactions_count': weekend_transactions_count,
-                        'unusual_days_count': unusual_days_count,
-                        'total_transactions': total_transactions,
-                        'weekend_percentage': (weekend_transactions_count / total_transactions * 100) if total_transactions > 0 else 0,
-                        'unusual_days_percentage': (unusual_days_count / total_transactions * 100) if total_transactions > 0 else 0,
-                        'debug_message': f'Found {weekend_transactions_count} weekend transactions and {unusual_days_count} unusual day patterns out of {total_transactions} total transactions',
-                        'clarification': 'Unusual days analysis identifies weekend postings and unusual temporal patterns'
-                    }
-                    
-                    response_data['unusual_days_analysis'] = enhanced_unusual_days_analysis
                 except Exception as e:
-                    logger.error(f"Error enhancing unusual days analysis for file {file_id}: {e}")
-                    response_data['unusual_days_analysis'] = {
-                        'error': f'Error enhancing unusual days analysis: {str(e)}',
-                        'status': 'ERROR',
-                        'original_data': {
-                            'analysis_id': str(unusual_days_analysis.id),
-                            'analysis_date': unusual_days_analysis.analysis_date,
-                            'status': unusual_days_analysis.status
-                        }
-                    }
-            else:
-                response_data['unusual_days_analysis'] = {
-                    'error': 'No unusual days analysis results found for this file',
-                    'status': 'NOT_AVAILABLE',
-                    'suggestions': ['Run unusual days analysis for this file', 'Check if unusual days analysis processing completed successfully']
+                    logger.warning(f"Error getting unusual days analysis data: {e}")
+                    weekend_count = 0
+                    unusual_days_count = 0
+                
+                anomaly_stats['unusual_days_analysis'] = {
+                    'analysis_id': str(unusual_days_analysis.id),
+                    'analysis_date': unusual_days_analysis.analysis_date.isoformat(),
+                    'weekend_transactions_count': weekend_count,
+                    'unusual_days_count': unusual_days_count,
+                    'analysis_info': unusual_days_analysis.analysis_info or {}
                 }
+                anomaly_stats['total_anomalies'] += weekend_count + unusual_days_count
+                anomaly_stats['anomaly_types_detected'].extend(['weekend_activity', 'unusual_days'])
             
-            # Combined Chart Data (only for overall and risk analysis)
-            combined_chart_data = {}
+            # Closing Entries Analysis
+            if closing_entries_analysis:
+                try:
+                    closing_count = closing_entries_analysis.get_closing_entries_count()
+                    post_close_count = closing_entries_analysis.get_post_close_entries_count()
+                except Exception as e:
+                    logger.warning(f"Error getting closing entries analysis data: {e}")
+                    closing_count = 0
+                    post_close_count = 0
+                
+                anomaly_stats['closing_entries_analysis'] = {
+                    'analysis_id': str(closing_entries_analysis.id),
+                    'analysis_date': closing_entries_analysis.analysis_date.isoformat(),
+                    'closing_entries_count': closing_count,
+                    'post_close_entries_count': post_close_count,
+                    'analysis_info': closing_entries_analysis.analysis_info or {}
+                }
+                anomaly_stats['total_anomalies'] += closing_count + post_close_count
+                anomaly_stats['anomaly_types_detected'].extend(['closing_entries', 'post_close_entries'])
             
+            # Holiday Analysis
+            if holiday_analysis:
+                try:
+                    holiday_count = holiday_analysis.get_holiday_postings_count()
+                    holiday_percentage = holiday_analysis.get_holiday_percentage()
+                    unique_holidays = holiday_analysis.get_unique_holidays()
+                    overall_risk_score = holiday_analysis.get_overall_risk_score()
+                except Exception as e:
+                    logger.warning(f"Error getting holiday analysis data: {e}")
+                    holiday_count = 0
+                    holiday_percentage = 0
+                    unique_holidays = 0
+                    overall_risk_score = 0
+                
+                anomaly_stats['holiday_analysis'] = {
+                    'analysis_id': str(holiday_analysis.id),
+                    'analysis_date': holiday_analysis.analysis_date.isoformat(),
+                    'holiday_postings_count': holiday_count,
+                    'holiday_percentage': holiday_percentage,
+                    'unique_holidays': unique_holidays,
+                    'overall_risk_score': overall_risk_score,
+                    'analysis_info': holiday_analysis.analysis_info or {}
+                }
+                anomaly_stats['total_anomalies'] += holiday_count
+                anomaly_stats['anomaly_types_detected'].append('holiday_posting')
+            
+            response_data['anomaly_statistics'] = anomaly_stats
+            
+            # Chart Data - Combine chart data from all analyses
+            chart_data = {
+                'overall_charts': {},
+                'risk_charts': {},
+                'anomaly_charts': {},
+                'temporal_charts': {},
+                'user_charts': {},
+                'account_charts': {}
+            }
+            
+            # Overall Analysis Chart Data
             if overall_analysis and overall_analysis.chart_data:
-                combined_chart_data.update(overall_analysis.chart_data)
+                chart_data['overall_charts'] = overall_analysis.chart_data
             
-            # Add risk-specific chart data if available
-            if risk_document:
-                # OPTIMIZATION: Check dataset size before processing chart data
-                transaction_count = SAPGLPosting.objects.filter(data_file=data_file).count()
-                
-                # Only process chart data for manageable datasets
-                if transaction_count < 5000:
-                    # Create ANOMALY-BASED risk distribution chart data (not transaction-based)
-                    # Get transactions for this file to calculate anomaly distribution
-                    transactions = SAPGLPosting.objects.filter(data_file=data_file)
-                    
-                    # Calculate anomaly counts
-                    duplicate_anomalies = transactions.filter(is_duplicate=True).count()
-                    backdated_anomalies = transactions.filter(is_backdated=True).count()
-                    high_value_anomalies = len([t for t in transactions if t.is_high_value])
-                    total_transactions = transactions.count()
-                else:
-                    # For large datasets, use simplified chart data
-                    duplicate_anomalies = 0
-                    backdated_anomalies = 0
-                    high_value_anomalies = 0
-                    total_transactions = transaction_count
-                
-                # Add debugging information for chart data
-                chart_debug_info = {
-                    'duplicate_anomalies': duplicate_anomalies,
-                    'backdated_anomalies': backdated_anomalies,
-                    'high_value_anomalies': high_value_anomalies,
-                    'total_transactions': total_transactions,
-                    'debug_message': f'Chart data: {duplicate_anomalies} duplicates, {backdated_anomalies} backdated, {high_value_anomalies} high value'
+            # Risk Analysis Chart Data
+            if risk_document and risk_document.risk_distributions:
+                chart_data['risk_charts'] = {
+                    'risk_distribution': risk_document.risk_distributions.get('distribution_chart', {}),
+                    'risk_levels': risk_document.risk_distributions.get('risk_levels_chart', {}),
+                    'risk_trends': risk_document.risk_distributions.get('risk_trends_chart', {})
                 }
-                
-                # Add user anomalies information if available
-                if user_analysis:
-                    user_anomalies_count = len(user_analysis.user_anomalies or [])
-                    high_risk_users_count = user_analysis.get_high_risk_users_count()
-                    chart_debug_info.update({
-                        'user_anomalies': user_anomalies_count,
-                        'high_risk_users': high_risk_users_count,
-                        'debug_message': f'{chart_debug_info["debug_message"]}, {user_anomalies_count} user anomalies, {high_risk_users_count} high-risk users'
-                    })
-                
-                # Add closing entries information if available
-                if closing_entries_analysis:
-                    closing_entries_count = closing_entries_analysis.get_closing_entries_count()
-                    post_close_entries_count = closing_entries_analysis.get_post_close_entries_count()
-                    closing_entries_risk_score = closing_entries_analysis.get_closing_entries_risk_score()
-                    chart_debug_info.update({
-                        'closing_entries': closing_entries_count,
-                        'post_close_entries': post_close_entries_count,
-                        'closing_entries_risk_score': closing_entries_risk_score,
-                        'debug_message': f'{chart_debug_info["debug_message"]}, {closing_entries_count} closing entries ({closing_entries_risk_score:.1f} risk), {post_close_entries_count} post-close entries'
-                    })
-                
-                # Add unusual days information if available
-                if unusual_days_analysis:
-                    weekend_transactions_count = unusual_days_analysis.get_weekend_transactions_count()
-                    unusual_days_count = unusual_days_analysis.get_unusual_days_count()
-                    weekend_risk_score = unusual_days_analysis.get_weekend_risk_score()
-                    chart_debug_info.update({
-                        'weekend_transactions': weekend_transactions_count,
-                        'unusual_days': unusual_days_count,
-                        'weekend_risk_score': weekend_risk_score,
-                        'debug_message': f'{chart_debug_info["debug_message"]}, {weekend_transactions_count} weekend transactions ({weekend_risk_score:.1f} risk), {unusual_days_count} unusual day patterns'
-                    })
-                
-                # Calculate anomaly distribution based on actual anomaly counts
-                # This is the correct approach - show individual anomalies, not merged transactions
-                
-                # Initialize anomaly counts by risk level
-                low_risk_anomalies = 0
-                medium_risk_anomalies = 0
-                high_risk_anomalies = 0
-                critical_risk_anomalies = 0
-                
-                # Distribute anomalies based on their risk levels
-                # Duplicate anomalies are typically high/critical risk
-                if duplicate_anomalies > 0:
-                    critical_risk_anomalies += duplicate_anomalies
-                
-                # Backdated anomalies are typically high risk
-                if backdated_anomalies > 0:
-                    high_risk_anomalies += backdated_anomalies
-                
-                # High value anomalies are typically medium risk
-                if high_value_anomalies > 0:
-                    medium_risk_anomalies += high_value_anomalies
-                
-                # Add closing entries anomalies (typically medium to high risk)
-                if closing_entries_analysis:
-                    closing_entries_count = closing_entries_analysis.get_closing_entries_count()
-                    closing_entries_risk_score = closing_entries_analysis.get_closing_entries_risk_score()
-                    if closing_entries_risk_score >= 70:
-                        critical_risk_anomalies += closing_entries_count
-                    elif closing_entries_risk_score >= 50:
-                        high_risk_anomalies += closing_entries_count
-                    else:
-                        medium_risk_anomalies += closing_entries_count
-                
-                # Add unusual days anomalies (typically high to critical risk)
-                if unusual_days_analysis:
-                    weekend_transactions_count = unusual_days_analysis.get_weekend_transactions_count()
-                    weekend_risk_score = unusual_days_analysis.get_weekend_risk_score()
-                    if weekend_risk_score >= 70:
-                        critical_risk_anomalies += weekend_transactions_count
-                    elif weekend_risk_score >= 50:
-                        high_risk_anomalies += weekend_transactions_count
-                    else:
-                        medium_risk_anomalies += weekend_transactions_count
-                
-                combined_chart_data['risk_distribution_chart'] = {
-                    'labels': ['Low Risk', 'Medium Risk', 'High Risk', 'Critical Risk'],
-                    'data': [
-                        low_risk_anomalies,
-                        medium_risk_anomalies,
-                        high_risk_anomalies,
-                        critical_risk_anomalies
-                    ],
-                    'colors': ['#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384'],
-                    'description': 'Distribution of anomalies across risk levels (not transactions)',
-                    'total_anomalies': low_risk_anomalies + medium_risk_anomalies + high_risk_anomalies + critical_risk_anomalies,
-                    'debug_info': chart_debug_info
-                }
-                
-                # Add overall risk score gauge chart with comprehensive definitions
-                combined_chart_data['overall_risk_gauge'] = {
-                    'value': risk_document.overall_risk_score,
-                    'max_value': 100,
-                    'risk_level': self._get_risk_level(risk_document.overall_risk_score),
-                    'color': self._get_risk_color(risk_document.overall_risk_score),
-                    'definition': {
-                        'title': 'Overall Risk Score Gauge',
-                        'description': 'Comprehensive risk assessment indicator that evaluates the average risk level across all transactions in the dataset',
-                        'calculation_method': 'Weighted average of individual transaction risk scores',
-                        'scale': '0-100 (0 = No Risk, 100 = Maximum Risk)',
-                        'update_frequency': 'Real-time with each analysis run'
-                    },
-                    'risk_levels': {
-                        'CRITICAL': {
-                            'range': '80-100',
-                            'description': 'Extremely high risk requiring immediate attention',
-                            'color': '#FF6384',
-                            'actions': [
-                                'Immediate audit review required',
-                                'Fraud investigation recommended',
-                                'Regulatory compliance review needed',
-                                'Internal control assessment mandatory'
-                            ]
-                        },
-                        'HIGH': {
-                            'range': '60-79',
-                            'description': 'High risk requiring prompt investigation',
-                            'color': '#FF9F40',
-                            'actions': [
-                                'Detailed transaction review',
-                                'Risk factor analysis',
-                                'Control effectiveness assessment',
-                                'Management oversight required'
-                            ]
-                        },
-                        'MEDIUM': {
-                            'range': '30-59',
-                            'description': 'Moderate risk with some concerns',
-                            'color': '#FFCE56',
-                            'actions': [
-                                'Selective transaction review',
-                                'Pattern analysis recommended',
-                                'Monitoring enhancement',
-                                'Periodic reassessment'
-                            ]
-                        },
-                        'LOW': {
-                            'range': '0-29',
-                            'description': 'Low risk with normal transaction patterns',
-                            'color': '#4BC0C0',
-                            'actions': [
-                                'Routine monitoring',
-                                'Standard audit procedures',
-                                'Regular risk assessment',
-                                'Baseline establishment'
-                            ]
-                        }
-                    },
-                    'calculation_details': {
-                        'formula': 'Overall Risk Score = Σ(Individual Transaction Risk Scores) / Total Transactions',
-                        'components': {
-                            'duplicate_analysis': {
-                                'weight': '25-30 points',
-                                'description': 'Risk from duplicate transaction detection'
-                            },
-                            'backdated_analysis': {
-                                'weight': '25-30 points', 
-                                'description': 'Risk from backdated entry detection'
-                            },
-                            'high_value_analysis': {
-                                'weight': '10-15 points',
-                                'description': 'Risk from transactions exceeding 1M SAR threshold'
-                            },
-                            'general_anomaly': {
-                                'weight': '10-20 points',
-                                'description': 'Risk from unusual patterns and ML-based anomaly detection'
-                            }
-                        },
-                        'scaling_factors': {
-                            'amount_multiplier': 'Risk increases with transaction amount',
-                            'frequency_multiplier': 'Risk increases with anomaly frequency',
-                            'combination_effect': 'Multiple anomalies per transaction have multiplicative effect'
-                        }
-                    },
-                    'interpretation_guide': {
-                        'score_0_20': 'Excellent - Minimal risk indicators detected',
-                        'score_21_40': 'Good - Some risk factors present but manageable',
-                        'score_41_60': 'Fair - Moderate risk requiring attention',
-                        'score_61_80': 'Poor - High risk requiring immediate action',
-                        'score_81_100': 'Critical - Maximum risk requiring urgent intervention'
-                    },
-                    'business_impact': {
-                        'financial_risk': 'Potential for financial loss or misstatement',
-                        'compliance_risk': 'Risk of regulatory violations or audit findings',
-                        'operational_risk': 'Risk of process failures or control weaknesses',
-                        'reputational_risk': 'Risk of damage to organizational reputation'
-                    }
-                }
-            else:
-                # For large datasets, use simplified chart data
-                combined_chart_data['large_dataset_warning'] = True
-                combined_chart_data['message'] = f'Chart data processing skipped for large dataset ({transaction_count} records)'
             
-            response_data['chart_data'] = combined_chart_data
+            # Anomaly Chart Data
+            if duplicate_analysis and duplicate_analysis.chart_data:
+                chart_data['anomaly_charts']['duplicate_charts'] = duplicate_analysis.chart_data
             
-            # Create comprehensive anomaly summary for frontend
-            anomaly_summary = {
-                'duplicateEntries': 0,
-                'userAnomalies': 0,
-                'backdatedEntries': 0,
-                'closingEntries': 0,
-                'unusualDays': 0,
-                'holidayEntries': 0,
-                'highRiskUsers': 0,
-                'totalUsers': 0,
-                'totalAnomalies': 0
+            if backdated_analysis and backdated_analysis.chart_data:
+                chart_data['anomaly_charts']['backdated_charts'] = backdated_analysis.chart_data
+            
+            if holiday_analysis and holiday_analysis.chart_data:
+                chart_data['anomaly_charts']['holiday_charts'] = holiday_analysis.chart_data
+            
+            # User Analysis Chart Data
+            if user_analysis and user_analysis.chart_data:
+                chart_data['user_charts'] = user_analysis.chart_data
+            
+            # General Analysis Chart Data
+            if general_analysis and general_analysis.chart_data:
+                chart_data['account_charts'] = general_analysis.chart_data
+            
+            response_data['chart_data'] = chart_data
+            
+            # Summary Dashboard - Key metrics for quick overview
+            overall_risk_score = risk_document.overall_risk_score if risk_document else 0
+            summary_dashboard = {
+                'total_transactions': data_file.total_records,
+                'total_anomalies': anomaly_stats['total_anomalies'],
+                'anomaly_percentage': (anomaly_stats['total_anomalies'] / data_file.total_records * 100) if data_file.total_records > 0 else 0,
+                'overall_risk_score': overall_risk_score,
+                'risk_level': self._get_risk_level(overall_risk_score),
+                'analysis_coverage': {
+                    'overall_analysis': bool(overall_analysis),
+                    'risk_analysis': bool(risk_document),
+                    'duplicate_analysis': bool(duplicate_analysis),
+                    'backdated_analysis': bool(backdated_analysis),
+                    'user_analysis': bool(user_analysis),
+                    'unusual_days_analysis': bool(unusual_days_analysis),
+                    'closing_entries_analysis': bool(closing_entries_analysis),
+                    'holiday_analysis': bool(holiday_analysis)
+                },
+                'key_metrics': {
+                    'duplicate_transactions': anomaly_stats['duplicate_analysis'].get('duplicate_count', 0),
+                    'backdated_transactions': anomaly_stats['backdated_analysis'].get('backdated_count', 0),
+                    'user_anomalies': anomaly_stats['user_analysis'].get('anomalies_count', 0),
+                    'weekend_transactions': anomaly_stats['unusual_days_analysis'].get('weekend_transactions_count', 0),
+                    'holiday_transactions': anomaly_stats['holiday_analysis'].get('holiday_postings_count', 0),
+                    'closing_entries': anomaly_stats['closing_entries_analysis'].get('closing_entries_count', 0)
+                }
             }
             
-            # Get transaction-based anomalies from overall analysis
-            if overall_analysis and 'flag_summary' in response_data.get('overall_analysis', {}):
-                flag_summary = response_data['overall_analysis']['flag_summary']
-                anomaly_summary['duplicateEntries'] = flag_summary.get('duplicate_anomalies', 0)
-                anomaly_summary['backdatedEntries'] = flag_summary.get('backdated_anomalies', 0)
-                # High value anomalies are not counted separately in frontend
-                anomaly_summary['totalAnomalies'] += flag_summary.get('duplicate_anomalies', 0)
-                anomaly_summary['totalAnomalies'] += flag_summary.get('backdated_anomalies', 0)
-            
-            # Get user anomalies from user analysis
-            if user_analysis:
-                anomaly_summary['userAnomalies'] = user_analysis.get_anomalies_count()
-                anomaly_summary['highRiskUsers'] = user_analysis.get_high_risk_users_count()
-                anomaly_summary['totalUsers'] = user_analysis.get_total_users()
-                anomaly_summary['totalAnomalies'] += user_analysis.get_anomalies_count()
-            
-            # Debug: Log what's available in response_data
-            logger.info(f"Debug - overall_analysis exists: {overall_analysis is not None}")
-            if overall_analysis:
-                logger.info(f"Debug - overall_analysis keys: {list(response_data.get('overall_analysis', {}).keys())}")
-                logger.info(f"Debug - closing_entries_summary exists: {'closing_entries_summary' in response_data.get('overall_analysis', {})}")
-                if 'closing_entries_summary' in response_data.get('overall_analysis', {}):
-                    logger.info(f"Debug - closing_entries_summary content: {response_data['overall_analysis']['closing_entries_summary']}")
-            
-            # Get closing entries from overall analysis (if available)
-            if overall_analysis and 'closing_entries_summary' in response_data.get('overall_analysis', {}):
-                closing_entries_summary = response_data['overall_analysis']['closing_entries_summary']
-                closing_entries_count = closing_entries_summary.get('total_closing_entries', 0)
-                anomaly_summary['closingEntries'] = closing_entries_count
-                anomaly_summary['totalAnomalies'] += closing_entries_count
-                logger.info(f"Closing entries from overall analysis: {closing_entries_count} closing entries")
-            elif closing_entries_analysis:
-                # Fallback to separate closing entries analysis if available
-                closing_entries_count = closing_entries_analysis.get_closing_entries_count()
-                anomaly_summary['closingEntries'] = closing_entries_count
-                anomaly_summary['totalAnomalies'] += closing_entries_count
-                logger.info(f"Closing entries from separate analysis: {closing_entries_count} closing entries")
-            else:
-                logger.warning(f"No closing entries data found for file {file_id}")
-            
-            # Debug: Log unusual days data availability
-            if overall_analysis:
-                logger.info(f"Debug - unusual_days_summary exists: {'unusual_days_summary' in response_data.get('overall_analysis', {})}")
-                if 'unusual_days_summary' in response_data.get('overall_analysis', {}):
-                    logger.info(f"Debug - unusual_days_summary content: {response_data['overall_analysis']['unusual_days_summary']}")
-            
-            # Get unusual days from overall analysis (if available)
-            if overall_analysis and 'unusual_days_summary' in response_data.get('overall_analysis', {}):
-                unusual_days_summary = response_data['overall_analysis']['unusual_days_summary']
-                unusual_days_count = unusual_days_summary.get('total_weekend_transactions', 0)
-                anomaly_summary['unusualDays'] = unusual_days_count
-                anomaly_summary['totalAnomalies'] += unusual_days_count
-                logger.info(f"Unusual days from overall analysis: {unusual_days_count} unusual days")
-            elif unusual_days_analysis:
-                # Fallback to separate unusual days analysis if available
-                unusual_days_count = unusual_days_analysis.get_weekend_transactions_count()
-                anomaly_summary['unusualDays'] = unusual_days_count
-                anomaly_summary['totalAnomalies'] += unusual_days_count
-                logger.info(f"Unusual days from separate analysis: {unusual_days_count} unusual days")
-            else:
-                logger.warning(f"No unusual days data found for file {file_id}")
-            
-            # Add anomaly summary to response
-            response_data['anomalySummary'] = anomaly_summary
-            
-            # Log the final anomaly summary for debugging
-            logger.info(f"Final anomaly summary for file {file_id}: {anomaly_summary}")
-            
-            # Add final validation and summary
-            response_data['summary'] = {
-                'total_alerts': len(response_data.get('overall_analysis', {}).get('critical_alerts', [])),
-                'critical_issues': len([a for a in response_data.get('overall_analysis', {}).get('critical_alerts', []) if a.get('type') == 'CRITICAL']),
-                'warnings': len([a for a in response_data.get('overall_analysis', {}).get('critical_alerts', []) if a.get('type') == 'WARNING']),
-                'analysis_quality': 'HIGH' if response_data['analysis_metadata']['has_overall_analysis'] and response_data['analysis_metadata']['has_risk_analysis'] else 'PARTIAL',
-                'user_anomalies_summary': {
-                    'total_user_anomalies': user_analysis.get_anomalies_count() if user_analysis else 0,
-                    'high_risk_users': user_analysis.get_high_risk_users_count() if user_analysis else 0,
-                    'total_users': user_analysis.get_total_users() if user_analysis else 0,
-                    'anomaly_percentage': (user_analysis.get_anomalies_count() / user_analysis.get_total_users() * 100) if user_analysis and user_analysis.get_total_users() > 0 else 0
-                } if user_analysis else {},
-                'closing_entries_summary': {
-                    'total_closing_entries': closing_entries_analysis.get_closing_entries_count() if closing_entries_analysis else 0,
-                    'post_close_entries': closing_entries_analysis.get_post_close_entries_count() if closing_entries_analysis else 0,
-                    'total_transactions': closing_entries_analysis.get_total_transactions() if closing_entries_analysis else 0,
-                    'closing_entries_percentage': (closing_entries_analysis.get_closing_entries_count() / closing_entries_analysis.get_total_transactions() * 100) if closing_entries_analysis and closing_entries_analysis.get_total_transactions() > 0 else 0
-                } if closing_entries_analysis else {},
-                'unusual_days_summary': {
-                    'weekend_transactions': unusual_days_analysis.get_weekend_transactions_count() if unusual_days_analysis else 0,
-                    'unusual_days_count': unusual_days_analysis.get_unusual_days_count() if unusual_days_analysis else 0,
-                    'total_transactions': unusual_days_analysis.get_total_transactions() if unusual_days_analysis else 0,
-                    'weekend_percentage': (unusual_days_analysis.get_weekend_transactions_count() / unusual_days_analysis.get_total_transactions() * 100) if unusual_days_analysis and unusual_days_analysis.get_total_transactions() > 0 else 0
-                } if unusual_days_analysis else {}
-            }
-            
-            # Log successful response for monitoring
-            logger.info(f"Successfully retrieved analysis statistics for file {file_id} with {response_data['summary']['total_alerts']} alerts")
+            response_data['summary_dashboard'] = summary_dashboard
             
             return Response(response_data, status=status.HTTP_200_OK)
             
         except Exception as e:
-            logger.error(f"Critical error getting file analysis statistics for file {file_id}: {e}")
+            logger.error(f"Error in FileAnalysisStatisticsView for file {file_id}: {e}")
             return Response(
                 {
-                    'error': 'Critical error occurred while retrieving file analysis statistics',
-                    'error_code': 'ANALYSIS_ERROR',
-                    'details': str(e),
-                    'file_id': file_id,
-                    'timestamp': timezone.now().isoformat(),
-                    'suggestions': [
-                        'Check if the file has been properly processed',
-                        'Verify database connectivity',
-                        'Review system logs for additional details'
-                    ]
+                    'error': 'Internal server error occurred while processing analysis statistics',
+                    'error_code': 'INTERNAL_ERROR',
+                    'details': str(e)
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
     def _get_risk_level(self, risk_score):
-        """
-        Get risk level classification based on risk score
-        
-        Risk Level Classification System:
-        - CRITICAL (80-100): Extremely high risk requiring immediate attention
-        - HIGH (60-79): High risk requiring prompt investigation  
-        - MEDIUM (30-59): Moderate risk with some concerns
-        - LOW (0-29): Low risk with normal transaction patterns
-        
-        Args:
-            risk_score (float): Risk score between 0-100
-            
-        Returns:
-            str: Risk level classification
-        """
+        """Get risk level based on risk score"""
         if risk_score >= 80:
             return 'CRITICAL'
         elif risk_score >= 60:
             return 'HIGH'
-        elif risk_score >= 30:
+        elif risk_score >= 40:
             return 'MEDIUM'
-        else:
+        elif risk_score >= 20:
             return 'LOW'
-    
-    def _get_risk_color(self, risk_score):
-        """
-        Get color code for risk score visualization
-        
-        Color Coding System:
-        - Red (#FF6384): Critical risk (80-100)
-        - Orange (#FF9F40): High risk (60-79)
-        - Yellow (#FFCE56): Medium risk (30-59)
-        - Green (#4BC0C0): Low risk (0-29)
-        
-        Args:
-            risk_score (float): Risk score between 0-100
-            
-        Returns:
-            str: Hexadecimal color code for visualization
-        """
-        if risk_score >= 80:
-            return '#FF6384'  # Red for critical
-        elif risk_score >= 60:
-            return '#FF9F40'  # Orange for high
-        elif risk_score >= 30:
-            return '#FFCE56'  # Yellow for medium
         else:
-            return '#4BC0C0'  # Green for low
-    
-    def _calculate_percentile(self, queryset, field_name, percentile):
-        """Calculate percentile for a given field"""
-        try:
-            values = list(queryset.values_list(field_name, flat=True))
-            if not values:
-                return 0.0
-            
-            values.sort()
-            index = (percentile / 100) * (len(values) - 1)
-            
-            if index.is_integer():
-                return float(values[int(index)])
-            else:
-                lower_index = int(index)
-                upper_index = lower_index + 1
-                lower_value = values[lower_index]
-                upper_value = values[upper_index] if upper_index < len(values) else lower_value
-                
-                # Linear interpolation
-                weight = index - lower_index
-                return float(lower_value + weight * (upper_value - lower_value))
-        except Exception:
-            return 0.0
-    
-    def _enhance_transaction_summary(self, original_summary, transactions):
-        """Enhance transaction summary with real data"""
-        if not transactions.exists():
-            return original_summary
-        
-        # Calculate real statistics
-        total_transactions = transactions.count()
-        total_amount = transactions.aggregate(total=Sum('amount_local_currency'))['total'] or Decimal('0.00')
-        unique_users = transactions.values('user_name').distinct().count()
-        unique_accounts = transactions.values('gl_account').distinct().count()
-        
-        # Amount statistics
-        amounts = [float(t.amount_local_currency) for t in transactions]
-        amount_stats = {
-            'mean': float(sum(amounts) / len(amounts)) if amounts else 0,
-            'median': float(sorted(amounts)[len(amounts)//2]) if amounts else 0,
-            'min': float(min(amounts)) if amounts else 0,
-            'max': float(max(amounts)) if amounts else 0,
-            'std': float((sum((x - sum(amounts)/len(amounts))**2 for x in amounts) / len(amounts))**0.5) if amounts else 0
-        }
-        
-        # Date range
-        date_range = transactions.aggregate(
-            min_date=Min('posting_date'),
-            max_date=Max('posting_date')
-        )
-        
-        # Currency
-        currency = transactions.first().local_currency if transactions.exists() else 'SAR'
-        
-        enhanced_summary = {
-            'total_transactions': total_transactions,
-            'total_amount': float(total_amount),
-            'unique_users': unique_users,
-            'unique_accounts': unique_accounts,
-            'average_transaction_amount': float(total_amount / total_transactions) if total_transactions > 0 else 0,
-            'amount_statistics': amount_stats,
-            'date_range': {
-                'min_date': date_range['min_date'].isoformat() if date_range['min_date'] else None,
-                'max_date': date_range['max_date'].isoformat() if date_range['max_date'] else None
-            },
-            'currency': currency
-        }
-        
-        # Merge with original summary if it has additional fields
-        if isinstance(original_summary, dict):
-            enhanced_summary.update(original_summary)
-        
-        return enhanced_summary
-    
-    def _enhance_flag_summary(self, original_summary, transactions):
-        """Enhance flag summary with real data"""
-        if not transactions.exists():
-            return original_summary
-        
-        # Calculate real anomaly statistics
-        duplicate_count = transactions.filter(is_duplicate=True).count()
-        backdated_count = transactions.filter(is_backdated=True).count()
-        high_value_count = len([t for t in transactions if t.is_high_value])
-        
-        # Calculate unique transactions with any anomaly using Q objects (more reliable than union)
-        from django.db.models import Q
-        unique_anomaly_transactions = transactions.filter(
-            Q(is_duplicate=True) | Q(is_backdated=True) | Q(amount_local_currency__gt=1000000)
-        )
-        
-        total_flagged = unique_anomaly_transactions.count()
-        
-        # Risk level distribution based on overall_risk_score
-        low_risk = transactions.filter(overall_risk_score__lt=30).count()
-        medium_risk = transactions.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count()
-        high_risk = transactions.filter(overall_risk_score__gte=60, overall_risk_score__lt=80).count()
-        critical_risk = transactions.filter(overall_risk_score__gte=80).count()
-        
-        enhanced_summary = {
-            'total_anomalies': duplicate_count + backdated_count + high_value_count,
-            'duplicate_anomalies': duplicate_count,
-            'backdated_anomalies': backdated_count,
-            'high_value_anomalies': high_value_count,
-            'low_risk_anomalies': low_risk,
-            'medium_risk_anomalies': medium_risk,
-            'high_risk_anomalies': high_risk,
-            'critical_risk_anomalies': critical_risk,
-            'total_flagged': total_flagged,  # Use the correct count of unique transactions with anomalies
-            'anomaly_rate': ((duplicate_count + backdated_count + high_value_count) / transactions.count() * 100) if transactions.count() > 0 else 0
-        }
-        
-        # Merge with original summary if it has additional fields, but ensure our calculated values take precedence
-        if isinstance(original_summary, dict):
-            # Start with original summary, then override with our calculated values
-            final_summary = original_summary.copy()
-            final_summary.update(enhanced_summary)
-            return final_summary
-        
-        return enhanced_summary
-    
-    def _enhance_risk_assessment(self, original_assessment, transactions):
-        """Enhance risk assessment with real data"""
-        if not transactions.exists():
-            return original_assessment
-        
-        # Calculate real risk statistics
-        total_transactions = transactions.count()
-        avg_risk_score = transactions.aggregate(avg=Avg('overall_risk_score'))['avg'] or 0
-        max_risk_score = transactions.aggregate(max=Max('overall_risk_score'))['max'] or 0
-        min_risk_score = transactions.aggregate(min=Min('overall_risk_score'))['min'] or 0
-        
-        # Risk distribution based on overall_risk_score
-        risk_distribution = {
-            'low_risk': transactions.filter(overall_risk_score__lt=30).count(),
-            'medium_risk': transactions.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count(),
-            'high_risk': transactions.filter(overall_risk_score__gte=60, overall_risk_score__lt=80).count(),
-            'critical_risk': transactions.filter(overall_risk_score__gte=80).count()
-        }
-        
-        # High-risk transactions - REMOVED to reduce payload size
-        
-        enhanced_assessment = {
-            'overall_risk_score': float(avg_risk_score),
-            'max_risk_score': float(max_risk_score),
-            'min_risk_score': float(min_risk_score),
-            'risk_level': self._get_risk_level(avg_risk_score),
-            'risk_distribution': risk_distribution,
-            'total_transactions': total_transactions,
-            'risk_percentiles': {
-                'p25': self._calculate_percentile(transactions, 'overall_risk_score', 25),
-                'p50': self._calculate_percentile(transactions, 'overall_risk_score', 50),
-                'p75': self._calculate_percentile(transactions, 'overall_risk_score', 75),
-                'p90': self._calculate_percentile(transactions, 'overall_risk_score', 90)
-            }
-        }
-        
-        # Merge with original assessment if it has additional fields
-        if isinstance(original_assessment, dict):
-            enhanced_assessment.update(original_assessment)
-        
-        return enhanced_assessment
-    
-
-    
-    def _enhance_risk_analysis(self, risk_document, transactions):
-        """Enhance risk analysis with real data"""
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        logger.info(f"Starting _enhance_risk_analysis for risk document {risk_document.id}")
-        logger.info(f"Risk document scoring_criteria type: {type(risk_document.scoring_criteria)}")
-        logger.info(f"Risk document risk_factors type: {type(risk_document.risk_factors)}")
-        logger.info(f"Risk document risk_calculations type: {type(risk_document.risk_calculations)}")
-        logger.info(f"Risk document risk_distributions type: {type(risk_document.risk_distributions)}")
-        
-        if not transactions.exists():
-            return {
-                'document_id': str(risk_document.id),
-                'document_date': risk_document.document_date,
-                'document_version': risk_document.document_version,
-                'processing_duration': risk_document.processing_duration,
-                'status': risk_document.status,
-                'error': 'No transaction data available for enhancement'
-            }
-        
-        # Calculate real risk statistics
-        logger.info("Calculating real risk statistics...")
-        total_transactions = transactions.count()
-        avg_risk_score = transactions.aggregate(avg=Avg('overall_risk_score'))['avg'] or 0
-        max_risk_score = transactions.aggregate(max=Max('overall_risk_score'))['max'] or 0
-        min_risk_score = transactions.aggregate(min=Min('overall_risk_score'))['min'] or 0
-        
-        logger.info(f"Risk statistics calculated: total={total_transactions}, avg={avg_risk_score}, max={max_risk_score}, min={min_risk_score}")
-        
-        # Real risk distribution based on overall_risk_score
-        logger.info("Calculating real risk distribution...")
-        real_risk_distribution = {
-            'low_risk': transactions.filter(overall_risk_score__lt=30).count(),
-            'medium_risk': transactions.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count(),
-            'high_risk': transactions.filter(overall_risk_score__gte=60, overall_risk_score__lt=80).count(),
-            'critical_risk': transactions.filter(overall_risk_score__gte=80).count()
-        }
-        logger.info(f"Risk distribution calculated: {real_risk_distribution}")
-        
-        # Enhanced methodology overview
-        logger.info("Creating enhanced methodology overview...")
-        enhanced_methodology = {
-            'description': 'Comprehensive risk scoring methodology based on actual transaction analysis',
-            'version': risk_document.document_version,
-            'analysis_date': risk_document.document_date.isoformat(),
-            'total_transactions_analyzed': total_transactions,
-            'risk_score_range': {
-                'min': float(min_risk_score),
-                'max': float(max_risk_score),
-                'average': float(avg_risk_score)
-            },
-            'risk_levels': {
-                'low_risk': {'min': 0, 'max': 29, 'description': 'Normal transactions'},
-                'medium_risk': {'min': 30, 'max': 59, 'description': 'Some concerns'},
-                'high_risk': {'min': 60, 'max': 79, 'description': 'Significant risk'},
-                'critical_risk': {'min': 80, 'max': 100, 'description': 'High risk'}
-            }
-        }
-        logger.info("Enhanced methodology overview created")
-        
-        # Enhanced risk factors based on actual data
-        logger.info("Creating enhanced risk factors...")
-        enhanced_risk_factors = {
-            'duplicate_risk': {
-                'count': transactions.filter(is_duplicate=True).count(),
-                'percentage': (transactions.filter(is_duplicate=True).count() / total_transactions * 100) if total_transactions > 0 else 0,
-                'description': 'Risk associated with duplicate transactions'
-            },
-            'backdated_risk': {
-                'count': transactions.filter(is_backdated=True).count(),
-                'percentage': (transactions.filter(is_backdated=True).count() / total_transactions * 100) if total_transactions > 0 else 0,
-                'description': 'Risk associated with backdated entries'
-            },
-            'high_value_risk': {
-                'count': len([t for t in transactions if t.is_high_value]),
-                'percentage': (len([t for t in transactions if t.is_high_value]) / total_transactions * 100) if total_transactions > 0 else 0,
-                'description': 'Risk associated with high-value transactions'
-            },
-            'unusual_pattern_risk': {
-                'count': transactions.filter(overall_risk_score__gte=60).count(),
-                'percentage': (transactions.filter(overall_risk_score__gte=60).count() / total_transactions * 100) if total_transactions > 0 else 0,
-                'description': 'Risk associated with unusual transaction patterns'
-            }
-        }
-        logger.info("Enhanced risk factors created")
-        
-        # Add user-based risk factors if user analysis data is available
-        # Note: This will be populated in the main method when user_analysis is available
-        logger.info("Adding user behavior risk factor...")
-        enhanced_risk_factors['user_behavior_risk'] = {
-            'count': 0,  # Will be updated if user analysis is available
-            'percentage': 0,  # Will be updated if user analysis is available
-            'description': 'Risk associated with user behavior patterns and anomalies'
-        }
-        logger.info("User behavior risk factor added")
-        
-        # Enhanced recommendations based on actual data
-        logger.info("Creating enhanced recommendations...")
-        enhanced_recommendations = []
-        
-        logger.info(f"Checking critical risk: {real_risk_distribution['critical_risk']}")
-        if real_risk_distribution['critical_risk'] > 0:
-            logger.info("Adding critical risk recommendation...")
-            enhanced_recommendations.append({
-                'priority': 'CRITICAL',
-                'action': 'Immediate review of critical risk transactions',
-                'description': f'{real_risk_distribution["critical_risk"]} critical risk transactions require immediate attention',
-                'count': real_risk_distribution['critical_risk']
-            })
-            logger.info("Critical risk recommendation added")
-        
-        logger.info(f"Checking high risk: {real_risk_distribution['high_risk']}")
-        if real_risk_distribution['high_risk'] > 0:
-            logger.info("Adding high risk recommendation...")
-            enhanced_recommendations.append({
-                'priority': 'HIGH',
-                'action': 'Review high-risk transactions',
-                'description': f'{real_risk_distribution["high_risk"]} high-risk transactions need investigation',
-                'count': real_risk_distribution['high_risk']
-            })
-            logger.info("High risk recommendation added")
-        
-        logger.info(f"Checking duplicate risk count: {enhanced_risk_factors['duplicate_risk']['count']}")
-        if enhanced_risk_factors['duplicate_risk']['count'] > 0:
-            logger.info("Adding duplicate risk recommendation...")
-            enhanced_recommendations.append({
-                'priority': 'HIGH',
-                'action': 'Investigate duplicate transactions',
-                'description': f'{enhanced_risk_factors["duplicate_risk"]["count"]} duplicate transactions detected',
-                'count': enhanced_risk_factors['duplicate_risk']['count']
-            })
-            logger.info("Duplicate risk recommendation added")
-        
-        logger.info(f"Checking backdated risk count: {enhanced_risk_factors['backdated_risk']['count']}")
-        if enhanced_risk_factors['backdated_risk']['count'] > 0:
-            logger.info("Adding backdated risk recommendation...")
-            enhanced_recommendations.append({
-                'priority': 'MEDIUM',
-                'action': 'Review backdated entries',
-                'description': f'{enhanced_risk_factors["backdated_risk"]["count"]} backdated transactions found',
-                'count': enhanced_risk_factors['backdated_risk']['count']
-            })
-            logger.info("Backdated risk recommendation added")
-        
-        logger.info(f"Checking high value risk count: {enhanced_risk_factors['high_value_risk']['count']}")
-        if enhanced_risk_factors['high_value_risk']['count'] > 0:
-            logger.info("Adding high value risk recommendation...")
-            enhanced_recommendations.append({
-                'priority': 'MEDIUM',
-                'action': 'Review high-value transactions',
-                'description': f'{enhanced_risk_factors["high_value_risk"]["count"]} high-value transactions identified',
-                'count': enhanced_risk_factors['high_value_risk']['count']
-            })
-            logger.info("High value risk recommendation added")
-        
-        # Enhanced audit implications
-        logger.info("Creating enhanced audit implications...")
-        enhanced_audit_implications = {
-            'immediate_actions': [
-                'Review all critical and high-risk transactions',
-                'Investigate duplicate transactions',
-                'Verify backdated entries',
-                'Analyze high-value transaction patterns'
-            ],
-            'follow_up_actions': [
-                'Implement controls to prevent future issues',
-                'Regular monitoring of flagged patterns',
-                'Staff training on proper posting procedures',
-                'Establish risk-based audit procedures'
-            ],
-            'compliance_considerations': [
-                'Ensure proper documentation for all flagged transactions',
-                'Verify compliance with accounting standards',
-                'Review internal control effectiveness',
-                'Assess fraud risk indicators'
-            ]
-        }
-        logger.info("Enhanced audit implications created")
-        
-        logger.info("Creating return dictionary...")
-        
-        # Pre-calculate risk level to avoid potential issues
-        logger.info("Creating risk calculations...")
-        risk_level = self._get_risk_level(avg_risk_score)
-        logger.info(f"Risk level calculated: {risk_level}")
-        
-        risk_calculations = {
-            'total_flagged': real_risk_distribution['high_risk'] + real_risk_distribution['critical_risk'],
-            'overall_risk_score': float(avg_risk_score),
-            'risk_level': risk_level,
-            'risk_score_range': {
-                'min': float(min_risk_score),
-                'max': float(max_risk_score),
-                'average': float(avg_risk_score)
-            }
-        }
-        
-        logger.info("Building return dictionary fields...")
-        
-        # Build return dictionary step by step
-        result = {}
-        
-        logger.info("Adding basic fields...")
-        result['document_id'] = str(risk_document.id)
-        result['document_date'] = risk_document.document_date
-        result['document_version'] = risk_document.document_version
-        result['processing_duration'] = risk_document.processing_duration
-        result['status'] = risk_document.status
-        
-        logger.info("Adding summary statistics...")
-        result['total_transactions'] = total_transactions
-        result['medium_risk_transactions'] = real_risk_distribution['medium_risk']
-        result['low_risk_transactions'] = real_risk_distribution['low_risk']
-        result['critical_risk_transactions'] = real_risk_distribution['critical_risk']
-        result['overall_risk_score'] = float(avg_risk_score)
-        
-        logger.info("Adding methodology and factors...")
-        result['methodology_overview'] = enhanced_methodology
-        result['risk_factors'] = enhanced_risk_factors
-        result['scoring_criteria'] = risk_document.scoring_criteria
-        
-        logger.info("Adding risk calculations and distributions...")
-        result['risk_calculations'] = risk_calculations
-        result['risk_distributions'] = real_risk_distribution
-        
-        logger.info("Adding recommendations and audit implications...")
-        result['recommendations'] = enhanced_recommendations
-        result['audit_implications'] = enhanced_audit_implications
-        
-        logger.info("Return dictionary built successfully")
-        return result 
-    
-    def _generate_critical_alerts(self, transaction_summary, flag_summary, risk_assessment):
-        """Generate critical alerts and warnings based on analysis results"""
-        alerts = []
-        
-        try:
-            # High value transaction alerts
-            if transaction_summary.get('total_amount', 0) > 100000000:  # 100M SAR
-                alerts.append({
-                    'type': 'CRITICAL',
-                    'category': 'HIGH_VALUE',
-                    'message': f'Total transaction amount ({transaction_summary.get("total_amount", 0):,.2f} SAR) exceeds 100M SAR threshold',
-                    'severity': 'HIGH',
-                    'action_required': 'Immediate review of high-value transactions'
-                })
-            
-            # High anomaly rate alerts
-            anomaly_rate = flag_summary.get('anomaly_rate', 0)
-            if anomaly_rate > 50:  # More than 50% anomalies
-                alerts.append({
-                    'type': 'WARNING',
-                    'category': 'HIGH_ANOMALY_RATE',
-                    'message': f'Anomaly rate ({anomaly_rate:.2f}%) is significantly high',
-                    'severity': 'MEDIUM',
-                    'action_required': 'Investigate anomaly patterns and root causes'
-                })
-            
-            # Critical risk alerts
-            critical_risk_count = flag_summary.get('critical_risk_anomalies', 0)
-            if critical_risk_count > 0:
-                alerts.append({
-                    'type': 'CRITICAL',
-                    'category': 'CRITICAL_RISK',
-                    'message': f'{critical_risk_count} critical risk transactions detected',
-                    'severity': 'CRITICAL',
-                    'action_required': 'Immediate investigation of critical risk transactions'
-                })
-            
-            # High risk score alerts
-            overall_risk_score = risk_assessment.get('overall_risk_score', 0)
-            if overall_risk_score > 70:
-                alerts.append({
-                    'type': 'WARNING',
-                    'category': 'HIGH_RISK_SCORE',
-                    'message': f'Overall risk score ({overall_risk_score:.2f}) indicates high risk',
-                    'severity': 'HIGH',
-                    'action_required': 'Review risk assessment methodology and investigate high-risk factors'
-                })
-            
-            # Duplicate transaction alerts
-            duplicate_count = flag_summary.get('duplicate_anomalies', 0)
-            if duplicate_count > 10:
-                alerts.append({
-                    'type': 'WARNING',
-                    'category': 'HIGH_DUPLICATE_COUNT',
-                    'message': f'{duplicate_count} duplicate transactions detected',
-                    'severity': 'MEDIUM',
-                    'action_required': 'Investigate duplicate transaction patterns'
-                })
-            
-            # Backdated transaction alerts
-            backdated_count = flag_summary.get('backdated_anomalies', 0)
-            if backdated_count > 5:
-                alerts.append({
-                    'type': 'WARNING',
-                    'category': 'HIGH_BACKDATED_COUNT',
-                    'message': f'{backdated_count} backdated transactions detected',
-                    'severity': 'MEDIUM',
-                    'action_required': 'Review backdated transaction policies and controls'
-                })
-            
-            # No alerts if everything is normal
-            if not alerts:
-                alerts.append({
-                    'type': 'INFO',
-                    'category': 'NORMAL',
-                    'message': 'No critical issues detected in analysis',
-                    'severity': 'LOW',
-                    'action_required': 'Continue monitoring'
-                })
-                
-        except Exception as e:
-            logger.error(f"Error generating critical alerts: {e}")
-            alerts.append({
-                'type': 'ERROR',
-                'category': 'ALERT_GENERATION_ERROR',
-                'message': f'Error generating alerts: {str(e)}',
-                'severity': 'HIGH',
-                'action_required': 'Review system logs and contact support'
-            })
-        
-        return alerts 
-
-    def _generate_all_gl_accounts_data(self, transactions):
-        """Generate data for all GL accounts, not just top ones"""
-        if not transactions.exists():
-            return []
-        
-        # Get all GL accounts with their statistics
-        gl_accounts_data = transactions.values('gl_account').annotate(
-            transaction_count=Count('id'),
-            total_amount=Sum('amount_local_currency'),
-            debit_amount=Sum('amount_local_currency', filter=Q(transaction_type='DEBIT')),
-            credit_amount=Sum('amount_local_currency', filter=Q(transaction_type='CREDIT')),
-            avg_risk_score=Avg('overall_risk_score'),
-            duplicate_count=Count('id', filter=Q(is_duplicate=True)),
-            backdated_count=Count('id', filter=Q(is_backdated=True)),
-            high_value_count=Count('id', filter=Q(amount_local_currency__gt=1000000))
-        ).order_by('-total_amount')  # Order by total amount descending
-        
-        # Convert to list of dictionaries with enhanced information
-        all_gl_accounts = []
-        for account_data in gl_accounts_data:
-            account_info = {
-                'gl_account': account_data['gl_account'],
-                'transaction_count': account_data['transaction_count'],
-                'total_amount': float(account_data['total_amount'] or 0),
-                'debit_amount': float(account_data['debit_amount'] or 0),
-                'credit_amount': float(account_data['credit_amount'] or 0),
-                'avg_risk_score': float(account_data['avg_risk_score'] or 0),
-                'anomaly_counts': {
-                    'duplicate': account_data['duplicate_count'],
-                    'backdated': account_data['backdated_count'],
-                    'high_value': account_data['high_value_count'],
-                    'total_anomalies': account_data['duplicate_count'] + account_data['backdated_count'] + account_data['high_value_count']
-                },
-                'risk_level': self._get_risk_level(account_data['avg_risk_score'] or 0),
-                'risk_color': self._get_risk_color(account_data['avg_risk_score'] or 0)
-            }
-            all_gl_accounts.append(account_info)
-        
-        return all_gl_accounts
-    
-    def _enhance_user_analysis(self, user_analysis, transactions):
-        """Enhanced user analysis with key statistics only"""
-        try:
-            enhanced_analysis = {
-                'analysis_id': str(user_analysis.id),
-                'analysis_date': user_analysis.analysis_date,
-                'processing_duration': user_analysis.processing_duration,
-                'status': user_analysis.status,
-                'analysis_version': user_analysis.analysis_version or '1.0.0',
-                
-                # User Summary Statistics
-                'user_summary': {
-                    'total_users': user_analysis.get_total_users(),
-                    'total_transactions': user_analysis.get_total_transactions(),
-                    'avg_transactions_per_user': user_analysis.get_total_transactions() / user_analysis.get_total_users() if user_analysis.get_total_users() > 0 else 0,
-                    'unique_accounts_accessed': len(set(t.gl_account for t in transactions)),
-                    'date_range': {
-                        'earliest_date': min(t.posting_date for t in transactions).isoformat() if transactions else None,
-                        'latest_date': max(t.posting_date for t in transactions).isoformat() if transactions else None
-                    }
-                },
-                
-                # User Anomalies Statistics
-                'user_anomalies': {
-                    'total_anomalies': user_analysis.get_anomalies_count(),
-                    'anomaly_types_count': len(self._get_user_anomaly_type_summary(user_analysis.user_anomalies or [])),
-                    'anomaly_severity_distribution': self._get_user_anomaly_severity_distribution(user_analysis.user_anomalies or []),
-                    'top_anomalous_users_count': len(self._get_top_anomalous_users(user_analysis.user_anomalies or [], limit=5)),
-                    'anomaly_trends_summary': {
-                        'total_days': self._get_user_anomaly_trends(user_analysis.user_anomalies or []).get('total_days', 0),
-                        'avg_anomalies_per_day': self._get_user_anomaly_trends(user_analysis.user_anomalies or []).get('avg_anomalies_per_day', 0)
-                    }
-                },
-                
-                # User Risk Assessment Statistics
-                'user_risk_assessment': {
-                    'high_risk_users_count': user_analysis.get_high_risk_users_count(),
-                    'risk_distribution': self._get_user_risk_distribution(user_analysis.user_risk_assessment),
-                    'risk_factors_count': len(self._extract_user_risk_factors(user_analysis.user_risk_assessment)),
-                    'top_risk_users_count': len(self._get_top_risk_users(user_analysis.user_risk_assessment, limit=5))
-                },
-                
-                # User Activity Pattern Statistics
-                'user_patterns': {
-                    'high_activity_users_count': len(self._analyze_user_transaction_patterns(user_analysis.user_transaction_summary or []).get('high_activity_users', [])),
-                    'low_activity_users_count': len(self._analyze_user_transaction_patterns(user_analysis.user_transaction_summary or []).get('low_activity_users', [])),
-                    'high_value_users_count': len(self._analyze_user_transaction_patterns(user_analysis.user_transaction_summary or []).get('high_value_users', [])),
-                    'multi_account_users_count': len(self._analyze_user_transaction_patterns(user_analysis.user_transaction_summary or []).get('multi_account_users', [])),
-                    'most_accessed_accounts_count': len(self._analyze_account_access_patterns(user_analysis.user_account_distribution or []).get('most_accessed_accounts', [])),
-                    'exclusive_accounts_count': len(self._analyze_account_access_patterns(user_analysis.user_account_distribution or []).get('exclusive_accounts', [])),
-                    'shared_accounts_count': len(self._analyze_account_access_patterns(user_analysis.user_account_distribution or []).get('shared_accounts', [])),
-                    'weekend_activity_percentage': self._analyze_temporal_patterns(transactions).get('weekend_activity', {}).get('weekend_percentage', 0)
-                }
-            }
-            
-            return enhanced_analysis
-            
-        except Exception as e:
-            logger.error(f"Error enhancing user analysis: {e}")
-            return {
-                'error': f'Error enhancing user analysis: {str(e)}',
-                'status': 'ERROR'
-            }
-    
-    def _get_user_anomaly_type_summary(self, user_anomalies):
-        """Get summary of user anomaly types"""
-        if not user_anomalies:
-            return {}
-        
-        anomaly_types = {}
-        for anomaly in user_anomalies:
-            if isinstance(anomaly, dict):
-                anomaly_type = anomaly.get('anomaly_type', 'unknown')
-                if anomaly_type not in anomaly_types:
-                    anomaly_types[anomaly_type] = {
-                        'count': 0,
-                        'users': set(),
-                        'severity_levels': set()
-                    }
-                
-                anomaly_types[anomaly_type]['count'] += 1
-                anomaly_types[anomaly_type]['users'].add(anomaly.get('user_name', 'unknown'))
-                anomaly_types[anomaly_type]['severity_levels'].add(anomaly.get('severity', 'medium'))
-        
-        # Convert sets to lists for JSON serialization
-        for anomaly_type in anomaly_types:
-            anomaly_types[anomaly_type]['users'] = list(anomaly_types[anomaly_type]['users'])
-            anomaly_types[anomaly_type]['severity_levels'] = list(anomaly_types[anomaly_type]['severity_levels'])
-        
-        return anomaly_types
-    
-    def _get_user_anomaly_severity_distribution(self, user_anomalies):
-        """Get distribution of user anomalies by severity"""
-        if not user_anomalies:
-            return {}
-        
-        severity_distribution = {
-            'low': 0,
-            'medium': 0,
-            'high': 0,
-            'critical': 0
-        }
-        
-        for anomaly in user_anomalies:
-            if isinstance(anomaly, dict):
-                severity = anomaly.get('severity', 'medium').lower()
-                if severity in severity_distribution:
-                    severity_distribution[severity] += 1
-        
-        return severity_distribution
-    
-    def _get_top_anomalous_users(self, user_anomalies, limit=10):
-        """Get top users with most anomalies"""
-        if not user_anomalies:
-            return []
-        
-        user_anomaly_counts = {}
-        for anomaly in user_anomalies:
-            if isinstance(anomaly, dict):
-                user_name = anomaly.get('user_name', 'unknown')
-                if user_name not in user_anomaly_counts:
-                    user_anomaly_counts[user_name] = {
-                        'user_name': user_name,
-                        'anomaly_count': 0,
-                        'anomaly_types': set(),
-                        'severity_levels': set(),
-                        'total_risk_score': 0
-                    }
-                
-                user_anomaly_counts[user_name]['anomaly_count'] += 1
-                user_anomaly_counts[user_name]['anomaly_types'].add(anomaly.get('anomaly_type', 'unknown'))
-                user_anomaly_counts[user_name]['severity_levels'].add(anomaly.get('severity', 'medium'))
-                user_anomaly_counts[user_name]['total_risk_score'] += anomaly.get('risk_score', 0)
-        
-        # Convert sets to lists and calculate average risk score
-        for user_data in user_anomaly_counts.values():
-            user_data['anomaly_types'] = list(user_data['anomaly_types'])
-            user_data['severity_levels'] = list(user_data['severity_levels'])
-            user_data['avg_risk_score'] = user_data['total_risk_score'] / user_data['anomaly_count'] if user_data['anomaly_count'] > 0 else 0
-        
-        # Sort by anomaly count and return top users
-        top_users = sorted(user_anomaly_counts.values(), key=lambda x: x['anomaly_count'], reverse=True)
-        return top_users[:limit]
-    
-    def _get_user_anomaly_trends(self, user_anomalies):
-        """Get trends in user anomalies over time"""
-        if not user_anomalies:
-            return {}
-        
-        # Group anomalies by date
-        date_anomalies = {}
-        for anomaly in user_anomalies:
-            if isinstance(anomaly, dict):
-                date_str = anomaly.get('date', 'unknown')
-                if date_str not in date_anomalies:
-                    date_anomalies[date_str] = {
-                        'date': date_str,
-                        'anomaly_count': 0,
-                        'unique_users': set(),
-                        'anomaly_types': set()
-                    }
-                
-                date_anomalies[date_str]['anomaly_count'] += 1
-                date_anomalies[date_str]['unique_users'].add(anomaly.get('user_name', 'unknown'))
-                date_anomalies[date_str]['anomaly_types'].add(anomaly.get('anomaly_type', 'unknown'))
-        
-        # Convert sets to lists
-        for date_data in date_anomalies.values():
-            date_data['unique_users'] = list(date_data['unique_users'])
-            date_data['anomaly_types'] = list(date_data['anomaly_types'])
-        
-        # Sort by date
-        sorted_dates = sorted(date_anomalies.values(), key=lambda x: x['date'])
-        
-        return {
-            'daily_trends': sorted_dates,
-            'total_days': len(sorted_dates),
-            'avg_anomalies_per_day': sum(d['anomaly_count'] for d in sorted_dates) / len(sorted_dates) if sorted_dates else 0
-        }
-    
-    def _get_user_risk_distribution(self, user_risk_assessment):
-        """Get distribution of user risk levels"""
-        if not user_risk_assessment:
-            return {}
-        
-        risk_distribution = {
-            'low': 0,
-            'medium': 0,
-            'high': 0,
-            'critical': 0
-        }
-        
-        # Handle list-based user risk assessment
-        if isinstance(user_risk_assessment, list):
-            for user in user_risk_assessment:
-                if isinstance(user, dict):
-                    risk_level = user.get('risk_level', 'low').lower()
-                    if risk_level in risk_distribution:
-                        risk_distribution[risk_level] += 1
-        
-        # Handle dictionary-based user risk assessment (legacy)
-        elif isinstance(user_risk_assessment, dict):
-            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
-            for user in user_risk_scores:
-                if isinstance(user, dict):
-                    risk_level = user.get('risk_level', 'low').lower()
-                    if risk_level in risk_distribution:
-                        risk_distribution[risk_level] += 1
-        
-        return risk_distribution
-    
-    def _extract_user_risk_factors(self, user_risk_assessment):
-        """Extract key risk factors from user risk assessment"""
-        if not user_risk_assessment:
-            return []
-        
-        risk_factors = []
-        
-        # Handle list-based user risk assessment
-        if isinstance(user_risk_assessment, list):
-            for user in user_risk_assessment:
-                if isinstance(user, dict):
-                    factors = user.get('risk_factors', [])
-                    if isinstance(factors, list):
-                        risk_factors.extend(factors)
-        
-        # Handle dictionary-based user risk assessment (legacy)
-        elif isinstance(user_risk_assessment, dict):
-            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
-            for user in user_risk_scores:
-                if isinstance(user, dict):
-                    factors = user.get('risk_factors', [])
-                    if isinstance(factors, list):
-                        risk_factors.extend(factors)
-        
-        # Count frequency of each risk factor
-        factor_counts = {}
-        for factor in risk_factors:
-            if isinstance(factor, dict):
-                factor_name = factor.get('factor', 'unknown')
-            else:
-                factor_name = str(factor)
-            
-            if factor_name not in factor_counts:
-                factor_counts[factor_name] = 0
-            factor_counts[factor_name] += 1
-        
-        # Return top risk factors
-        sorted_factors = sorted(factor_counts.items(), key=lambda x: x[1], reverse=True)
-        return [{'factor': factor, 'count': count} for factor, count in sorted_factors[:10]]
-    
-    def _get_top_risk_users(self, user_risk_assessment, limit=10):
-        """Get top users with highest risk scores"""
-        if not user_risk_assessment:
-            return []
-        
-        user_risk_data = []
-        
-        # Handle list-based user risk assessment
-        if isinstance(user_risk_assessment, list):
-            for user in user_risk_assessment:
-                if isinstance(user, dict):
-                    user_risk_data.append({
-                        'user_name': user.get('user_name', 'unknown'),
-                        'risk_score': user.get('risk_score', 0),
-                        'risk_level': user.get('risk_level', 'low'),
-                        'risk_factors': user.get('risk_factors', [])
-                    })
-        
-        # Handle dictionary-based user risk assessment (legacy)
-        elif isinstance(user_risk_assessment, dict):
-            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
-            for user in user_risk_scores:
-                if isinstance(user, dict):
-                    user_risk_data.append({
-                        'user_name': user.get('user_name', 'unknown'),
-                        'risk_score': user.get('risk_score', 0),
-                        'risk_level': user.get('risk_level', 'low'),
-                        'risk_factors': user.get('risk_factors', [])
-                    })
-        
-        # Sort by risk score and return top users
-        sorted_users = sorted(user_risk_data, key=lambda x: x['risk_score'], reverse=True)
-        return sorted_users[:limit]
-    
-    def _analyze_user_transaction_patterns(self, user_transaction_summary):
-        """Analyze patterns in user transaction behavior"""
-        if not user_transaction_summary:
-            return {}
-        
-        patterns = {
-            'high_activity_users': [],
-            'low_activity_users': [],
-            'high_value_users': [],
-            'multi_account_users': []
-        }
-        
-        for user in user_transaction_summary:
-            if isinstance(user, dict):
-                user_name = user.get('user_name', 'unknown')
-                transaction_count = user.get('transaction_count', 0)
-                total_amount = user.get('total_amount', 0)
-                account_count = user.get('account_count', 0)
-                
-                # High activity users (>10 transactions)
-                if transaction_count > 10:
-                    patterns['high_activity_users'].append({
-                        'user_name': user_name,
-                        'transaction_count': transaction_count,
-                        'total_amount': total_amount
-                    })
-                
-                # Low activity users (≤5 transactions)
-                if transaction_count <= 5:
-                    patterns['low_activity_users'].append({
-                        'user_name': user_name,
-                        'transaction_count': transaction_count,
-                        'total_amount': total_amount
-                    })
-                
-                # High value users (>1M total amount)
-                if total_amount > 1000000:
-                    patterns['high_value_users'].append({
-                        'user_name': user_name,
-                        'transaction_count': transaction_count,
-                        'total_amount': total_amount
-                    })
-                
-                # Multi-account users (>5 accounts)
-                if account_count > 5:
-                    patterns['multi_account_users'].append({
-                        'user_name': user_name,
-                        'account_count': account_count,
-                        'transaction_count': transaction_count
-                    })
-        
-        return patterns
-    
-    def _analyze_account_access_patterns(self, user_account_distribution):
-        """Analyze patterns in user account access"""
-        if not user_account_distribution:
-            return {}
-        
-        patterns = {
-            'most_accessed_accounts': [],
-            'exclusive_accounts': [],
-            'shared_accounts': []
-        }
-        
-        for account_data in user_account_distribution:
-            if isinstance(account_data, dict):
-                account = account_data.get('account', 'unknown')
-                user_count = account_data.get('user_count', 0)
-                transaction_count = account_data.get('transaction_count', 0)
-                
-                account_info = {
-                    'account': account,
-                    'user_count': user_count,
-                    'transaction_count': transaction_count
-                }
-                
-                # Most accessed accounts (high transaction count)
-                if transaction_count > 50:
-                    patterns['most_accessed_accounts'].append(account_info)
-                
-                # Exclusive accounts (only 1 user)
-                if user_count == 1:
-                    patterns['exclusive_accounts'].append(account_info)
-                
-                # Shared accounts (multiple users)
-                if user_count > 3:
-                    patterns['shared_accounts'].append(account_info)
-        
-        # Sort by relevant metrics
-        patterns['most_accessed_accounts'].sort(key=lambda x: x['transaction_count'], reverse=True)
-        patterns['exclusive_accounts'].sort(key=lambda x: x['transaction_count'], reverse=True)
-        patterns['shared_accounts'].sort(key=lambda x: x['user_count'], reverse=True)
-        
-        return patterns
-    
-    def _analyze_temporal_patterns(self, transactions):
-        """Analyze temporal patterns in user activity"""
-        if not transactions:
-            return {}
-        
-        # Group transactions by user and date
-        user_daily_activity = {}
-        for transaction in transactions:
-            user_name = transaction.user_name
-            date_str = transaction.posting_date.isoformat()
-            
-            if user_name not in user_daily_activity:
-                user_daily_activity[user_name] = {}
-            
-            if date_str not in user_daily_activity[user_name]:
-                user_daily_activity[user_name][date_str] = {
-                    'transaction_count': 0,
-                    'total_amount': 0,
-                    'accounts_accessed': set()
-                }
-            
-            user_daily_activity[user_name][date_str]['transaction_count'] += 1
-            user_daily_activity[user_name][date_str]['total_amount'] += float(transaction.amount_local_currency)
-            user_daily_activity[user_name][date_str]['accounts_accessed'].add(transaction.gl_account)
-        
-        # Convert sets to lists
-        for user_data in user_daily_activity.values():
-            for date_data in user_data.values():
-                date_data['accounts_accessed'] = list(date_data['accounts_accessed'])
-        
-        patterns = {
-            'user_daily_activity': user_daily_activity,
-            'peak_activity_days': self._find_peak_activity_days(transactions),
-            'weekend_activity': self._analyze_weekend_activity(transactions),
-            'monthly_trends': self._analyze_monthly_trends(transactions)
-        }
-        
-        return patterns
-    
-    def _find_peak_activity_days(self, transactions):
-        """Find days with peak transaction activity"""
-        daily_counts = {}
-        for transaction in transactions:
-            date_str = transaction.posting_date.isoformat()
-            daily_counts[date_str] = daily_counts.get(date_str, 0) + 1
-        
-        # Find top 5 busiest days
-        sorted_days = sorted(daily_counts.items(), key=lambda x: x[1], reverse=True)
-        return [{'date': date, 'transaction_count': count} for date, count in sorted_days[:5]]
-    
-    def _analyze_weekend_activity(self, transactions):
-        """Analyze weekend vs weekday activity"""
-        weekday_count = 0
-        weekend_count = 0
-        
-        for transaction in transactions:
-            if transaction.posting_date.weekday() < 5:  # Monday = 0, Friday = 4
-                weekday_count += 1
-            else:
-                weekend_count += 1
-        
-        return {
-            'weekday_transactions': weekday_count,
-            'weekend_transactions': weekend_count,
-            'weekend_percentage': (weekend_count / (weekday_count + weekend_count) * 100) if (weekday_count + weekend_count) > 0 else 0
-        }
-    
-    def _analyze_monthly_trends(self, transactions):
-        """Analyze monthly transaction trends"""
-        monthly_counts = {}
-        for transaction in transactions:
-            month_key = f"{transaction.posting_date.year}-{transaction.posting_date.month:02d}"
-            monthly_counts[month_key] = monthly_counts.get(month_key, 0) + 1
-        
-        # Sort by month
-        sorted_months = sorted(monthly_counts.items())
-        return [{'month': month, 'transaction_count': count} for month, count in sorted_months]
-    
-    def _prepare_user_anomaly_export(self, user_anomalies):
-        """Prepare user anomalies data for export"""
-        if not user_anomalies:
-            return []
-        
-        export_data = []
-        for anomaly in user_anomalies:
-            if isinstance(anomaly, dict):
-                export_data.append({
-                    'user_name': anomaly.get('user_name', ''),
-                    'anomaly_type': anomaly.get('anomaly_type', ''),
-                    'severity': anomaly.get('severity', ''),
-                    'risk_score': anomaly.get('risk_score', 0),
-                    'description': anomaly.get('description', ''),
-                    'date': anomaly.get('date', ''),
-                    'transaction_count': anomaly.get('transaction_count', 0),
-                    'total_amount': anomaly.get('total_amount', 0)
-                })
-        
-        return export_data
-    
-    def _prepare_user_risk_export(self, user_risk_assessment):
-        """Prepare user risk assessment data for export"""
-        if not user_risk_assessment:
-            return []
-        
-        export_data = []
-        
-        # Handle list-based user risk assessment
-        if isinstance(user_risk_assessment, list):
-            for user in user_risk_assessment:
-                if isinstance(user, dict):
-                    export_data.append({
-                        'user_name': user.get('user_name', ''),
-                        'risk_score': user.get('risk_score', 0),
-                        'risk_level': user.get('risk_level', ''),
-                        'risk_factors': user.get('risk_factors', []),
-                        'transaction_count': user.get('transaction_count', 0),
-                        'total_amount': user.get('total_amount', 0)
-                    })
-        
-        # Handle dictionary-based user risk assessment (legacy)
-        elif isinstance(user_risk_assessment, dict):
-            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
-            for user in user_risk_scores:
-                if isinstance(user, dict):
-                    export_data.append({
-                        'user_name': user.get('user_name', ''),
-                        'risk_score': user.get('risk_score', 0),
-                        'risk_level': user.get('risk_level', ''),
-                        'risk_factors': user.get('risk_factors', []),
-                        'transaction_count': user.get('transaction_count', 0),
-                        'total_amount': user.get('total_amount', 0)
-                    })
-        
-        return export_data
-    
-    def _enhance_closing_entries_analysis(self, closing_entries_analysis, transactions):
-        """Enhanced closing entries analysis with statistics only - no chart or listing data"""
-        try:
-            enhanced_analysis = {
-                'analysis_id': str(closing_entries_analysis.id),
-                'analysis_date': closing_entries_analysis.analysis_date,
-                'processing_duration': closing_entries_analysis.processing_duration,
-                'status': closing_entries_analysis.status,
-                'analysis_version': closing_entries_analysis.analysis_version or '1.0.0',
-                
-                # Closing Entries Summary Statistics Only
-                'closing_entries_summary': {
-                    'total_transactions': closing_entries_analysis.get_total_transactions(),
-                    'closing_entries_count': closing_entries_analysis.get_closing_entries_count(),
-                    'post_close_entries_count': closing_entries_analysis.get_post_close_entries_count(),
-                    'closing_entries_percentage': (closing_entries_analysis.get_closing_entries_count() / closing_entries_analysis.get_total_transactions() * 100) if closing_entries_analysis.get_total_transactions() > 0 else 0,
-                    'post_close_percentage': (closing_entries_analysis.get_post_close_entries_count() / closing_entries_analysis.get_total_transactions() * 100) if closing_entries_analysis.get_total_transactions() > 0 else 0,
-                    'date_range': {
-                        'earliest_date': min(t.posting_date for t in transactions).isoformat() if transactions else None,
-                        'latest_date': max(t.posting_date for t in transactions).isoformat() if transactions else None
-                    }
-                },
-                
-                # Risk Assessment Statistics Only
-                'risk_assessment': {
-                    'risk_level': closing_entries_analysis.get_risk_level(),
-                    'closing_entries_risk_score': closing_entries_analysis.get_closing_entries_risk_score(),
-                    'post_close_risk_score': closing_entries_analysis.get_post_close_risk_score(),
-                    'high_value_post_close_risk_score': closing_entries_analysis.get_high_value_post_close_risk_score(),
-                    'overall_risk_score': closing_entries_analysis.get_overall_risk_score(),
-                    'recommendations': closing_entries_analysis.get_recommendations()
-                }
-            }
-            
-            return enhanced_analysis
-            
-        except Exception as e:
-            logger.error(f"Error enhancing closing entries analysis: {e}")
-            return {
-                'error': f'Error enhancing closing entries analysis: {str(e)}',
-                'status': 'ERROR'
-            }
-    
-    def _enhance_unusual_days_analysis(self, unusual_days_analysis, transactions):
-        """Enhanced unusual days analysis with statistics only - no chart or listing data"""
-        try:
-            enhanced_analysis = {
-                'analysis_id': str(unusual_days_analysis.id),
-                'analysis_date': unusual_days_analysis.analysis_date,
-                'processing_duration': unusual_days_analysis.processing_duration,
-                'status': unusual_days_analysis.status,
-                'analysis_version': unusual_days_analysis.analysis_version or '1.0.0',
-                
-                # Unusual Days Summary Statistics Only
-                'unusual_days_summary': {
-                    'total_transactions': unusual_days_analysis.get_total_transactions(),
-                    'weekend_transactions_count': unusual_days_analysis.get_weekend_transactions_count(),
-                    'unusual_days_count': unusual_days_analysis.get_unusual_days_count(),
-                    'weekend_percentage': (unusual_days_analysis.get_weekend_transactions_count() / unusual_days_analysis.get_total_transactions() * 100) if unusual_days_analysis.get_total_transactions() > 0 else 0,
-                    'unusual_days_percentage': (unusual_days_analysis.get_unusual_days_count() / unusual_days_analysis.get_total_transactions() * 100) if unusual_days_analysis.get_total_transactions() > 0 else 0,
-                    'date_range': {
-                        'earliest_date': min(t.posting_date for t in transactions).isoformat() if transactions else None,
-                        'latest_date': max(t.posting_date for t in transactions).isoformat() if transactions else None
-                    }
-                },
-                
-                # Risk Assessment Statistics Only
-                'risk_assessment': {
-                    'risk_level': unusual_days_analysis.get_risk_level(),
-                    'weekend_risk_score': unusual_days_analysis.get_weekend_risk_score(),
-                    'unusual_pattern_risk_score': unusual_days_analysis.get_unusual_pattern_risk_score(),
-                    'high_value_weekend_risk_score': unusual_days_analysis.get_high_value_weekend_risk_score(),
-                    'overall_risk_score': unusual_days_analysis.get_overall_risk_score(),
-                    'recommendations': unusual_days_analysis.get_recommendations()
-                }
-            }
-            
-            return enhanced_analysis
-            
-        except Exception as e:
-            logger.error(f"Error enhancing unusual days analysis: {e}")
-            return {
-                'error': f'Error enhancing unusual days analysis: {str(e)}',
-                'status': 'ERROR'
-            }
-    
-    def _prepare_user_summary_export(self, user_transaction_summary):
-        """Prepare user transaction summary data for export"""
-        if not user_transaction_summary:
-            return []
-        
-        export_data = []
-        for user in user_transaction_summary:
-            if isinstance(user, dict):
-                export_data.append({
-                    'user_name': user.get('user_name', ''),
-                    'transaction_count': user.get('transaction_count', 0),
-                    'total_amount': user.get('total_amount', 0),
-                    'account_count': user.get('account_count', 0),
-                    'avg_amount': user.get('avg_amount', 0),
-                    'min_amount': user.get('min_amount', 0),
-                    'max_amount': user.get('max_amount', 0),
-                    'first_transaction_date': user.get('first_transaction_date', ''),
-                    'last_transaction_date': user.get('last_transaction_date', '')
-                })
-        
-        return export_data
+            return 'VERY_LOW'
 
 class SAPGLPostingPagination(PageNumberPagination):
     page_size = 50
@@ -3985,19 +2372,44 @@ class DuplicateAnalysisView(generics.GenericAPIView):
         return list(accounts)
 
 class UserAnalysisView(generics.GenericAPIView):
-    """API view for retrieving user analysis results by file ID.
+    """Enhanced API view for retrieving comprehensive user analysis results by file ID.
     
     This view provides comprehensive user analysis results including:
-    - User transaction summaries
-    - User anomaly detection
-    - User risk assessment
-    - Chart data for visualizations
-    - Export-ready data
+    - User transaction summaries and patterns
+    - Enhanced user anomaly detection with ML integration
+    - Comprehensive user risk assessment and scoring
+    - Advanced chart data for visualizations
+    - Export-ready data with multiple formats
+    - Audit recommendations and compliance assessment
+    - Financial statement impact analysis
     """
     
     def get(self, request, file_id):
-        """Get user analysis results for a specific file"""
+        """Get comprehensive user analysis results for a specific file"""
         try:
+            # Validate file exists
+            try:
+                data_file = DataFile.objects.select_related().get(id=file_id)
+            except DataFile.DoesNotExist:
+                return Response(
+                    {
+                        'error': f'File with ID {file_id} not found',
+                        'error_code': 'FILE_NOT_FOUND',
+                        'suggestions': ['Verify the file ID is correct', 'Check if the file has been uploaded']
+                    },
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            except Exception as e:
+                logger.error(f"Database error retrieving file {file_id}: {e}")
+                return Response(
+                    {
+                        'error': 'Database error occurred while retrieving file',
+                        'error_code': 'DATABASE_ERROR',
+                        'details': str(e)
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            
             # Get the latest user analysis result
             from .models import UserAnalysisResult
             user_analysis = UserAnalysisResult.objects.filter(
@@ -4010,67 +2422,113 @@ class UserAnalysisView(generics.GenericAPIView):
                     'error_code': 'NO_USER_ANALYSIS_FOUND',
                     'suggestions': [
                         'Run user analysis for this file',
-                        'Check if user analysis processing completed successfully'
+                        'Check if user analysis processing completed successfully',
+                        'Verify the analysis status is COMPLETED'
                     ]
-                }, status=404)
+                }, status=status.HTTP_404_NOT_FOUND)
             
-            # Prepare response data
+            # Prepare comprehensive response data
             response_data = {
                 'analysis_info': {
                     'analysis_id': str(user_analysis.id),
-                    'analysis_date': user_analysis.analysis_date,
+                    'analysis_date': user_analysis.analysis_date.isoformat(),
+                    'analysis_type': user_analysis.analysis_type,
+                    'analysis_version': user_analysis.analysis_version,
                     'processing_duration': user_analysis.processing_duration,
                     'status': user_analysis.status,
-                    'analysis_version': user_analysis.analysis_version or '1.0.0'
+                    'file_info': {
+                        'file_name': data_file.file_name,
+                        'file_id': str(data_file.id),
+                        'uploaded_at': data_file.uploaded_at.isoformat(),
+                        'total_records': data_file.total_records
+                    }
                 },
                 'summary': {
                     'total_users': user_analysis.get_total_users(),
                     'total_transactions': user_analysis.get_total_transactions(),
                     'anomalies_detected': user_analysis.get_anomalies_count(),
                     'high_risk_users': user_analysis.get_high_risk_users_count(),
-                    'risk_distribution': self._get_risk_distribution_from_list(user_analysis.user_risk_assessment)
+                    'risk_distribution': self._get_risk_distribution(user_analysis.user_risk_assessment),
+                    'anomaly_distribution': self._get_anomaly_distribution(user_analysis.user_anomalies),
+                    'processing_summary': {
+                        'analysis_duration': user_analysis.processing_duration,
+                        'analysis_date': user_analysis.analysis_date.isoformat(),
+                        'analysis_version': user_analysis.analysis_version
+                    }
                 },
                 'user_analysis': {
                     'user_transaction_summary': user_analysis.user_transaction_summary or [],
                     'user_debit_analysis': user_analysis.user_debit_analysis or [],
                     'user_account_distribution': user_analysis.user_account_distribution or [],
-                    'user_fs_line_distribution': user_analysis.user_fs_line_distribution or []
+                    'user_fs_line_distribution': user_analysis.user_fs_line_distribution or [],
+                    'user_patterns': user_analysis.user_patterns or {}
                 },
                 'anomaly_detection': {
                     'user_anomalies': user_analysis.user_anomalies or [],
-                    'anomaly_types': self._get_anomaly_type_summary(user_analysis.user_anomalies or []),
-                    'ml_detected_anomalies': self._get_ml_anomalies(user_analysis.user_anomalies or [])
+                    'anomaly_types': self._get_anomaly_type_summary(user_analysis.user_anomalies),
+                    'ml_detected_anomalies': self._get_ml_anomalies(user_analysis.user_anomalies),
+                    'anomaly_severity_breakdown': self._get_anomaly_severity_breakdown(user_analysis.user_anomalies),
+                    'anomaly_trends': self._extract_anomaly_trends(user_analysis.user_anomalies)
                 },
                 'risk_assessment': {
-                    'user_risk_scores': user_analysis.user_risk_assessment if isinstance(user_analysis.user_risk_assessment, list) else [],
-                    'high_risk_users': self._get_high_risk_users_from_list(user_analysis.user_risk_assessment),
-                    'risk_factors': self._extract_risk_factors_from_list(user_analysis.user_risk_assessment)
+                    'user_risk_scores': self._format_user_risk_assessment(user_analysis.user_risk_assessment),
+                    'high_risk_users': self._get_high_risk_users(user_analysis.user_risk_assessment),
+                    'risk_factors': self._extract_risk_factors(user_analysis.user_risk_assessment),
+                    'risk_trends': self._extract_risk_trends(user_analysis.user_risk_assessment),
+                    'risk_calculations': self._get_risk_calculations(user_analysis.user_risk_assessment)
                 },
                 'patterns': {
                     'user_patterns': user_analysis.user_patterns or {},
-                    'activity_trends': self._extract_activity_trends(user_analysis.user_transaction_summary or [])
+                    'activity_trends': self._extract_activity_trends(user_analysis.user_transaction_summary),
+                    'user_behavior_analysis': self._analyze_user_behavior(user_analysis.user_transaction_summary),
+                    'temporal_patterns': self._extract_temporal_patterns(user_analysis.user_transaction_summary)
                 },
                 'visualizations': {
                     'chart_data': user_analysis.chart_data or {},
                     'chart_types': [
-                        'transaction_vs_average',
-                        'debit_value_analysis', 
-                        'users_per_account',
-                        'users_per_fs_line',
-                        'anomaly_distribution'
-                    ]
+                        'user_transaction_distribution',
+                        'user_risk_distribution',
+                        'anomaly_distribution',
+                        'user_activity_trends',
+                        'risk_score_distribution',
+                        'user_account_distribution',
+                        'user_fs_line_distribution'
+                    ],
+                    'chart_configurations': self._get_chart_configurations()
                 },
-                # 'export_data': {
-                #     'user_summary': self._prepare_user_summary_export(user_analysis.user_transaction_summary or []),
-                #     'anomaly_export': self._prepare_anomaly_export(user_analysis.user_anomalies or []),
-                #     'risk_export': self._prepare_risk_export_from_list(user_analysis.user_risk_assessment)
-                # }
+                'audit_recommendations': {
+                    'high_priority_recommendations': self._generate_high_priority_recommendations(user_analysis),
+                    'medium_priority_recommendations': self._generate_medium_priority_recommendations(user_analysis),
+                    'low_priority_recommendations': self._generate_low_priority_recommendations(user_analysis),
+                    'compliance_issues': self._identify_compliance_issues(user_analysis),
+                    'follow_up_actions': self._generate_follow_up_actions(user_analysis)
+                },
+                'compliance_assessment': {
+                    'overall_compliance_score': self._calculate_compliance_score(user_analysis),
+                    'compliance_risks': self._identify_compliance_risks(user_analysis),
+                    'regulatory_implications': self._assess_regulatory_implications(user_analysis),
+                    'internal_control_assessment': self._assess_internal_controls(user_analysis)
+                },
+                'financial_statement_impact': {
+                    'material_impact_assessment': self._assess_material_impact(user_analysis),
+                    'financial_statement_risks': self._identify_fs_risks(user_analysis),
+                    'disclosure_requirements': self._assess_disclosure_requirements(user_analysis),
+                    'audit_implications': self._assess_audit_implications(user_analysis)
+                },
+                'export_data': {
+                    'user_summary': self._prepare_user_summary_export(user_analysis.user_transaction_summary),
+                    'anomaly_export': self._prepare_anomaly_export(user_analysis.user_anomalies),
+                    'risk_export': self._prepare_risk_export(user_analysis.user_risk_assessment),
+                    'patterns_export': self._prepare_patterns_export(user_analysis.user_patterns),
+                    'recommendations_export': self._prepare_recommendations_export(user_analysis)
+                }
             }
             
             # Log successful retrieval
             user_count = user_analysis.get_total_users()
             anomaly_count = user_analysis.get_anomalies_count()
-            logger.info(f"Successfully retrieved user analysis for file {file_id} with {user_count} users and {anomaly_count} anomalies")
+            high_risk_count = user_analysis.get_high_risk_users_count()
+            logger.info(f"Successfully retrieved enhanced user analysis for file {file_id} with {user_count} users, {anomaly_count} anomalies, and {high_risk_count} high-risk users")
             
             return Response(response_data)
             
@@ -4079,73 +2537,69 @@ class UserAnalysisView(generics.GenericAPIView):
             return Response({
                 'error': 'Error occurred while retrieving user analysis',
                 'error_code': 'USER_ANALYSIS_ERROR',
-                'details': str(e)
-            }, status=500)
+                'details': str(e),
+                'suggestions': [
+                    'Check if the analysis was completed successfully',
+                    'Verify the file exists and has been processed',
+                    'Contact system administrator if the issue persists'
+                ]
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
-    def _get_risk_distribution_from_list(self, user_risk_assessment):
-        """Get risk distribution from list-based user risk assessment"""
-        if not isinstance(user_risk_assessment, list):
-            return {}
+    def _get_risk_distribution(self, user_risk_assessment):
+        """Get comprehensive risk distribution from user risk assessment"""
+        if not user_risk_assessment:
+            return {'low': 0, 'medium': 0, 'high': 0, 'critical': 0, 'total': 0}
         
-        risk_distribution = {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+        risk_distribution = {'low': 0, 'medium': 0, 'high': 0, 'critical': 0, 'total': 0}
         
-        for user_risk in user_risk_assessment:
-            if isinstance(user_risk, dict):
-                risk_level = user_risk.get('risk_level', 'low')
-                if risk_level in risk_distribution:
-                    risk_distribution[risk_level] += 1
+        # Handle list-based user risk assessment
+        if isinstance(user_risk_assessment, list):
+            for user_risk in user_risk_assessment:
+                if isinstance(user_risk, dict):
+                    risk_level = user_risk.get('risk_level', 'low').lower()
+                    if risk_level in risk_distribution:
+                        risk_distribution[risk_level] += 1
+                    risk_distribution['total'] += 1
+        
+        # Handle dictionary-based user risk assessment (legacy)
+        elif isinstance(user_risk_assessment, dict):
+            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
+            if isinstance(user_risk_scores, list):
+                for user_risk in user_risk_scores:
+                    if isinstance(user_risk, dict):
+                        risk_level = user_risk.get('risk_level', 'low').lower()
+                        if risk_level in risk_distribution:
+                            risk_distribution[risk_level] += 1
+                        risk_distribution['total'] += 1
         
         return risk_distribution
     
-    def _get_high_risk_users_from_list(self, user_risk_assessment):
-        """Get high risk users from list-based user risk assessment"""
-        if not isinstance(user_risk_assessment, list):
-            return []
+    def _get_anomaly_distribution(self, user_anomalies):
+        """Get anomaly distribution summary"""
+        if not user_anomalies or not isinstance(user_anomalies, list):
+            return {'total': 0, 'by_type': {}, 'by_severity': {}}
         
-        high_risk_users = []
-        for user_risk in user_risk_assessment:
-            if isinstance(user_risk, dict) and user_risk.get('risk_level') in ['high', 'critical']:
-                high_risk_users.append(user_risk)
+        distribution = {
+            'total': len(user_anomalies),
+            'by_type': {},
+            'by_severity': {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+        }
         
-        return high_risk_users
-    
-    def _extract_risk_factors_from_list(self, user_risk_assessment):
-        """Extract key risk factors from list-based user risk assessment"""
-        risk_factors = []
+        for anomaly in user_anomalies:
+            if isinstance(anomaly, dict):
+                # Count by type
+                anomaly_type = anomaly.get('anomaly_type', 'unknown')
+                distribution['by_type'][anomaly_type] = distribution['by_type'].get(anomaly_type, 0) + 1
+                
+                # Count by severity
+                severity = anomaly.get('severity', 'medium').lower()
+                if severity in distribution['by_severity']:
+                    distribution['by_severity'][severity] += 1
         
-        if not isinstance(user_risk_assessment, list):
-            return risk_factors
-        
-        # High risk users
-        high_risk_users = [user for user in user_risk_assessment if isinstance(user, dict) and user.get('risk_level') in ['high', 'critical']]
-        if high_risk_users:
-            risk_factors.append({
-                'factor': 'High-risk users',
-                'count': len(high_risk_users),
-                'impact': 'HIGH',
-                'description': f'{len(high_risk_users)} users identified with high or critical risk levels'
-            })
-        
-        # Users with high risk scores
-        high_score_users = [user for user in user_risk_assessment if isinstance(user, dict) and user.get('risk_score', 0) > 70]
-        if high_score_users:
-            risk_factors.append({
-                'factor': 'Users with high risk scores',
-                'count': len(high_score_users),
-                'impact': 'MEDIUM',
-                'description': f'{len(high_score_users)} users have risk scores above 70'
-            })
-        
-        return risk_factors
-    
-    def _prepare_risk_export_from_list(self, user_risk_assessment):
-        """Prepare risk assessment data for export from list-based structure"""
-        if not isinstance(user_risk_assessment, list):
-            return []
-        return user_risk_assessment
+        return distribution
     
     def _get_anomaly_type_summary(self, anomalies):
-        """Get summary of anomaly types"""
+        """Get comprehensive summary of anomaly types"""
         anomaly_types = {}
         
         if not anomalies or not isinstance(anomalies, list):
@@ -4159,14 +2613,82 @@ class UserAnalysisView(generics.GenericAPIView):
             if anomaly_type not in anomaly_types:
                 anomaly_types[anomaly_type] = {
                     'count': 0,
-                    'severity_breakdown': {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+                    'severity_breakdown': {'low': 0, 'medium': 0, 'high': 0, 'critical': 0},
+                    'users_affected': set(),
+                    'total_amount': 0.0,
+                    'avg_risk_score': 0.0
                 }
+            
             anomaly_types[anomaly_type]['count'] += 1
             severity = anomaly.get('severity', 'medium')
             if severity in anomaly_types[anomaly_type]['severity_breakdown']:
                 anomaly_types[anomaly_type]['severity_breakdown'][severity] += 1
+            
+            # Track users affected
+            user = anomaly.get('user', 'unknown')
+            anomaly_types[anomaly_type]['users_affected'].add(user)
+            
+            # Track amounts and risk scores
+            amount = anomaly.get('amount', 0.0)
+            anomaly_types[anomaly_type]['total_amount'] += amount
+            risk_score = anomaly.get('risk_score', 0.0)
+            anomaly_types[anomaly_type]['avg_risk_score'] += risk_score
+        
+        # Convert sets to lists and calculate averages
+        for anomaly_type in anomaly_types:
+            anomaly_types[anomaly_type]['users_affected'] = list(anomaly_types[anomaly_type]['users_affected'])
+            if anomaly_types[anomaly_type]['count'] > 0:
+                anomaly_types[anomaly_type]['avg_risk_score'] /= anomaly_types[anomaly_type]['count']
         
         return anomaly_types
+    
+    def _get_anomaly_severity_breakdown(self, anomalies):
+        """Get detailed breakdown of anomalies by severity"""
+        if not anomalies or not isinstance(anomalies, list):
+            return {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+        
+        severity_breakdown = {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+        
+        for anomaly in anomalies:
+            if isinstance(anomaly, dict):
+                severity = anomaly.get('severity', 'medium').lower()
+                if severity in severity_breakdown:
+                    severity_breakdown[severity] += 1
+        
+        return severity_breakdown
+    
+    def _extract_anomaly_trends(self, anomalies):
+        """Extract trends from user anomalies"""
+        if not anomalies or not isinstance(anomalies, list):
+            return {}
+        
+        trends = {
+            'most_common_types': [],
+            'highest_risk_anomalies': [],
+            'users_with_most_anomalies': {}
+        }
+        
+        # Count anomaly types
+        type_counts = {}
+        user_anomaly_counts = {}
+        
+        for anomaly in anomalies:
+            if isinstance(anomaly, dict):
+                # Count by type
+                anomaly_type = anomaly.get('anomaly_type', 'unknown')
+                type_counts[anomaly_type] = type_counts.get(anomaly_type, 0) + 1
+                
+                # Count by user
+                user = anomaly.get('user', 'unknown')
+                user_anomaly_counts[user] = user_anomaly_counts.get(user, 0) + 1
+        
+        # Get most common types
+        trends['most_common_types'] = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        # Get users with most anomalies
+        trends['users_with_most_anomalies'] = dict(sorted(user_anomaly_counts.items(), key=lambda x: x[1], reverse=True)[:10])
+        
+        return trends
     
     def _get_ml_anomalies(self, anomalies):
         """Get ML-detected anomalies"""
@@ -4174,22 +2696,53 @@ class UserAnalysisView(generics.GenericAPIView):
             return []
         return [anomaly for anomaly in anomalies if isinstance(anomaly, dict) and anomaly.get('ml_detected', False)]
     
-    def _extract_risk_factors(self, risk_assessment):
+    def _format_user_risk_assessment(self, user_risk_assessment):
+        """Format user risk assessment for consistent response"""
+        if not user_risk_assessment:
+            return []
+        
+        # Handle list-based user risk assessment
+        if isinstance(user_risk_assessment, list):
+            return user_risk_assessment
+        
+        # Handle dictionary-based user risk assessment (legacy)
+        if isinstance(user_risk_assessment, dict):
+            return user_risk_assessment.get('user_risk_scores', [])
+        
+        return []
+    
+    def _get_high_risk_users(self, user_risk_assessment):
+        """Get high risk users from user risk assessment"""
+        if not user_risk_assessment:
+            return []
+        
+        high_risk_users = []
+        
+        # Handle list-based user risk assessment
+        if isinstance(user_risk_assessment, list):
+            for user_risk in user_risk_assessment:
+                if isinstance(user_risk, dict) and user_risk.get('risk_level', 'low').lower() in ['high', 'critical']:
+                    high_risk_users.append(user_risk)
+        
+        # Handle dictionary-based user risk assessment (legacy)
+        elif isinstance(user_risk_assessment, dict):
+            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
+            if isinstance(user_risk_scores, list):
+                for user_risk in user_risk_scores:
+                    if isinstance(user_risk, dict) and user_risk.get('risk_level', 'low').lower() in ['high', 'critical']:
+                        high_risk_users.append(user_risk)
+        
+        return high_risk_users
+    
+    def _extract_risk_factors(self, user_risk_assessment):
         """Extract key risk factors from user risk assessment"""
         risk_factors = []
         
-        # Ensure risk_assessment is a dictionary
-        if not isinstance(risk_assessment, dict):
-            return risk_factors
-        
-        user_risk_scores = risk_assessment.get('user_risk_scores', [])
-        
-        # Ensure user_risk_scores is a list
-        if not isinstance(user_risk_scores, list):
+        if not user_risk_assessment:
             return risk_factors
         
         # High risk users
-        high_risk_users = [user for user in user_risk_scores if isinstance(user, dict) and user.get('risk_level') in ['high', 'critical']]
+        high_risk_users = self._get_high_risk_users(user_risk_assessment)
         if high_risk_users:
             risk_factors.append({
                 'factor': 'High-risk users',
@@ -4198,63 +2751,560 @@ class UserAnalysisView(generics.GenericAPIView):
                 'description': f'{len(high_risk_users)} users identified with high or critical risk levels'
             })
         
-        # Users with anomalies
-        users_with_anomalies = [user for user in user_risk_scores if isinstance(user, dict) and user.get('anomaly_count', 0) > 0]
-        if users_with_anomalies:
+        # Users with high risk scores
+        formatted_assessment = self._format_user_risk_assessment(user_risk_assessment)
+        high_score_users = [user for user in formatted_assessment if isinstance(user, dict) and user.get('risk_score', 0) > 70]
+        if high_score_users:
             risk_factors.append({
-                'factor': 'Users with anomalies',
-                'count': len(users_with_anomalies),
+                'factor': 'Users with high risk scores',
+                'count': len(high_score_users),
                 'impact': 'MEDIUM',
-                'description': f'{len(users_with_anomalies)} users have detected anomalies'
+                'description': f'{len(high_score_users)} users have risk scores above 70'
             })
         
         return risk_factors
+    
+    def _extract_risk_trends(self, user_risk_assessment):
+        """Extract risk trends from user risk assessment"""
+        if not user_risk_assessment:
+            return {}
+        
+        trends = {
+            'risk_score_distribution': {'low': 0, 'medium': 0, 'high': 0, 'critical': 0},
+            'average_risk_score': 0.0,
+            'highest_risk_users': []
+        }
+        
+        formatted_assessment = self._format_user_risk_assessment(user_risk_assessment)
+        
+        if formatted_assessment:
+            total_score = 0
+            for user_risk in formatted_assessment:
+                if isinstance(user_risk, dict):
+                    risk_level = user_risk.get('risk_level', 'low').lower()
+                    if risk_level in trends['risk_score_distribution']:
+                        trends['risk_score_distribution'][risk_level] += 1
+                    
+                    risk_score = user_risk.get('risk_score', 0.0)
+                    total_score += risk_score
+            
+            trends['average_risk_score'] = total_score / len(formatted_assessment) if formatted_assessment else 0.0
+            
+            # Get highest risk users
+            trends['highest_risk_users'] = sorted(
+                [user for user in formatted_assessment if isinstance(user, dict)],
+                key=lambda x: x.get('risk_score', 0),
+                reverse=True
+            )[:10]
+        
+        return trends
+    
+    def _get_risk_calculations(self, user_risk_assessment):
+        """Get detailed risk calculations"""
+        if not user_risk_assessment:
+            return {}
+        
+        calculations = {
+            'total_users': 0,
+            'risk_score_ranges': {'0-20': 0, '21-40': 0, '41-60': 0, '61-80': 0, '81-100': 0},
+            'risk_level_percentages': {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+        }
+        
+        formatted_assessment = self._format_user_risk_assessment(user_risk_assessment)
+        
+        if formatted_assessment:
+            calculations['total_users'] = len(formatted_assessment)
+            
+            for user_risk in formatted_assessment:
+                if isinstance(user_risk, dict):
+                    risk_score = user_risk.get('risk_score', 0)
+                    risk_level = user_risk.get('risk_level', 'low').lower()
+                    
+                    # Count by score range
+                    if risk_score <= 20:
+                        calculations['risk_score_ranges']['0-20'] += 1
+                    elif risk_score <= 40:
+                        calculations['risk_score_ranges']['21-40'] += 1
+                    elif risk_score <= 60:
+                        calculations['risk_score_ranges']['41-60'] += 1
+                    elif risk_score <= 80:
+                        calculations['risk_score_ranges']['61-80'] += 1
+                    else:
+                        calculations['risk_score_ranges']['81-100'] += 1
+                    
+                    # Count by risk level
+                    if risk_level in calculations['risk_level_percentages']:
+                        calculations['risk_level_percentages'][risk_level] += 1
+            
+            # Calculate percentages
+            if calculations['total_users'] > 0:
+                for level in calculations['risk_level_percentages']:
+                    calculations['risk_level_percentages'][level] = (
+                        calculations['risk_level_percentages'][level] / calculations['total_users'] * 100
+                    )
+        
+        return calculations
     
     def _extract_activity_trends(self, user_summary):
         """Extract activity trends from user summary"""
         if not user_summary or not isinstance(user_summary, list):
             return {}
         
-        # Filter out non-dictionary items
-        valid_users = [user for user in user_summary if isinstance(user, dict)]
+        trends = {
+            'most_active_users': [],
+            'highest_value_users': [],
+            'users_by_transaction_count': {'low': 0, 'medium': 0, 'high': 0}
+        }
         
-        if not valid_users:
+        if user_summary:
+            # Most active users (by transaction count)
+            trends['most_active_users'] = sorted(
+                user_summary,
+                key=lambda x: x.get('transaction_count', 0),
+                reverse=True
+            )[:10]
+            
+            # Highest value users (by total amount)
+            trends['highest_value_users'] = sorted(
+                user_summary,
+                key=lambda x: x.get('total_amount', 0),
+                reverse=True
+            )[:10]
+            
+            # Users by transaction count
+            for user in user_summary:
+                transaction_count = user.get('transaction_count', 0)
+                if transaction_count <= 10:
+                    trends['users_by_transaction_count']['low'] += 1
+                elif transaction_count <= 50:
+                    trends['users_by_transaction_count']['medium'] += 1
+                else:
+                    trends['users_by_transaction_count']['high'] += 1
+        
+        return trends
+    
+    def _analyze_user_behavior(self, user_summary):
+        """Analyze user behavior patterns"""
+        if not user_summary or not isinstance(user_summary, list):
             return {}
         
-        # Calculate averages
-        total_transactions = sum(user.get('transaction_count', 0) for user in valid_users)
-        total_amount = sum(user.get('total_amount', 0) for user in valid_users)
-        avg_transactions = total_transactions / len(valid_users) if valid_users else 0
-        avg_amount = total_amount / len(valid_users) if valid_users else 0
+        behavior = {
+            'behavior_patterns': [],
+            'unusual_activities': [],
+            'user_segments': {'low_activity': 0, 'medium_activity': 0, 'high_activity': 0}
+        }
         
-        # Identify top performers
-        top_transaction_users = sorted(valid_users, key=lambda x: x.get('transaction_count', 0), reverse=True)[:5]
-        top_amount_users = sorted(valid_users, key=lambda x: x.get('total_amount', 0), reverse=True)[:5]
+        if user_summary:
+            for user in user_summary:
+                transaction_count = user.get('transaction_count', 0)
+                total_amount = user.get('total_amount', 0)
+                avg_amount = user.get('avg_amount', 0)
+                
+                # Segment users by activity level
+                if transaction_count <= 5:
+                    behavior['user_segments']['low_activity'] += 1
+                elif transaction_count <= 20:
+                    behavior['user_segments']['medium_activity'] += 1
+                else:
+                    behavior['user_segments']['high_activity'] += 1
+                
+                # Identify unusual activities
+                if transaction_count > 100 or total_amount > 1000000:
+                    behavior['unusual_activities'].append({
+                        'user': user.get('user', 'unknown'),
+                        'reason': 'High activity or value',
+                        'transaction_count': transaction_count,
+                        'total_amount': total_amount
+                    })
         
+        return behavior
+    
+    def _extract_temporal_patterns(self, user_summary):
+        """Extract temporal patterns from user activity"""
+        # This would require additional data not currently in user_summary
+        # Placeholder for future enhancement
         return {
-            'averages': {
-                'avg_transactions_per_user': avg_transactions,
-                'avg_amount_per_user': avg_amount
+            'daily_patterns': {},
+            'weekly_patterns': {},
+            'monthly_patterns': {},
+            'seasonal_trends': {}
+        }
+    
+    def _get_chart_configurations(self):
+        """Get chart configurations for visualizations"""
+        return {
+            'user_transaction_distribution': {
+                'type': 'bar',
+                'title': 'User Transaction Distribution',
+                'x_axis': 'Users',
+                'y_axis': 'Transaction Count'
             },
-            'top_performers': {
-                'top_transaction_users': top_transaction_users,
-                'top_amount_users': top_amount_users
+            'user_risk_distribution': {
+                'type': 'pie',
+                'title': 'User Risk Distribution',
+                'labels': ['Low Risk', 'Medium Risk', 'High Risk', 'Critical Risk']
+            },
+            'anomaly_distribution': {
+                'type': 'doughnut',
+                'title': 'Anomaly Distribution by Type',
+                'show_percentages': True
+            },
+            'user_activity_trends': {
+                'type': 'line',
+                'title': 'User Activity Trends',
+                'x_axis': 'Time Period',
+                'y_axis': 'Activity Level'
             }
         }
     
+    def _generate_high_priority_recommendations(self, user_analysis):
+        """Generate high priority audit recommendations"""
+        recommendations = []
+        
+        high_risk_users = self._get_high_risk_users(user_analysis.user_risk_assessment)
+        if high_risk_users:
+            recommendations.append({
+                'priority': 'HIGH',
+                'category': 'User Risk Management',
+                'recommendation': f'Investigate {len(high_risk_users)} high-risk users immediately',
+                'rationale': 'High-risk users pose significant audit and compliance risks',
+                'action_items': [
+                    'Review all transactions by high-risk users',
+                    'Conduct detailed user access reviews',
+                    'Implement additional monitoring controls'
+                ]
+            })
+        
+        anomalies = user_analysis.user_anomalies or []
+        critical_anomalies = [a for a in anomalies if isinstance(a, dict) and a.get('severity') == 'critical']
+        if critical_anomalies:
+            recommendations.append({
+                'priority': 'HIGH',
+                'category': 'Anomaly Investigation',
+                'recommendation': f'Investigate {len(critical_anomalies)} critical anomalies',
+                'rationale': 'Critical anomalies require immediate attention',
+                'action_items': [
+                    'Review each critical anomaly in detail',
+                    'Assess potential fraud indicators',
+                    'Document findings and remediation actions'
+                ]
+            })
+        
+        return recommendations
+    
+    def _generate_medium_priority_recommendations(self, user_analysis):
+        """Generate medium priority audit recommendations"""
+        recommendations = []
+        
+        # Add medium priority recommendations based on analysis results
+        total_users = user_analysis.get_total_users()
+        if total_users > 100:
+            recommendations.append({
+                'priority': 'MEDIUM',
+                'category': 'User Management',
+                'recommendation': 'Implement user activity monitoring system',
+                'rationale': 'Large number of users requires systematic monitoring',
+                'action_items': [
+                    'Deploy automated monitoring tools',
+                    'Establish regular user access reviews',
+                    'Implement segregation of duties controls'
+                ]
+            })
+        
+        return recommendations
+    
+    def _generate_low_priority_recommendations(self, user_analysis):
+        """Generate low priority audit recommendations"""
+        recommendations = []
+        
+        # Add low priority recommendations for process improvements
+        recommendations.append({
+            'priority': 'LOW',
+            'category': 'Process Improvement',
+            'recommendation': 'Establish regular user analysis reviews',
+            'rationale': 'Regular reviews help maintain control effectiveness',
+            'action_items': [
+                'Schedule quarterly user analysis reviews',
+                'Update user risk assessment criteria',
+                'Document lessons learned and best practices'
+            ]
+        })
+        
+        return recommendations
+    
+    def _identify_compliance_issues(self, user_analysis):
+        """Identify compliance issues from user analysis"""
+        issues = []
+        
+        # Check for segregation of duties violations
+        users_with_high_activity = []
+        user_summary = user_analysis.user_transaction_summary or []
+        for user in user_summary:
+            if isinstance(user, dict) and user.get('transaction_count', 0) > 50:
+                users_with_high_activity.append(user.get('user', 'unknown'))
+        
+        if len(users_with_high_activity) > 0:
+            issues.append({
+                'issue_type': 'Segregation of Duties',
+                'severity': 'MEDIUM',
+                'description': f'{len(users_with_high_activity)} users have excessive transaction activity',
+                'affected_users': users_with_high_activity,
+                'compliance_impact': 'Potential SOD violations'
+            })
+        
+        return issues
+    
+    def _generate_follow_up_actions(self, user_analysis):
+        """Generate follow-up actions for audit team"""
+        actions = []
+        
+        # Immediate actions
+        high_risk_users = self._get_high_risk_users(user_analysis.user_risk_assessment)
+        if high_risk_users:
+            actions.append({
+                'timeline': 'IMMEDIATE',
+                'action': 'Investigate high-risk users',
+                'responsible_party': 'Audit Team',
+                'deadline': 'Within 1 week'
+            })
+        
+        # Short-term actions
+        actions.append({
+            'timeline': 'SHORT_TERM',
+            'action': 'Review and update user access controls',
+            'responsible_party': 'IT Security Team',
+            'deadline': 'Within 1 month'
+        })
+        
+        # Long-term actions
+        actions.append({
+            'timeline': 'LONG_TERM',
+            'action': 'Implement continuous monitoring system',
+            'responsible_party': 'IT Team',
+            'deadline': 'Within 3 months'
+        })
+        
+        return actions
+    
+    def _calculate_compliance_score(self, user_analysis):
+        """Calculate overall compliance score"""
+        score = 100.0
+        
+        # Deduct points for high-risk users
+        high_risk_users = self._get_high_risk_users(user_analysis.user_risk_assessment)
+        if high_risk_users:
+            score -= len(high_risk_users) * 5  # 5 points per high-risk user
+        
+        # Deduct points for anomalies
+        anomalies = user_analysis.user_anomalies or []
+        if anomalies:
+            score -= len(anomalies) * 2  # 2 points per anomaly
+        
+        return max(0, score)
+    
+    def _identify_compliance_risks(self, user_analysis):
+        """Identify compliance risks"""
+        risks = []
+        
+        # Add compliance risks based on analysis
+        risks.append({
+            'risk_type': 'User Access Management',
+            'risk_level': 'MEDIUM',
+            'description': 'Potential segregation of duties violations',
+            'mitigation': 'Implement role-based access controls'
+        })
+        
+        return risks
+    
+    def _assess_regulatory_implications(self, user_analysis):
+        """Assess regulatory implications"""
+        implications = []
+        
+        # Add regulatory implications
+        implications.append({
+            'regulation': 'SOX Compliance',
+            'implication': 'User access controls must be documented and tested',
+            'impact': 'MEDIUM',
+            'action_required': 'Document user access review procedures'
+        })
+        
+        return implications
+    
+    def _assess_internal_controls(self, user_analysis):
+        """Assess internal control effectiveness"""
+        assessment = {
+            'overall_effectiveness': 'ADEQUATE',
+            'control_deficiencies': [],
+            'recommendations': []
+        }
+        
+        # Assess based on analysis results
+        high_risk_users = self._get_high_risk_users(user_analysis.user_risk_assessment)
+        if high_risk_users:
+            assessment['control_deficiencies'].append({
+                'deficiency': 'Inadequate user access controls',
+                'impact': 'HIGH',
+                'recommendation': 'Strengthen user access review process'
+            })
+        
+        return assessment
+    
+    def _assess_material_impact(self, user_analysis):
+        """Assess material impact on financial statements"""
+        assessment = {
+            'materiality_assessment': 'LOW',
+            'impact_areas': [],
+            'quantified_impact': 0.0
+        }
+        
+        # Assess material impact based on analysis
+        user_summary = user_analysis.user_transaction_summary or []
+        total_amount = sum(user.get('total_amount', 0) for user in user_summary if isinstance(user, dict))
+        
+        if total_amount > 1000000:
+            assessment['materiality_assessment'] = 'MEDIUM'
+            assessment['quantified_impact'] = total_amount
+        
+        return assessment
+    
+    def _identify_fs_risks(self, user_analysis):
+        """Identify financial statement risks"""
+        risks = []
+        
+        # Add financial statement risks
+        risks.append({
+            'risk_type': 'User Error',
+            'risk_level': 'LOW',
+            'description': 'Potential errors due to user activity patterns',
+            'mitigation': 'Implement additional review controls'
+        })
+        
+        return risks
+    
+    def _assess_disclosure_requirements(self, user_analysis):
+        """Assess disclosure requirements"""
+        disclosures = []
+        
+        # Add disclosure requirements
+        high_risk_users = self._get_high_risk_users(user_analysis.user_risk_assessment)
+        if high_risk_users:
+            disclosures.append({
+                'disclosure_type': 'Internal Control Deficiency',
+                'description': 'Significant number of high-risk users identified',
+                'required': 'YES',
+                'timeline': 'Immediate'
+            })
+        
+        return disclosures
+    
+    def _assess_audit_implications(self, user_analysis):
+        """Assess audit implications"""
+        implications = []
+        
+        # Add audit implications
+        implications.append({
+            'implication_type': 'Testing Scope',
+            'description': 'User analysis results may require expanded testing',
+            'impact': 'MEDIUM',
+            'action_required': 'Consider additional substantive testing'
+        })
+        
+        return implications
+    
     def _prepare_user_summary_export(self, user_summary):
         """Prepare user summary data for export"""
-        return user_summary
+        if not user_summary or not isinstance(user_summary, list):
+            return []
+        
+        export_data = []
+        for user in user_summary:
+            if isinstance(user, dict):
+                export_data.append({
+                    'user': user.get('user', ''),
+                    'transaction_count': user.get('transaction_count', 0),
+                    'total_amount': user.get('total_amount', 0.0),
+                    'avg_amount': user.get('avg_amount', 0.0),
+                    'accounts': ', '.join(user.get('accounts', []))
+                })
+        
+        return export_data
     
     def _prepare_anomaly_export(self, anomalies):
         """Prepare anomaly data for export"""
-        return anomalies
-    
-    def _prepare_risk_export(self, risk_assessment):
-        """Prepare risk assessment data for export"""
-        if not isinstance(risk_assessment, dict):
+        if not anomalies or not isinstance(anomalies, list):
             return []
-        return risk_assessment.get('user_risk_scores', [])
+        
+        export_data = []
+        for anomaly in anomalies:
+            if isinstance(anomaly, dict):
+                export_data.append({
+                    'user': anomaly.get('user', ''),
+                    'anomaly_type': anomaly.get('anomaly_type', ''),
+                    'severity': anomaly.get('severity', ''),
+                    'risk_score': anomaly.get('risk_score', 0.0),
+                    'details': anomaly.get('details', '')
+                })
+        
+        return export_data
+    
+    def _prepare_risk_export(self, user_risk_assessment):
+        """Prepare risk assessment data for export"""
+        formatted_assessment = self._format_user_risk_assessment(user_risk_assessment)
+        
+        export_data = []
+        for user_risk in formatted_assessment:
+            if isinstance(user_risk, dict):
+                export_data.append({
+                    'user': user_risk.get('user', ''),
+                    'risk_level': user_risk.get('risk_level', ''),
+                    'risk_score': user_risk.get('risk_score', 0.0),
+                    'risk_factors': ', '.join(user_risk.get('risk_factors', []))
+                })
+        
+        return export_data
+    
+    def _prepare_patterns_export(self, user_patterns):
+        """Prepare user patterns data for export"""
+        if not user_patterns or not isinstance(user_patterns, dict):
+            return []
+        
+        export_data = []
+        for pattern_type, pattern_data in user_patterns.items():
+            if isinstance(pattern_data, list):
+                for pattern in pattern_data:
+                    if isinstance(pattern, dict):
+                        export_data.append({
+                            'pattern_type': pattern_type,
+                            'pattern_data': pattern
+                        })
+        
+        return export_data
+    
+    def _prepare_recommendations_export(self, user_analysis):
+        """Prepare recommendations data for export"""
+        recommendations = []
+        
+        # Add high priority recommendations
+        high_priority = self._generate_high_priority_recommendations(user_analysis)
+        for rec in high_priority:
+            recommendations.append({
+                'priority': rec['priority'],
+                'category': rec['category'],
+                'recommendation': rec['recommendation'],
+                'rationale': rec['rationale']
+            })
+        
+        # Add medium priority recommendations
+        medium_priority = self._generate_medium_priority_recommendations(user_analysis)
+        for rec in medium_priority:
+            recommendations.append({
+                'priority': rec['priority'],
+                'category': rec['category'],
+                'recommendation': rec['recommendation'],
+                'rationale': rec['rationale']
+            })
+        
+        return recommendations
 
 class BackdatedAnalysisView(generics.GenericAPIView):
     """API view for retrieving backdated analysis results by file ID.
@@ -4480,6 +3530,183 @@ class BackdatedAnalysisView(generics.GenericAPIView):
             'monthly_backdated_trend': monthly_trend_chart
         }
     
+    def _generate_backdated_chart_data_from_entries(self, backdated_entries, total_transactions):
+        """
+        Generate comprehensive chart data for backdated analysis from entries data
+        
+        Args:
+            backdated_entries: List of backdated entry dictionaries
+            total_transactions: Total number of transactions for context
+            
+        Returns:
+            dict: Chart data for various visualizations
+        """
+        if not backdated_entries:
+            return {
+                'backdated_days_distribution': {'labels': [], 'data': [], 'colors': []},
+                'risk_level_distribution': {'labels': [], 'data': [], 'colors': []},
+                'backdated_activity_by_user': {'labels': [], 'data': [], 'colors': []},
+                'backdated_amount_distribution': {'labels': [], 'data': [], 'colors': []},
+                'financial_statement_line_breakdown': {'labels': [], 'data': [], 'colors': []},
+                'monthly_backdated_trend': {'labels': [], 'data': [], 'colors': []}
+            }
+        
+        # 1. Backdated Days Distribution
+        days_ranges = [
+            (1, 7, '1-7 days'),
+            (8, 30, '8-30 days'),
+            (31, 90, '31-90 days'),
+            (91, 365, '91-365 days'),
+            (366, float('inf'), '365+ days')
+        ]
+        
+        days_distribution_data = []
+        days_labels = []
+        
+        for min_days, max_days, label in days_ranges:
+            if max_days == float('inf'):
+                count = len([entry for entry in backdated_entries if entry.get('days_difference', 0) >= min_days])
+            else:
+                count = len([entry for entry in backdated_entries if min_days <= entry.get('days_difference', 0) < max_days])
+            
+            days_distribution_data.append(count)
+            days_labels.append(label)
+        
+        days_distribution_chart = {
+            'labels': days_labels,
+            'data': days_distribution_data,
+            'colors': ['#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384', '#36A2EB']
+        }
+        
+        # 2. Risk Level Distribution
+        risk_levels = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
+        risk_level_data = []
+        risk_colors = ['#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384']
+        
+        for i, level in enumerate(risk_levels):
+            count = len([entry for entry in backdated_entries if entry.get('risk_level') == level])
+            risk_level_data.append(count)
+        
+        risk_level_chart = {
+            'labels': risk_levels,
+            'data': risk_level_data,
+            'colors': risk_colors
+        }
+        
+        # 3. Backdated Activity by User
+        user_activity = {}
+        for entry in backdated_entries:
+            user = entry.get('user', 'UNKNOWN')
+            if user not in user_activity:
+                user_activity[user] = {
+                    'count': 0,
+                    'total_amount': 0.0,
+                    'avg_days_difference': 0.0
+                }
+            user_activity[user]['count'] += 1
+            user_activity[user]['total_amount'] += float(entry.get('amount', 0))
+            user_activity[user]['avg_days_difference'] += entry.get('days_difference', 0)
+        
+        # Calculate averages and get top 10 users
+        for user_data in user_activity.values():
+            if user_data['count'] > 0:
+                user_data['avg_days_difference'] = user_data['avg_days_difference'] / user_data['count']
+        
+        top_users = sorted(user_activity.items(), key=lambda x: x[1]['count'], reverse=True)[:10]
+        
+        user_activity_chart = {
+            'labels': [user for user, _ in top_users],
+            'data': [data['count'] for _, data in top_users],
+            'colors': ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF', '#FF9F40', '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0']
+        }
+        
+        # 4. Backdated Amount Distribution
+        amount_ranges = [
+            (0, 100000, '0-100K SAR'),
+            (100000, 1000000, '100K-1M SAR'),
+            (1000000, 10000000, '1M-10M SAR'),
+            (10000000, float('inf'), '10M+ SAR')
+        ]
+        
+        amount_distribution_data = []
+        amount_labels = []
+        
+        for min_amount, max_amount, label in amount_ranges:
+            if max_amount == float('inf'):
+                count = len([entry for entry in backdated_entries if float(entry.get('amount', 0)) >= min_amount])
+            else:
+                count = len([entry for entry in backdated_entries if min_amount <= float(entry.get('amount', 0)) < max_amount])
+            
+            amount_distribution_data.append(count)
+            amount_labels.append(label)
+        
+        amount_distribution_chart = {
+            'labels': amount_labels,
+            'data': amount_distribution_data,
+            'colors': ['#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384']
+        }
+        
+        # 5. Financial Statement Line Breakdown (by Account)
+        account_data = {}
+        for entry in backdated_entries:
+            account = entry.get('account', 'UNKNOWN')
+            if account not in account_data:
+                account_data[account] = {
+                    'count': 0,
+                    'total_amount': 0.0,
+                    'avg_days_difference': 0.0
+                }
+            account_data[account]['count'] += 1
+            account_data[account]['total_amount'] += float(entry.get('amount', 0))
+            account_data[account]['avg_days_difference'] += entry.get('days_difference', 0)
+        
+        # Calculate averages and get top 10 accounts
+        for account_info in account_data.values():
+            if account_info['count'] > 0:
+                account_info['avg_days_difference'] = account_info['avg_days_difference'] / account_info['count']
+        
+        top_accounts = sorted(account_data.items(), key=lambda x: x[1]['total_amount'], reverse=True)[:10]
+        
+        gl_account_chart = {
+            'labels': [f"GL {account}" for account, _ in top_accounts],
+            'data': [data['count'] for _, data in top_accounts],
+            'colors': ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF', '#FF9F40', '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0']
+        }
+        
+        # 6. Monthly Backdated Trend
+        monthly_data = {}
+        for entry in backdated_entries:
+            posting_date = entry.get('posting_date', '')
+            if posting_date:
+                try:
+                    from datetime import datetime
+                    date_obj = datetime.strptime(posting_date, '%Y-%m-%d')
+                    month = date_obj.month
+                    if month not in monthly_data:
+                        monthly_data[month] = 0
+                    monthly_data[month] += 1
+                except (ValueError, TypeError):
+                    pass
+        
+        # Create complete month labels
+        month_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        monthly_trend_data = [monthly_data.get(i, 0) for i in range(1, 13)]
+        
+        monthly_trend_chart = {
+            'labels': month_labels,
+            'data': monthly_trend_data,
+            'colors': ['#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384', '#36A2EB', '#9966FF', '#4BC0C0', '#FFCE56', '#FF9F40', '#FF6384', '#36A2EB', '#9966FF']
+        }
+        
+        return {
+            'backdated_days_distribution': days_distribution_chart,
+            'risk_level_distribution': risk_level_chart,
+            'backdated_activity_by_user': user_activity_chart,
+            'backdated_amount_distribution': amount_distribution_chart,
+            'financial_statement_line_breakdown': gl_account_chart,
+            'monthly_backdated_trend': monthly_trend_chart
+        }
+    
     def get(self, request, file_id):
         """Get backdated analysis results for a specific file"""
         try:
@@ -4507,43 +3734,58 @@ class BackdatedAnalysisView(generics.GenericAPIView):
                     status=status.HTTP_404_NOT_FOUND
                 )
             
-            # Get transactions for this file to enhance the analysis
-            transactions = SAPGLPosting.objects.filter(data_file=data_file)
+            # Get backdated entries from the analysis result
+            backdated_entries = backdated_analysis.backdated_entries or []
             
-            # Calculate enhanced statistics
-            total_transactions = transactions.count()
-            backdated_transactions = transactions.filter(is_backdated=True)
-            backdated_count = backdated_transactions.count()
+            # Calculate statistics from the actual data structure
+            total_transactions = backdated_analysis.analysis_info.get('total_transactions', 0)
+            backdated_count = len(backdated_entries)
             
             # Calculate risk statistics for backdated transactions
-            if backdated_transactions.exists():
-                avg_risk_score = backdated_transactions.aggregate(avg=Avg('backdated_risk_score'))['avg'] or 0
-                max_risk_score = backdated_transactions.aggregate(max=Max('backdated_risk_score'))['max'] or 0
-                min_risk_score = backdated_transactions.aggregate(min=Min('backdated_risk_score'))['min'] or 0
-                total_backdated_amount = backdated_transactions.aggregate(total=Sum('amount_local_currency'))['total'] or 0
-                avg_backdated_days = backdated_transactions.aggregate(avg=Avg('backdated_days'))['avg'] or 0
-                max_backdated_days = backdated_transactions.aggregate(max=Max('backdated_days'))['max'] or 0
+            if backdated_entries:
+                risk_scores = [entry.get('risk_level', 'LOW') for entry in backdated_entries]
+                amounts = [float(entry.get('amount', 0)) for entry in backdated_entries]
+                days_differences = [entry.get('days_difference', 0) for entry in backdated_entries]
+                
+                # Risk level mapping
+                risk_score_mapping = {'LOW': 20, 'MEDIUM': 45, 'HIGH': 70, 'CRITICAL': 90}
+                numeric_risk_scores = [risk_score_mapping.get(risk, 20) for risk in risk_scores]
+                
+                avg_risk_score = sum(numeric_risk_scores) / len(numeric_risk_scores) if numeric_risk_scores else 0
+                max_risk_score = max(numeric_risk_scores) if numeric_risk_scores else 0
+                min_risk_score = min(numeric_risk_scores) if numeric_risk_scores else 0
+                total_backdated_amount = sum(amounts)
+                avg_backdated_days = sum(days_differences) / len(days_differences) if days_differences else 0
+                max_backdated_days = max(days_differences) if days_differences else 0
             else:
                 avg_risk_score = max_risk_score = min_risk_score = total_backdated_amount = avg_backdated_days = max_backdated_days = 0
             
             # Risk level distribution for backdated transactions
             risk_distribution = {
-                'low_risk': backdated_transactions.filter(backdated_risk_score__lt=30).count(),
-                'medium_risk': backdated_transactions.filter(backdated_risk_score__gte=30, backdated_risk_score__lt=60).count(),
-                'high_risk': backdated_transactions.filter(backdated_risk_score__gte=60, backdated_risk_score__lt=80).count(),
-                'critical_risk': backdated_transactions.filter(backdated_risk_score__gte=80).count()
+                'low_risk': len([entry for entry in backdated_entries if entry.get('risk_level') == 'LOW']),
+                'medium_risk': len([entry for entry in backdated_entries if entry.get('risk_level') == 'MEDIUM']),
+                'high_risk': len([entry for entry in backdated_entries if entry.get('risk_level') == 'HIGH']),
+                'critical_risk': len([entry for entry in backdated_entries if entry.get('risk_level') == 'CRITICAL'])
             }
             
             # Get high-risk backdated transactions
-            high_risk_backdated = backdated_transactions.filter(
-                backdated_risk_score__gte=60
-            ).values(
-                'id', 'document_number', 'gl_account', 'amount_local_currency',
-                'user_name', 'posting_date', 'backdated_risk_score', 'backdated_days'
-            ).order_by('-backdated_risk_score')[:10]
+            high_risk_backdated = [
+                {
+                    'id': entry.get('transaction_id'),
+                    'document_number': entry.get('document_number'),
+                    'account': entry.get('account'),
+                    'amount': entry.get('amount'),
+                    'user': entry.get('user'),
+                    'posting_date': entry.get('posting_date'),
+                    'document_date': entry.get('document_date'),
+                    'risk_level': entry.get('risk_level'),
+                    'days_difference': entry.get('days_difference')
+                }
+                for entry in backdated_entries if entry.get('risk_level') in ['HIGH', 'CRITICAL']
+            ][:10]
             
             # Generate comprehensive chart data
-            chart_data = self._generate_backdated_chart_data(backdated_transactions, transactions)
+            chart_data = self._generate_backdated_chart_data_from_entries(backdated_entries, total_transactions)
             
             # Prepare response data
             response_data = {
@@ -4584,7 +3826,6 @@ class BackdatedAnalysisView(generics.GenericAPIView):
                     'overall_risk_score': float(avg_risk_score)
                 },
                 'chart_data': chart_data,
-                'backdated_entries': backdated_analysis.backdated_entries or [],
                 'backdated_patterns': backdated_analysis.analysis_info or {},
                 'analysis_metadata': {
                     'detection_methods': backdated_analysis.analysis_info.get('detection_methods', []),
@@ -4743,32 +3984,30 @@ class UnusualDaysAnalysisView(generics.GenericAPIView):
                     'status': unusual_days_analysis.status,
                     'analysis_version': unusual_days_analysis.analysis_version or '1.0.0'
                 },
-                'summary': {
-                    'total_transactions': unusual_days_analysis.get_total_transactions(),
-                    'weekend_postings': unusual_days_analysis.get_weekend_transactions_count(),
-                    'unusual_days_detected': unusual_days_analysis.get_unusual_days_count(),
-                    'risk_level': unusual_days_analysis.get_risk_level(),
-                    'overall_risk_score': unusual_days_analysis.get_overall_risk_score()
-                },
-                'unusual_days_analysis': {
-                    'weekend_postings': unusual_days_analysis.weekend_postings or [],
-                    'day_of_week_activity': unusual_days_analysis.day_of_week_activity or {},
-                    'unusual_days': unusual_days_analysis.unusual_days or [],
-                    'user_day_patterns': unusual_days_analysis.user_day_patterns or [],
-                    'fs_line_day_patterns': unusual_days_analysis.fs_line_day_patterns or []
-                },
-                'risk_assessment': {
-                    'risk_assessment': unusual_days_analysis.risk_assessment or {},
-                    'weekend_risk_score': unusual_days_analysis.get_weekend_risk_score(),
-                    'unusual_pattern_risk_score': unusual_days_analysis.get_unusual_pattern_risk_score(),
-                    'high_value_weekend_risk_score': unusual_days_analysis.get_high_value_weekend_risk_score(),
-                    'overall_risk_score': unusual_days_analysis.get_overall_risk_score()
-                },
-                'patterns': {
-                    'day_of_week_activity': unusual_days_analysis.day_of_week_activity or {},
-                    'user_day_patterns': unusual_days_analysis.user_day_patterns or [],
-                    'fs_line_day_patterns': unusual_days_analysis.fs_line_day_patterns or []
-                },
+                        'summary': {
+            'total_transactions': unusual_days_analysis.analysis_info.get('total_transactions', 0),
+            'weekend_postings': len(unusual_days_analysis.weekend_postings or []),
+            'unusual_days_detected': len(unusual_days_analysis.unusual_days or []),
+            'risk_level': self._calculate_risk_level(unusual_days_analysis),
+            'overall_risk_score': self._calculate_overall_risk_score(unusual_days_analysis)
+        },
+                        'unusual_days_analysis': {
+            'day_of_week_activity': self._generate_day_of_week_activity(unusual_days_analysis),
+            'user_day_patterns': self._generate_user_day_patterns(unusual_days_analysis),
+            'fs_line_day_patterns': unusual_days_analysis.fs_line_day_patterns or []
+        },
+                        'risk_assessment': {
+            'risk_assessment': unusual_days_analysis.risk_assessment or {},
+            'weekend_risk_score': self._calculate_weekend_risk_score(unusual_days_analysis),
+            'unusual_pattern_risk_score': self._calculate_unusual_pattern_risk_score(unusual_days_analysis),
+            'high_value_weekend_risk_score': self._calculate_high_value_weekend_risk_score(unusual_days_analysis),
+            'overall_risk_score': self._calculate_overall_risk_score(unusual_days_analysis)
+        },
+                        'patterns': {
+            'day_of_week_activity': self._generate_day_of_week_activity(unusual_days_analysis),
+            'user_day_patterns': self._generate_user_day_patterns(unusual_days_analysis),
+            'fs_line_day_patterns': unusual_days_analysis.fs_line_day_patterns or []
+        },
                 'visualizations': {
                     'chart_data': unusual_days_analysis.chart_data or {},
                     'chart_types': [
@@ -4812,17 +4051,197 @@ class UnusualDaysAnalysisView(generics.GenericAPIView):
     def _prepare_user_patterns_export(self, user_patterns):
         """Prepare user patterns data for export"""
         return user_patterns
+    
+    def _calculate_risk_level(self, unusual_days_analysis):
+        """Calculate risk level based on unusual days data"""
+        unusual_days = unusual_days_analysis.unusual_days or []
+        
+        total_unusual = len(unusual_days)
+        total_transactions = unusual_days_analysis.analysis_info.get('total_transactions', 0)
+        
+        if total_transactions == 0:
+            return 'LOW'
+        
+        unusual_percentage = (total_unusual / total_transactions) * 100
+        
+        if unusual_percentage > 10:
+            return 'CRITICAL'
+        elif unusual_percentage > 5:
+            return 'HIGH'
+        elif unusual_percentage > 2:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    
+    def _calculate_overall_risk_score(self, unusual_days_analysis):
+        """Calculate overall risk score based on unusual days data"""
+        unusual_days = unusual_days_analysis.unusual_days or []
+        
+        total_unusual = len(unusual_days)
+        total_transactions = unusual_days_analysis.analysis_info.get('total_transactions', 0)
+        
+        if total_transactions == 0:
+            return 0.0
+        
+        unusual_percentage = (total_unusual / total_transactions) * 100
+        
+        # Calculate risk score based on percentage and high-value transactions
+        high_value_count = sum(1 for entry in unusual_days 
+                              if float(entry.get('amount', 0)) > 10000000)
+        
+        base_score = min(unusual_percentage * 10, 100)  # Max 100
+        high_value_bonus = min(high_value_count * 5, 50)  # Max 50 bonus
+        
+        return min(base_score + high_value_bonus, 100)
+    
+    def _calculate_weekend_risk_score(self, unusual_days_analysis):
+        """Calculate weekend risk score"""
+        unusual_days = unusual_days_analysis.unusual_days or []
+        total_transactions = unusual_days_analysis.analysis_info.get('total_transactions', 0)
+        
+        if total_transactions == 0:
+            return 0.0
+        
+        # Since all unusual days are weekend postings in this case
+        weekend_percentage = (len(unusual_days) / total_transactions) * 100
+        high_value_weekend = sum(1 for entry in unusual_days 
+                                if float(entry.get('amount', 0)) > 10000000)
+        
+        base_score = min(weekend_percentage * 15, 100)  # Weekend transactions are higher risk
+        high_value_bonus = min(high_value_weekend * 10, 50)
+        
+        return min(base_score + high_value_bonus, 100)
+    
+    def _calculate_unusual_pattern_risk_score(self, unusual_days_analysis):
+        """Calculate unusual pattern risk score"""
+        unusual_days = unusual_days_analysis.unusual_days or []
+        total_transactions = unusual_days_analysis.analysis_info.get('total_transactions', 0)
+        
+        if total_transactions == 0:
+            return 0.0
+        
+        unusual_percentage = (len(unusual_days) / total_transactions) * 100
+        high_value_unusual = sum(1 for entry in unusual_days 
+                                if float(entry.get('amount', 0)) > 10000000)
+        
+        base_score = min(unusual_percentage * 12, 100)
+        high_value_bonus = min(high_value_unusual * 8, 40)
+        
+        return min(base_score + high_value_bonus, 100)
+    
+    def _calculate_high_value_weekend_risk_score(self, unusual_days_analysis):
+        """Calculate high value weekend risk score"""
+        unusual_days = unusual_days_analysis.unusual_days or []
+        total_transactions = unusual_days_analysis.analysis_info.get('total_transactions', 0)
+        
+        if total_transactions == 0:
+            return 0.0
+        
+        high_value_weekend = sum(1 for entry in unusual_days 
+                                if float(entry.get('amount', 0)) > 10000000)
+        
+        high_value_percentage = (high_value_weekend / total_transactions) * 100
+        
+        return min(high_value_percentage * 20, 100)  # High value weekend transactions are very high risk
+    
+    def _generate_day_of_week_activity(self, unusual_days_analysis):
+        """Generate day of week activity from actual data"""
+        unusual_days = unusual_days_analysis.unusual_days or []
+        
+        day_activity = {}
+        
+        for entry in unusual_days:
+            day = entry.get('day_of_week', 'Unknown')
+            if day not in day_activity:
+                day_activity[day] = {
+                    'count': 0,
+                    'total_amount': 0.0,
+                    'average_amount': 0.0,
+                    'high_value_count': 0,
+                    'high_value_amount': 0.0
+                }
+            
+            amount = float(entry.get('amount', 0))
+            day_activity[day]['count'] += 1
+            day_activity[day]['total_amount'] += amount
+            
+            if amount > 10000000:
+                day_activity[day]['high_value_count'] += 1
+                day_activity[day]['high_value_amount'] += amount
+        
+        # Calculate averages
+        for day_data in day_activity.values():
+            if day_data['count'] > 0:
+                day_data['average_amount'] = day_data['total_amount'] / day_data['count']
+        
+        return day_activity
+    
+    def _generate_user_day_patterns(self, unusual_days_analysis):
+        """Generate user day patterns from actual data"""
+        unusual_days = unusual_days_analysis.unusual_days or []
+        
+        user_patterns = {}
+        
+        for entry in unusual_days:
+            user = entry.get('user', 'Unknown')
+            day = entry.get('day_of_week', 'Unknown')
+            
+            if user not in user_patterns:
+                user_patterns[user] = {
+                    'total_transactions': 0,
+                    'total_amount': 0.0,
+                    'days_activity': {},
+                    'high_value_transactions': 0,
+                    'high_value_amount': 0.0
+                }
+            
+            amount = float(entry.get('amount', 0))
+            user_patterns[user]['total_transactions'] += 1
+            user_patterns[user]['total_amount'] += amount
+            
+            if day not in user_patterns[user]['days_activity']:
+                user_patterns[user]['days_activity'][day] = {
+                    'count': 0,
+                    'amount': 0.0
+                }
+            
+            user_patterns[user]['days_activity'][day]['count'] += 1
+            user_patterns[user]['days_activity'][day]['amount'] += amount
+            
+            if amount > 10000000:
+                user_patterns[user]['high_value_transactions'] += 1
+                user_patterns[user]['high_value_amount'] += amount
+        
+        # Convert to list format and add computed fields
+        user_patterns_list = []
+        for user, data in user_patterns.items():
+            user_data = {
+                'user': user,
+                'total_transactions': data['total_transactions'],
+                'total_amount': data['total_amount'],
+                'average_amount': data['total_amount'] / data['total_transactions'] if data['total_transactions'] > 0 else 0,
+                'high_value_transactions': data['high_value_transactions'],
+                'high_value_amount': data['high_value_amount'],
+                'high_value_percentage': (data['high_value_transactions'] / data['total_transactions'] * 100) if data['total_transactions'] > 0 else 0,
+                'days_activity': data['days_activity']
+            }
+            user_patterns_list.append(user_data)
+        
+        # Sort by total amount descending
+        user_patterns_list.sort(key=lambda x: x['total_amount'], reverse=True)
+        
+        return user_patterns_list
 
 
 class ClosingEntriesAnalysisView(generics.GenericAPIView):
     """API view for retrieving closing entries analysis results by file ID.
     
     This view provides comprehensive closing entries analysis results including:
-    - Month-end closing transactions
-    - Post-close flag analysis
-    - Financial statement line closing patterns
-    - User closing activity patterns
-    - Risk assessment for closing entries
+    - Month-end closing transactions with detailed analysis
+    - Risk assessment and scoring
+    - User activity patterns
+    - Account-based analysis
+    - Temporal patterns and trends
     - Chart data for visualizations
     - Export-ready data
     """
@@ -4846,7 +4265,41 @@ class ClosingEntriesAnalysisView(generics.GenericAPIView):
                     ]
                 }, status=404)
             
-            # Prepare response data
+            # Get closing entries data
+            closing_entries = closing_entries_analysis.closing_entries or []
+            
+            # Calculate risk scores from actual data
+            total_transactions = closing_entries_analysis.get_total_transactions()
+            closing_entries_count = closing_entries_analysis.get_closing_entries_count()
+            post_close_entries_count = closing_entries_analysis.get_post_close_entries_count()
+            
+            # Calculate risk scores from closing entries data
+            if closing_entries:
+                risk_scores = [entry.get('risk_level', 'LOW') for entry in closing_entries]
+                amounts = [float(entry.get('amount', 0)) for entry in closing_entries]
+                
+                # Risk level mapping
+                risk_score_mapping = {'LOW': 20, 'MEDIUM': 45, 'HIGH': 70, 'CRITICAL': 90}
+                numeric_risk_scores = [risk_score_mapping.get(risk, 20) for risk in risk_scores]
+                
+                avg_risk_score = sum(numeric_risk_scores) / len(numeric_risk_scores) if numeric_risk_scores else 0
+                total_closing_amount = sum(amounts)
+                
+                # Calculate risk level based on average risk score
+                if avg_risk_score >= 80:
+                    risk_level = 'CRITICAL'
+                elif avg_risk_score >= 60:
+                    risk_level = 'HIGH'
+                elif avg_risk_score >= 30:
+                    risk_level = 'MEDIUM'
+                else:
+                    risk_level = 'LOW'
+            else:
+                avg_risk_score = 0.0
+                total_closing_amount = 0.0
+                risk_level = 'LOW'
+            
+            # Prepare comprehensive response data
             response_data = {
                 'analysis_info': {
                     'analysis_id': str(closing_entries_analysis.id),
@@ -4856,14 +4309,13 @@ class ClosingEntriesAnalysisView(generics.GenericAPIView):
                     'analysis_version': closing_entries_analysis.analysis_version or '1.0.0'
                 },
                 'summary': {
-                    'total_transactions': closing_entries_analysis.get_total_transactions(),
-                    'closing_entries_count': closing_entries_analysis.get_closing_entries_count(),
-                    'post_close_entries_count': closing_entries_analysis.get_post_close_entries_count(),
-                    'risk_level': closing_entries_analysis.get_risk_level(),
-                    'overall_risk_score': closing_entries_analysis.get_overall_risk_score()
+                    'total_transactions': total_transactions,
+                    'closing_entries_count': closing_entries_count,
+                    'post_close_entries_count': post_close_entries_count,
+                    'risk_level': risk_level,
+                    'overall_risk_score': avg_risk_score
                 },
                 'closing_entries_analysis': {
-                    'closing_entries': closing_entries_analysis.closing_entries or [],
                     'post_close_analysis': closing_entries_analysis.post_close_analysis or {},
                     'fs_line_closing': closing_entries_analysis.fs_line_closing or {},
                     'user_closing': closing_entries_analysis.user_closing or {},
@@ -4893,11 +4345,11 @@ class ClosingEntriesAnalysisView(generics.GenericAPIView):
                         'risk_distribution'
                     ]
                 },
-                # 'export_data': {
-                #     'closing_entries_export': self._prepare_closing_entries_export(closing_entries_analysis.closing_entries or []),
-                #     'post_close_export': self._prepare_post_close_export(closing_entries_analysis.post_close_analysis or {}),
-                #     'fs_line_export': self._prepare_fs_line_export(closing_entries_analysis.fs_line_closing or {})
-                # }
+                'detailed_analysis': self._generate_detailed_analysis(closing_entries),
+                'export_data': {
+                    'post_close_export': self._prepare_post_close_export(closing_entries_analysis.post_close_analysis or {}),
+                    'fs_line_export': self._prepare_fs_line_export(closing_entries_analysis.fs_line_closing or {})
+                }
             }
             
             # Log successful retrieval
@@ -4914,6 +4366,125 @@ class ClosingEntriesAnalysisView(generics.GenericAPIView):
                 'error_code': 'CLOSING_ENTRIES_ANALYSIS_ERROR',
                 'details': str(e)
             }, status=500)
+    
+    def _generate_detailed_analysis(self, closing_entries):
+        """Generate detailed analysis from closing entries data"""
+        if not closing_entries:
+            return {}
+        
+        # Risk distribution analysis
+        risk_distribution = {}
+        for entry in closing_entries:
+            risk_level = entry.get('risk_level', 'UNKNOWN')
+            risk_distribution[risk_level] = risk_distribution.get(risk_level, 0) + 1
+        
+        # User analysis
+        user_analysis = {}
+        for entry in closing_entries:
+            user = entry.get('user', 'UNKNOWN')
+            if user not in user_analysis:
+                user_analysis[user] = {
+                    'total_entries': 0,
+                    'total_amount': 0.0,
+                    'accounts': set(),
+                    'risk_levels': {},
+                    'posting_dates': set()
+                }
+            
+            user_analysis[user]['total_entries'] += 1
+            user_analysis[user]['total_amount'] += float(entry.get('amount', 0))
+            user_analysis[user]['accounts'].add(entry.get('account', ''))
+            user_analysis[user]['posting_dates'].add(entry.get('posting_date', ''))
+            
+            risk_level = entry.get('risk_level', 'UNKNOWN')
+            user_analysis[user]['risk_levels'][risk_level] = user_analysis[user]['risk_levels'].get(risk_level, 0) + 1
+        
+        # Convert sets to lists for JSON serialization
+        for user_data in user_analysis.values():
+            user_data['accounts'] = list(user_data['accounts'])
+            user_data['posting_dates'] = list(user_data['posting_dates'])
+        
+        # Account analysis
+        account_analysis = {}
+        for entry in closing_entries:
+            account = entry.get('account', 'UNKNOWN')
+            if account not in account_analysis:
+                account_analysis[account] = {
+                    'total_entries': 0,
+                    'total_amount': 0.0,
+                    'users': set(),
+                    'risk_levels': {},
+                    'posting_dates': set()
+                }
+            
+            account_analysis[account]['total_entries'] += 1
+            account_analysis[account]['total_amount'] += float(entry.get('amount', 0))
+            account_analysis[account]['users'].add(entry.get('user', ''))
+            account_analysis[account]['posting_dates'].add(entry.get('posting_date', ''))
+            
+            risk_level = entry.get('risk_level', 'UNKNOWN')
+            account_analysis[account]['risk_levels'][risk_level] = account_analysis[account]['risk_levels'].get(risk_level, 0) + 1
+        
+        # Convert sets to lists for JSON serialization
+        for account_data in account_analysis.values():
+            account_data['users'] = list(account_data['users'])
+            account_data['posting_dates'] = list(account_data['posting_dates'])
+        
+        # Temporal analysis
+        temporal_analysis = {}
+        for entry in closing_entries:
+            posting_date = entry.get('posting_date', '')
+            days_from_month_end = entry.get('days_from_month_end', 0)
+            
+            if posting_date not in temporal_analysis:
+                temporal_analysis[posting_date] = {
+                    'total_entries': 0,
+                    'total_amount': 0.0,
+                    'users': set(),
+                    'accounts': set(),
+                    'risk_levels': {},
+                    'days_from_month_end': days_from_month_end
+                }
+            
+            temporal_analysis[posting_date]['total_entries'] += 1
+            temporal_analysis[posting_date]['total_amount'] += float(entry.get('amount', 0))
+            temporal_analysis[posting_date]['users'].add(entry.get('user', ''))
+            temporal_analysis[posting_date]['accounts'].add(entry.get('account', ''))
+            
+            risk_level = entry.get('risk_level', 'UNKNOWN')
+            temporal_analysis[posting_date]['risk_levels'][risk_level] = temporal_analysis[posting_date]['risk_levels'].get(risk_level, 0) + 1
+        
+        # Convert sets to lists for JSON serialization
+        for date_data in temporal_analysis.values():
+            date_data['users'] = list(date_data['users'])
+            date_data['accounts'] = list(date_data['accounts'])
+        
+        # Amount analysis
+        amounts = [float(entry.get('amount', 0)) for entry in closing_entries]
+        amount_analysis = {
+            'total_amount': sum(amounts),
+            'average_amount': sum(amounts) / len(amounts) if amounts else 0,
+            'min_amount': min(amounts) if amounts else 0,
+            'max_amount': max(amounts) if amounts else 0,
+            'high_value_entries': len([amt for amt in amounts if amt > 10000000]),  # > 10M
+            'medium_value_entries': len([amt for amt in amounts if 1000000 <= amt <= 10000000]),  # 1M-10M
+            'low_value_entries': len([amt for amt in amounts if amt < 1000000])  # < 1M
+        }
+        
+        return {
+            'risk_distribution': risk_distribution,
+            'user_analysis': user_analysis,
+            'account_analysis': account_analysis,
+            'temporal_analysis': temporal_analysis,
+            'amount_analysis': amount_analysis,
+            'summary_stats': {
+                'total_entries': len(closing_entries),
+                'unique_users': len(set(entry.get('user', '') for entry in closing_entries)),
+                'unique_accounts': len(set(entry.get('account', '') for entry in closing_entries)),
+                'unique_posting_dates': len(set(entry.get('posting_date', '') for entry in closing_entries)),
+                'average_days_from_month_end': sum(entry.get('days_from_month_end', 0) for entry in closing_entries) / len(closing_entries) if closing_entries else 0
+            }
+        }
     
     def _prepare_closing_entries_export(self, closing_entries):
         """Prepare closing entries data for export"""
@@ -5187,3 +4758,719 @@ class FileGLAccountsView(APIView):
             return Response({'error': f'File with ID {file_id} not found'}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class ClosingEntriesListView(generics.ListAPIView):
+    """API view for listing closing entries with pagination.
+    
+    This view provides a paginated list of closing entries for a specific file.
+    
+    Query Parameters:
+    - page, page_size: Pagination controls
+    - user_name: Filter by user name
+    - account: Filter by account
+    - date_from, date_to: Posting date range
+    - amount_range: Comma-separated min,max (e.g., amount_range=1000,5000)
+    - risk_level: Filter by risk level (LOW, MEDIUM, HIGH, CRITICAL)
+    - days_from_month_end: Filter by days from month end
+    - high_value: Filter by high value transactions (true/false)
+    - ordering: Field to order by (e.g., -amount, posting_date, -risk_level)
+    """
+    
+    serializer_class = ClosingEntriesListSerializer
+    pagination_class = SAPGLPostingPagination
+    
+    def get_queryset(self):
+        """Get closing entries for the specified file"""
+        file_id = self.kwargs.get('file_id')
+        
+        # Get the latest closing entries analysis result
+        from .models import ClosingEntriesAnalysisResult
+        closing_entries_analysis = ClosingEntriesAnalysisResult.objects.filter(
+            data_file_id=file_id, status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        
+        if not closing_entries_analysis:
+            return []
+        
+        # Get closing entries from the analysis result
+        closing_entries = closing_entries_analysis.closing_entries or []
+        
+        # Apply filters
+        filtered_entries = self._apply_filters(closing_entries)
+        
+        return filtered_entries
+    
+    def _apply_filters(self, closing_entries):
+        """Apply filters to closing entries based on actual data structure"""
+        filtered_entries = closing_entries
+        
+        # Filter by user name
+        user_name = self.request.query_params.get('user_name')
+        if user_name:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if user_name.lower() in entry.get('user', '').lower()
+            ]
+        
+        # Filter by account
+        account = self.request.query_params.get('account')
+        if account:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if entry.get('account') == account
+            ]
+        
+        # Filter by posting date range
+        date_from = self.request.query_params.get('date_from')
+        date_to = self.request.query_params.get('date_to')
+        if date_from or date_to:
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if self._is_date_in_range(entry.get('posting_date'), date_from, date_to)
+            ]
+        
+        # Filter by amount range
+        amount_range = self.request.query_params.get('amount_range')
+        if amount_range:
+            try:
+                min_amount, max_amount = map(float, amount_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_amount <= float(entry.get('amount', 0)) <= max_amount
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Filter by risk level
+        risk_level = self.request.query_params.get('risk_level')
+        if risk_level:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if entry.get('risk_level') == risk_level.upper()
+            ]
+        
+        # Filter by days from month end
+        days_from_month_end = self.request.query_params.get('days_from_month_end')
+        if days_from_month_end:
+            try:
+                days = int(days_from_month_end)
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if entry.get('days_from_month_end', 0) == days
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Filter by high value transactions
+        high_value = self.request.query_params.get('high_value')
+        if high_value is not None:
+            high_value_bool = high_value.lower() == 'true'
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if (float(entry.get('amount', 0)) > 10000000) == high_value_bool
+            ]
+        
+        # Apply sorting
+        ordering = self.request.query_params.get('ordering', '-amount')
+        if ordering:
+            reverse = ordering.startswith('-')
+            field = ordering[1:] if reverse else ordering
+            
+            if field == 'amount':
+                filtered_entries.sort(key=lambda x: float(x.get('amount', 0)), reverse=reverse)
+            elif field == 'posting_date':
+                filtered_entries.sort(key=lambda x: x.get('posting_date', ''), reverse=reverse)
+            elif field == 'user':
+                filtered_entries.sort(key=lambda x: x.get('user', ''), reverse=reverse)
+            elif field == 'account':
+                filtered_entries.sort(key=lambda x: x.get('account', ''), reverse=reverse)
+            elif field == 'risk_level':
+                filtered_entries.sort(key=lambda x: x.get('risk_level', ''), reverse=reverse)
+            elif field == 'days_from_month_end':
+                filtered_entries.sort(key=lambda x: x.get('days_from_month_end', 0), reverse=reverse)
+        
+        return filtered_entries
+    
+    def _is_date_in_range(self, posting_date, date_from, date_to):
+        """Check if posting date is within the specified range"""
+        if not posting_date:
+            return False
+        
+        from datetime import datetime
+        try:
+            if isinstance(posting_date, str):
+                posting_date = datetime.strptime(posting_date, '%Y-%m-%d').date()
+            
+            if date_from:
+                from_date = datetime.strptime(date_from, '%Y-%m-%d').date()
+                if posting_date < from_date:
+                    return False
+            
+            if date_to:
+                to_date = datetime.strptime(date_to, '%Y-%m-%d').date()
+                if posting_date > to_date:
+                    return False
+            
+            return True
+        except (ValueError, TypeError):
+            return False
+    
+    def list(self, request, *args, **kwargs):
+        """Return only paginated closing entries listing"""
+        queryset = self.get_queryset()
+        
+        # Apply pagination
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+    
+
+
+class BackdatedEntriesListView(generics.ListAPIView):
+    """API view for listing backdated entries with pagination.
+    
+    This view provides a paginated list of backdated entries for a specific file.
+    
+    Query Parameters:
+    - page, page_size: Pagination controls
+    - user_name: Filter by user name
+    - account: Filter by account
+    - date_from, date_to: Posting date range
+    - document_date_from, document_date_to: Document date range
+    - amount_range: Comma-separated min,max (e.g., amount_range=1000,5000)
+    - risk_level: Filter by risk level (LOW, MEDIUM, HIGH, CRITICAL)
+    - days_difference_range: Comma-separated min,max (e.g., days_difference_range=1,30)
+    - backdated_severity: Filter by severity (MINOR, MODERATE, SIGNIFICANT, CRITICAL)
+    - ordering: Field to order by (e.g., -amount, posting_date, -days_difference)
+    """
+    
+    serializer_class = BackdatedEntriesListSerializer
+    pagination_class = SAPGLPostingPagination
+    
+    def get_queryset(self):
+        """Get backdated entries for the specified file"""
+        file_id = self.kwargs.get('file_id')
+        
+        # Get the latest backdated analysis result
+        from .models import BackdatedAnalysisResult
+        backdated_analysis = BackdatedAnalysisResult.objects.filter(
+            data_file_id=file_id, status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        
+        if not backdated_analysis:
+            return []
+        
+        # Get backdated entries from the analysis result
+        backdated_entries = backdated_analysis.backdated_entries or []
+        
+        # Apply filters
+        filtered_entries = self._apply_filters(backdated_entries)
+        
+        return filtered_entries
+    
+    def _apply_filters(self, backdated_entries):
+        """Apply filters to backdated entries based on actual data structure"""
+        filtered_entries = backdated_entries
+        
+        # Filter by user name
+        user_name = self.request.query_params.get('user_name')
+        if user_name:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if user_name.lower() in entry.get('user', '').lower()
+            ]
+        
+        # Filter by account
+        account = self.request.query_params.get('account')
+        if account:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if entry.get('account') == account
+            ]
+        
+        # Filter by posting date range
+        date_from = self.request.query_params.get('date_from')
+        date_to = self.request.query_params.get('date_to')
+        if date_from or date_to:
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if self._is_date_in_range(entry.get('posting_date'), date_from, date_to)
+            ]
+        
+        # Filter by document date range
+        document_date_from = self.request.query_params.get('document_date_from')
+        document_date_to = self.request.query_params.get('document_date_to')
+        if document_date_from or document_date_to:
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if self._is_date_in_range(entry.get('document_date'), document_date_from, document_date_to)
+            ]
+        
+        # Filter by amount range
+        amount_range = self.request.query_params.get('amount_range')
+        if amount_range:
+            try:
+                min_amount, max_amount = map(float, amount_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_amount <= float(entry.get('amount', 0)) <= max_amount
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Filter by risk level
+        risk_level = self.request.query_params.get('risk_level')
+        if risk_level:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if entry.get('risk_level') == risk_level.upper()
+            ]
+        
+        # Filter by days difference range
+        days_difference_range = self.request.query_params.get('days_difference_range')
+        if days_difference_range:
+            try:
+                min_days, max_days = map(int, days_difference_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_days <= entry.get('days_difference', 0) <= max_days
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Filter by backdated severity
+        backdated_severity = self.request.query_params.get('backdated_severity')
+        if backdated_severity:
+            severity_mapping = {
+                'MINOR': (0, 7),
+                'MODERATE': (8, 30),
+                'SIGNIFICANT': (31, 90),
+                'CRITICAL': (91, float('inf'))
+            }
+            if backdated_severity in severity_mapping:
+                min_days, max_days = severity_mapping[backdated_severity]
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_days <= entry.get('days_difference', 0) <= max_days
+                ]
+        
+        # Apply sorting
+        ordering = self.request.query_params.get('ordering', '-amount')
+        if ordering:
+            reverse = ordering.startswith('-')
+            field = ordering[1:] if reverse else ordering
+            
+            if field == 'amount':
+                filtered_entries.sort(key=lambda x: float(x.get('amount', 0)), reverse=reverse)
+            elif field == 'posting_date':
+                filtered_entries.sort(key=lambda x: x.get('posting_date', ''), reverse=reverse)
+            elif field == 'document_date':
+                filtered_entries.sort(key=lambda x: x.get('document_date', ''), reverse=reverse)
+            elif field == 'user':
+                filtered_entries.sort(key=lambda x: x.get('user', ''), reverse=reverse)
+            elif field == 'account':
+                filtered_entries.sort(key=lambda x: x.get('account', ''), reverse=reverse)
+            elif field == 'risk_level':
+                filtered_entries.sort(key=lambda x: x.get('risk_level', ''), reverse=reverse)
+            elif field == 'days_difference':
+                filtered_entries.sort(key=lambda x: x.get('days_difference', 0), reverse=reverse)
+        
+        return filtered_entries
+    
+    def _is_date_in_range(self, posting_date, date_from, date_to):
+        """Check if posting date is within the specified range"""
+        if not posting_date:
+            return False
+        
+        from datetime import datetime
+        try:
+            if isinstance(posting_date, str):
+                posting_date = datetime.strptime(posting_date, '%Y-%m-%d').date()
+            
+            if date_from:
+                from_date = datetime.strptime(date_from, '%Y-%m-%d').date()
+                if posting_date < from_date:
+                    return False
+            
+            if date_to:
+                to_date = datetime.strptime(date_to, '%Y-%m-%d').date()
+                if posting_date > to_date:
+                    return False
+            
+            return True
+        except (ValueError, TypeError):
+            return False
+    
+    def list(self, request, *args, **kwargs):
+        """Return only paginated backdated entries listing"""
+        queryset = self.get_queryset()
+        
+        # Apply pagination
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+    
+
+class UnusualDaysListView(generics.ListAPIView):
+    """API view for listing unusual days entries with pagination.
+    
+    This view provides a paginated list of unusual days entries for a specific file.
+    
+    Query Parameters:
+    - page, page_size: Pagination controls
+    - user: Filter by user name
+    - account: Filter by account
+    - posting_date_from, posting_date_to: Posting date range
+    - amount_range: Comma-separated min,max (e.g., amount_range=1000,5000)
+    - risk_level: Filter by risk level (LOW, MEDIUM, HIGH, CRITICAL)
+    - day_of_week: Filter by day of week (Monday, Tuesday, etc.)
+    - day_type: Filter by day type (WEEKEND, WEEKDAY)
+    - high_value: Filter by high value transactions (true/false)
+    - ordering: Field to order by (e.g., -amount, posting_date, -risk_level)
+    """
+    
+    serializer_class = UnusualDaysListSerializer
+    pagination_class = SAPGLPostingPagination
+    
+    def get_queryset(self):
+        """Get unusual days entries from UnusualDaysAnalysisResult"""
+        file_id = self.kwargs.get('file_id')
+        
+        try:
+            unusual_days_analysis = UnusualDaysAnalysisResult.objects.filter(
+                data_file_id=file_id,
+                status='COMPLETED'
+            ).first()
+            
+            if not unusual_days_analysis:
+                return []
+            
+            unusual_days = unusual_days_analysis.unusual_days or []
+            return self._apply_filters(unusual_days)
+            
+        except Exception as e:
+            logger.error(f"Error fetching unusual days data: {e}")
+            return []
+    
+    def _apply_filters(self, unusual_days):
+        """Apply filters to unusual days entries"""
+        filtered_entries = unusual_days
+        
+        # User filter
+        user_filter = self.request.query_params.get('user')
+        if user_filter:
+            user_terms = [term.strip().lower() for term in user_filter.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if any(term in entry.get('user', '').lower() for term in user_terms)
+            ]
+        
+        # Account filter
+        account_filter = self.request.query_params.get('account')
+        if account_filter:
+            account_terms = [term.strip() for term in account_filter.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if entry.get('account', '') in account_terms
+            ]
+        
+        # Posting date range filter
+        date_from = self.request.query_params.get('posting_date_from')
+        date_to = self.request.query_params.get('posting_date_to')
+        if date_from or date_to:
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if self._is_date_in_range(entry.get('posting_date', ''), date_from, date_to)
+            ]
+        
+        # Amount range filter
+        amount_range = self.request.query_params.get('amount_range')
+        if amount_range:
+            try:
+                min_amount, max_amount = map(float, amount_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_amount <= float(entry.get('amount', 0)) <= max_amount
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Risk level filter
+        risk_level = self.request.query_params.get('risk_level')
+        if risk_level:
+            risk_levels = [level.strip().upper() for level in risk_level.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if entry.get('risk_level', '').upper() in risk_levels
+            ]
+        
+        # Day of week filter
+        day_of_week = self.request.query_params.get('day_of_week')
+        if day_of_week:
+            days = [day.strip() for day in day_of_week.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if entry.get('day_of_week', '') in days
+            ]
+        
+        # Day type filter
+        day_type = self.request.query_params.get('day_type')
+        if day_type:
+            if day_type.upper() == 'WEEKEND':
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if entry.get('day_of_week', '').lower() in ['saturday', 'sunday']
+                ]
+            elif day_type.upper() == 'WEEKDAY':
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if entry.get('day_of_week', '').lower() not in ['saturday', 'sunday']
+                ]
+        
+        # High value filter
+        high_value = self.request.query_params.get('high_value')
+        if high_value is not None:
+            is_high_value = high_value.lower() == 'true'
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if (float(entry.get('amount', 0)) > 10000000) == is_high_value
+            ]
+        
+        # Sorting
+        ordering = self.request.query_params.get('ordering', '-posting_date')
+        reverse = ordering.startswith('-')
+        field = ordering[1:] if reverse else ordering
+        
+        if field in ['amount', 'posting_date', 'risk_level', 'user', 'account', 'day_of_week']:
+            try:
+                filtered_entries.sort(
+                    key=lambda x: (
+                        float(x.get('amount', 0)) if field == 'amount' else
+                        x.get('posting_date', '') if field == 'posting_date' else
+                        x.get('risk_level', '') if field == 'risk_level' else
+                        x.get('user', '') if field == 'user' else
+                        x.get('account', '') if field == 'account' else
+                        x.get('day_of_week', '')
+                    ),
+                    reverse=reverse
+                )
+            except (ValueError, TypeError):
+                pass
+        
+        return filtered_entries
+    
+    def _is_date_in_range(self, posting_date, date_from, date_to):
+        """Check if posting date is within the specified range"""
+        try:
+            if not posting_date:
+                return False
+            
+            posting_date_obj = datetime.strptime(posting_date, '%Y-%m-%d').date()
+            
+            if date_from:
+                from_date = datetime.strptime(date_from, '%Y-%m-%d').date()
+                if posting_date_obj < from_date:
+                    return False
+            
+            if date_to:
+                to_date = datetime.strptime(date_to, '%Y-%m-%d').date()
+                if posting_date_obj > to_date:
+                    return False
+            
+            return True
+        except (ValueError, TypeError):
+            return False
+    
+    def list(self, request, *args, **kwargs):
+        """Return only paginated unusual days entries listing"""
+        queryset = self.get_queryset()
+        
+        # Apply pagination
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+    
+
+class HolidayListView(generics.ListAPIView):
+    """API view for listing holiday entries with pagination.
+    
+    This view provides a paginated list of holiday entries for a specific file.
+    
+    Query Parameters:
+    - page, page_size: Pagination controls
+    - user_name: Filter by user name
+    - account: Filter by account
+    - date_from, date_to: Posting date range
+    - amount_range: Comma-separated min,max (e.g., amount_range=1000,5000)
+    - risk_level: Filter by risk level (LOW, MEDIUM, HIGH, CRITICAL)
+    - holiday_type: Filter by holiday type (Public holiday, Observance, etc.)
+    - holiday_name: Filter by holiday name
+    - high_value: Filter by high value transactions (true/false)
+    - ordering: Field to order by (e.g., -amount, posting_date, -risk_level)
+    """
+    
+    serializer_class = HolidayListSerializer
+    pagination_class = SAPGLPostingPagination
+    
+    def get_queryset(self):
+        """Get holiday entries for the specified file"""
+        file_id = self.kwargs.get('file_id')
+        
+        try:
+            # Get the latest holiday analysis result
+            from .models import HolidayAnalysisResult
+            holiday_analysis = HolidayAnalysisResult.objects.filter(
+                data_file_id=file_id, status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            if not holiday_analysis:
+                return []
+            
+            # Get holiday entries from the analysis
+            holiday_entries = holiday_analysis.holiday_postings or []
+            
+            # Apply filters
+            filtered_entries = self._apply_filters(holiday_entries)
+            
+            return filtered_entries
+            
+        except Exception as e:
+            logger.error(f"Error fetching holiday data: {e}")
+            return []
+    
+    def _apply_filters(self, holiday_entries):
+        """Apply filters to holiday entries based on actual data structure"""
+        filtered_entries = holiday_entries
+        
+        # Filter by user name
+        user_name = self.request.query_params.get('user_name')
+        if user_name:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if user_name.lower() in entry.get('user_name', '').lower()
+            ]
+        
+        # Filter by account
+        account = self.request.query_params.get('account')
+        if account:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if entry.get('gl_account') == account
+            ]
+        
+        # Filter by posting date range
+        date_from = self.request.query_params.get('date_from')
+        date_to = self.request.query_params.get('date_to')
+        if date_from or date_to:
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if self._is_date_in_range(entry.get('posting_date'), date_from, date_to)
+            ]
+        
+        # Filter by amount range
+        amount_range = self.request.query_params.get('amount_range')
+        if amount_range:
+            try:
+                min_amount, max_amount = map(float, amount_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_amount <= float(entry.get('amount', 0)) <= max_amount
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Filter by risk level
+        risk_level = self.request.query_params.get('risk_level')
+        if risk_level:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if entry.get('risk_level', '').upper() == risk_level.upper()
+            ]
+        
+        # Filter by holiday type
+        holiday_type = self.request.query_params.get('holiday_type')
+        if holiday_type:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if holiday_type.lower() in entry.get('holiday_type', '').lower()
+            ]
+        
+        # Filter by holiday name
+        holiday_name = self.request.query_params.get('holiday_name')
+        if holiday_name:
+            filtered_entries = [
+                entry for entry in filtered_entries 
+                if holiday_name.lower() in entry.get('holiday_name', '').lower()
+            ]
+        
+        # Filter by high value
+        high_value = self.request.query_params.get('high_value')
+        if high_value is not None:
+            is_high_value = high_value.lower() == 'true'
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if float(entry.get('amount', 0)) > 10000000 == is_high_value
+            ]
+        
+        # Apply ordering
+        ordering = self.request.query_params.get('ordering', '-amount')
+        if ordering:
+            reverse = ordering.startswith('-')
+            field = ordering[1:] if reverse else ordering
+            
+            if field == 'amount':
+                filtered_entries.sort(key=lambda x: float(x.get('amount', 0)), reverse=reverse)
+            elif field == 'posting_date':
+                filtered_entries.sort(key=lambda x: x.get('posting_date', ''), reverse=reverse)
+            elif field == 'risk_level':
+                risk_order = {'LOW': 1, 'MEDIUM': 2, 'HIGH': 3, 'CRITICAL': 4}
+                filtered_entries.sort(key=lambda x: risk_order.get(x.get('risk_level', 'LOW'), 0), reverse=reverse)
+            elif field == 'risk_score':
+                filtered_entries.sort(key=lambda x: float(x.get('risk_score', 0)), reverse=reverse)
+        
+        return filtered_entries
+    
+    def _is_date_in_range(self, posting_date, date_from, date_to):
+        """Check if posting date is within the specified range"""
+        try:
+            if isinstance(posting_date, str):
+                posting_date = datetime.strptime(posting_date, '%Y-%m-%d').date()
+            
+            if date_from:
+                from_date = datetime.strptime(date_from, '%Y-%m-%d').date()
+                if posting_date < from_date:
+                    return False
+            
+            if date_to:
+                to_date = datetime.strptime(date_to, '%Y-%m-%d').date()
+                if posting_date > to_date:
+                    return False
+            
+            return True
+        except (ValueError, TypeError):
+            return False
+    
+    def list(self, request, *args, **kwargs):
+        """Return only paginated holiday entries listing"""
+        queryset = self.get_queryset()
+        
+        # Apply pagination
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)

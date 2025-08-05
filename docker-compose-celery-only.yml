@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  # Redis for Celery (only service that needs to be in Docker)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker (only Celery in Docker)
+  celery_worker:
+    build: .
+    command: celery -A analytics worker --loglevel=info --concurrency=4
+    volumes:
+      - .:/app
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=analytics.settings
+      # Database connection for local PostgreSQL
+      - DB_NAME=analytics-db
+      - DB_USER=postgres
+      - DB_PASSWORD=Malik@0900
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5432
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Celery Beat (for scheduled tasks)
+  celery_beat:
+    build: .
+    command: celery -A analytics beat --loglevel=info
+    volumes:
+      - .:/app
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=analytics.settings
+      # Database connection for local PostgreSQL
+      - DB_NAME=analytics-db
+      - DB_USER=postgres
+      - DB_PASSWORD=Malik@0900
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5432
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  redis_data: 

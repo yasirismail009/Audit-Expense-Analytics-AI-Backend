@@ -1741,6 +1741,7 @@ class RiskScoringDocument(models.Model):
     high_risk_transactions = models.IntegerField(default=0, help_text='Number of high-risk transactions')
     medium_risk_transactions = models.IntegerField(default=0, help_text='Number of medium-risk transactions')
     low_risk_transactions = models.IntegerField(default=0, help_text='Number of low-risk transactions')
+    critical_risk_transactions = models.IntegerField(default=0, help_text='Number of critical-risk transactions')
     overall_risk_score = models.FloatField(default=0.0, help_text='Overall risk score for the dataset')
     
     # Processing metadata
@@ -1799,10 +1800,12 @@ class RiskScoringDocument(models.Model):
             'high_risk': self.high_risk_transactions,
             'medium_risk': self.medium_risk_transactions,
             'low_risk': self.low_risk_transactions,
+            'critical_risk': self.critical_risk_transactions,
             'total': self.total_transactions,
             'high_risk_percentage': (self.high_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
             'medium_risk_percentage': (self.medium_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
             'low_risk_percentage': (self.low_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
+            'critical_risk_percentage': (self.critical_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
         }
 
 class HolidayAnalysisResult(models.Model):
@@ -2012,3 +2015,372 @@ class HolidayAnalysisResult(models.Model):
             }
         
         return summary
+
+class RuleBasedModelTraining(models.Model):
+    """Model to store Rule-based Model Training results"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Name of the training session')
+    description = models.TextField(blank=True, help_text='Description of the training session')
+    model_type = models.CharField(max_length=50, default='rule_based', help_text='Type of model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(default=0, help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    
+    # Training results
+    training_results = models.JSONField(default=dict, help_text='Detailed training results for each rule type')
+    performance_metrics = models.JSONField(default=dict, help_text='Performance metrics from training')
+    
+    # Training metadata
+    started_at = models.DateTimeField(auto_now_add=True, help_text='When training started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When training completed')
+    training_duration = models.FloatField(default=0.0, help_text='Training duration in seconds')
+    
+    # Status
+    status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed')
+    ], default='PENDING', help_text='Training status')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, help_text='Error message if training failed')
+    
+    class Meta:
+        db_table = 'rule_based_model_training'
+        ordering = ['-started_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.status}"
+    
+    def get_training_summary(self):
+        """Get a summary of the training results"""
+        return {
+            'session_name': self.session_name,
+            'model_type': self.model_type,
+            'training_data_size': self.training_data_size,
+            'training_duration': self.training_duration,
+            'status': self.status,
+            'models_trained': len(self.training_results) if self.training_results else 0,
+            'performance_metrics': self.performance_metrics
+        }
+    
+    def get_rule_thresholds(self):
+        """Get optimized rule thresholds from training results"""
+        thresholds = {}
+        
+        if self.training_results:
+            # Extract thresholds from each rule type
+            for rule_type, results in self.training_results.items():
+                if 'optimal_thresholds' in results:
+                    thresholds[rule_type] = results['optimal_thresholds']
+        
+        return thresholds
+    
+    def get_training_accuracy(self):
+        """Get overall training accuracy"""
+        if self.performance_metrics and 'training_accuracy' in self.performance_metrics:
+            return self.performance_metrics['training_accuracy']
+        return 0.0
+
+class DuplicateAnalysisModelTraining(models.Model):
+    """Model to store Duplicate Analysis Model Training results"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Name of the training session')
+    description = models.TextField(blank=True, help_text='Description of the training session')
+    model_type = models.CharField(max_length=50, default='duplicate_analysis', help_text='Type of model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(default=0, help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    
+    # Training results
+    training_results = models.JSONField(default=dict, help_text='Detailed training results for duplicate detection')
+    performance_metrics = models.JSONField(default=dict, help_text='Performance metrics from training')
+    
+    # Training metadata
+    started_at = models.DateTimeField(auto_now_add=True, help_text='When training started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When training completed')
+    training_duration = models.FloatField(default=0.0, help_text='Training duration in seconds')
+    
+    # Status
+    status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed')
+    ], default='PENDING', help_text='Training status')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, help_text='Error message if training failed')
+    
+    class Meta:
+        db_table = 'duplicate_analysis_model_training'
+        ordering = ['-started_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.status}"
+    
+    def get_training_summary(self):
+        """Get a summary of the training results"""
+        return {
+            'session_name': self.session_name,
+            'model_type': self.model_type,
+            'training_data_size': self.training_data_size,
+            'training_duration': self.training_duration,
+            'status': self.status,
+            'performance_metrics': self.performance_metrics
+        }
+
+class BackdatedAnalysisModelTraining(models.Model):
+    """Model to store Backdated Analysis Model Training results"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Name of the training session')
+    description = models.TextField(blank=True, help_text='Description of the training session')
+    model_type = models.CharField(max_length=50, default='backdated_analysis', help_text='Type of model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(default=0, help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    
+    # Training results
+    training_results = models.JSONField(default=dict, help_text='Detailed training results for backdated detection')
+    performance_metrics = models.JSONField(default=dict, help_text='Performance metrics from training')
+    
+    # Training metadata
+    started_at = models.DateTimeField(auto_now_add=True, help_text='When training started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When training completed')
+    training_duration = models.FloatField(default=0.0, help_text='Training duration in seconds')
+    
+    # Status
+    status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed')
+    ], default='PENDING', help_text='Training status')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, help_text='Error message if training failed')
+    
+    class Meta:
+        db_table = 'backdated_analysis_model_training'
+        ordering = ['-started_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.status}"
+
+class UserAnalysisModelTraining(models.Model):
+    """Model to store User Analysis Model Training results"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Name of the training session')
+    description = models.TextField(blank=True, help_text='Description of the training session')
+    model_type = models.CharField(max_length=50, default='user_analysis', help_text='Type of model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(default=0, help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    
+    # Training results
+    training_results = models.JSONField(default=dict, help_text='Detailed training results for user anomaly detection')
+    performance_metrics = models.JSONField(default=dict, help_text='Performance metrics from training')
+    
+    # Training metadata
+    started_at = models.DateTimeField(auto_now_add=True, help_text='When training started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When training completed')
+    training_duration = models.FloatField(default=0.0, help_text='Training duration in seconds')
+    
+    # Status
+    status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed')
+    ], default='PENDING', help_text='Training status')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, help_text='Error message if training failed')
+    
+    class Meta:
+        db_table = 'user_analysis_model_training'
+        ordering = ['-started_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.status}"
+
+class UnusualDaysAnalysisModelTraining(models.Model):
+    """Model to store Unusual Days Analysis Model Training results"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Name of the training session')
+    description = models.TextField(blank=True, help_text='Description of the training session')
+    model_type = models.CharField(max_length=50, default='unusual_days_analysis', help_text='Type of model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(default=0, help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    
+    # Training results
+    training_results = models.JSONField(default=dict, help_text='Detailed training results for unusual days detection')
+    performance_metrics = models.JSONField(default=dict, help_text='Performance metrics from training')
+    
+    # Training metadata
+    started_at = models.DateTimeField(auto_now_add=True, help_text='When training started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When training completed')
+    training_duration = models.FloatField(default=0.0, help_text='Training duration in seconds')
+    
+    # Status
+    status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed')
+    ], default='PENDING', help_text='Training status')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, help_text='Error message if training failed')
+    
+    class Meta:
+        db_table = 'unusual_days_analysis_model_training'
+        ordering = ['-started_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.status}"
+
+class ClosingEntriesAnalysisModelTraining(models.Model):
+    """Model to store Closing Entries Analysis Model Training results"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Name of the training session')
+    description = models.TextField(blank=True, help_text='Description of the training session')
+    model_type = models.CharField(max_length=50, default='closing_entries_analysis', help_text='Type of model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(default=0, help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    
+    # Training results
+    training_results = models.JSONField(default=dict, help_text='Detailed training results for closing entries detection')
+    performance_metrics = models.JSONField(default=dict, help_text='Performance metrics from training')
+    
+    # Training metadata
+    started_at = models.DateTimeField(auto_now_add=True, help_text='When training started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When training completed')
+    training_duration = models.FloatField(default=0.0, help_text='Training duration in seconds')
+    
+    # Status
+    status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed')
+    ], default='PENDING', help_text='Training status')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, help_text='Error message if training failed')
+    
+    class Meta:
+        db_table = 'closing_entries_analysis_model_training'
+        ordering = ['-started_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.status}"
+
+class HolidayAnalysisModelTraining(models.Model):
+    """Model to store Holiday Analysis Model Training results"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Name of the training session')
+    description = models.TextField(blank=True, help_text='Description of the training session')
+    model_type = models.CharField(max_length=50, default='holiday_analysis', help_text='Type of model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(default=0, help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    
+    # Training results
+    training_results = models.JSONField(default=dict, help_text='Detailed training results for holiday detection')
+    performance_metrics = models.JSONField(default=dict, help_text='Performance metrics from training')
+    
+    # Training metadata
+    started_at = models.DateTimeField(auto_now_add=True, help_text='When training started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When training completed')
+    training_duration = models.FloatField(default=0.0, help_text='Training duration in seconds')
+    
+    # Status
+    status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed')
+    ], default='PENDING', help_text='Training status')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, help_text='Error message if training failed')
+    
+    class Meta:
+        db_table = 'holiday_analysis_model_training'
+        ordering = ['-started_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.status}"
+
+class OverallRiskAnalysisModelTraining(models.Model):
+    """Model to store Overall Risk Analysis Model Training results"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Name of the training session')
+    description = models.TextField(blank=True, help_text='Description of the training session')
+    model_type = models.CharField(max_length=50, default='overall_risk_analysis', help_text='Type of model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(default=0, help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    
+    # Training results
+    training_results = models.JSONField(default=dict, help_text='Detailed training results for overall risk analysis')
+    performance_metrics = models.JSONField(default=dict, help_text='Performance metrics from training')
+    
+    # Training metadata
+    started_at = models.DateTimeField(auto_now_add=True, help_text='When training started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When training completed')
+    training_duration = models.FloatField(default=0.0, help_text='Training duration in seconds')
+    
+    # Status
+    status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed')
+    ], default='PENDING', help_text='Training status')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, help_text='Error message if training failed')
+    
+    class Meta:
+        db_table = 'overall_risk_analysis_model_training'
+        ordering = ['-started_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.status}"

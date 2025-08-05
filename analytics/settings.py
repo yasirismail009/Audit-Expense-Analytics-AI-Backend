@@ -77,14 +77,15 @@ WSGI_APPLICATION = 'analytics.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+# Database Configuration
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.getenv('DB_NAME', 'analytics-db'),
-        'USER': os.getenv('DB_USER', 'postgres'),
-        'PASSWORD': os.getenv('DB_PASSWORD', 'Malik@0900'),
-        'HOST': os.getenv('DB_HOST', 'localhost'),
-        'PORT': os.getenv('DB_PORT', '5432'),
+        'NAME': os.getenv('POSTGRES_DB', 'analytics_db'),
+        'USER': os.getenv('POSTGRES_USER', 'analytics_user'),
+        'PASSWORD': os.getenv('POSTGRES_PASSWORD', 'analytics_password'),
+        'HOST': os.getenv('POSTGRES_HOST', 'db'),
+        'PORT': os.getenv('POSTGRES_PORT', '5432'),
         'OPTIONS': {
             'client_encoding': 'UTF8',
         },
@@ -126,7 +127,17 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+
+# Extra places for collectstatic to find static files.
+STATICFILES_DIRS = [
+    os.path.join(BASE_DIR, 'static'),
+]
+
+# Media files
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
@@ -177,15 +188,29 @@ CORS_ALLOW_HEADERS = [
 # https://docs.celeryproject.org/en/stable/django/first-steps-with-django.html
 
 # Celery broker settings - Using Redis for better performance
-CELERY_BROKER_URL = 'redis://localhost:6379/0'
-CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
-
-# Celery task settings
+# Celery Configuration
+CELERY_BROKER_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TIMEZONE = TIME_ZONE
-CELERY_ENABLE_UTC = True
+CELERY_TIMEZONE = 'UTC'
+
+# Force Redis transport and disable AMQP
+CELERY_BROKER_TRANSPORT = 'redis'
+CELERY_RESULT_BACKEND_TRANSPORT = 'redis'
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    'visibility_timeout': 3600,
+    'fanout_prefix': True,
+    'fanout_patterns': True,
+}
+CELERY_TASK_ALWAYS_EAGER = False
+CELERY_TASK_EAGER_PROPAGATES = True
+
+# Disable AMQP transport completely
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_BROKER_CONNECTION_MAX_RETRIES = 10
+CELERY_BROKER_CONNECTION_RETRY = True
 
 # Celery task routing
 CELERY_TASK_ROUTES = {
@@ -237,6 +262,8 @@ BACKGROUND_PROCESSING_TIMEOUT = 300  # 5 minutes
 # Celery fallback settings
 ENABLE_SYNC_FALLBACK = True  # Enable synchronous processing when Celery is not available
 CELERY_CONNECTION_TIMEOUT = 5  # Timeout for Celery connection test (seconds)
+
+# Celery task timeout and retry settings
 
 # Celery task timeout and retry settings
 CELERY_TASK_TIME_LIMIT = 300  # 5 minutes
@@ -309,7 +336,17 @@ LOGGING = {
         },
         'celery': {
             'handlers': ['console', 'file'],
-            'level': 'INFO',
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'celery.task': {
+            'handlers': ['console', 'file'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'celery.worker': {
+            'handlers': ['console', 'file'],
+            'level': 'DEBUG',
             'propagate': False,
         },
     },

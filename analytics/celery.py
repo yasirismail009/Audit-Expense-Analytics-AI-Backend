@@ -14,6 +14,14 @@ app = Celery('analytics')
 # the configuration object to child processes.
 app.config_from_object('django.conf:settings', namespace='CELERY')
 
+# Explicitly configure broker to use Redis
+app.conf.update(
+    broker_url=os.environ.get('REDIS_URL', 'redis://localhost:6379/0'),
+    result_backend=os.environ.get('REDIS_URL', 'redis://localhost:6379/0'),
+    broker_transport='redis',
+    result_backend_transport='redis',
+)
+
 # Load task modules from all registered Django apps.
 app.autodiscover_tasks()
 

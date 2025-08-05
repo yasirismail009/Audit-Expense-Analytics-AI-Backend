@@ -54,15 +54,15 @@ class Command(BaseCommand):
                 raise CommandError(f'Job with ID {options["job_id"]} not found')
         elif options['all']:
             jobs = FileProcessingJob.objects.filter(
-                status__in=['PENDING', 'FAILED']
+                status__in=['PENDING', 'QUEUED', 'FAILED']
             ).order_by('created_at')
         elif options['pending']:
-            jobs = FileProcessingJob.objects.filter(status='PENDING').order_by('created_at')
+            jobs = FileProcessingJob.objects.filter(status__in=['PENDING', 'QUEUED']).order_by('created_at')
         elif options['failed']:
             jobs = FileProcessingJob.objects.filter(status='FAILED').order_by('created_at')
         else:
-            # Default: process pending jobs
-            jobs = FileProcessingJob.objects.filter(status='PENDING').order_by('created_at')
+            # Default: process pending and queued jobs
+            jobs = FileProcessingJob.objects.filter(status__in=['PENDING', 'QUEUED']).order_by('created_at')
         
         job_count = jobs.count()
         
@@ -199,9 +199,8 @@ class Command(BaseCommand):
             # 1. General Analysis
             self.stdout.write('   📈 Running General Analysis...')
             try:
-                from core.tasks import run_general_analysis
-                # Call the function directly without self
-                general_result = run_general_analysis.__wrapped__(mock_task, str(job.id))
+                from core.sync_analysis import run_general_analysis_sync
+                general_result = run_general_analysis_sync(str(job.id))
                 analysis_results['general_analysis'] = general_result
                 self.stdout.write(f'   ✅ General Analysis completed')
             except Exception as e:
@@ -211,9 +210,8 @@ class Command(BaseCommand):
             # 2. Duplicate Analysis
             self.stdout.write('   🔍 Running Duplicate Analysis...')
             try:
-                from core.tasks import run_duplicate_analysis
-                # Call the function directly without self
-                duplicate_result = run_duplicate_analysis.__wrapped__(mock_task, str(job.id))
+                from core.sync_analysis import run_duplicate_analysis_sync
+                duplicate_result = run_duplicate_analysis_sync(str(job.id))
                 analysis_results['duplicate_analysis'] = duplicate_result
                 self.stdout.write(f'   ✅ Duplicate Analysis completed')
             except Exception as e:
@@ -223,9 +221,8 @@ class Command(BaseCommand):
             # 3. Backdated Analysis
             self.stdout.write('   📅 Running Backdated Analysis...')
             try:
-                from core.tasks import run_backdated_analysis
-                # Call the function directly without self
-                backdated_result = run_backdated_analysis.__wrapped__(mock_task, str(job.id))
+                from core.sync_analysis import run_backdated_analysis_sync
+                backdated_result = run_backdated_analysis_sync(str(job.id))
                 analysis_results['backdated_analysis'] = backdated_result
                 self.stdout.write(f'   ✅ Backdated Analysis completed')
             except Exception as e:
@@ -235,9 +232,8 @@ class Command(BaseCommand):
             # 4. Overall Analysis
             self.stdout.write('   📊 Running Overall Analysis...')
             try:
-                from core.tasks import run_overall_analysis
-                # Call the function directly without self
-                overall_result = run_overall_analysis.__wrapped__(mock_task, str(job.id))
+                from core.sync_analysis import run_overall_analysis_sync
+                overall_result = run_overall_analysis_sync(str(job.id))
                 analysis_results['overall_analysis'] = overall_result
                 self.stdout.write(f'   ✅ Overall Analysis completed')
             except Exception as e:
@@ -247,9 +243,8 @@ class Command(BaseCommand):
             # 5. Risk Analysis
             self.stdout.write('   ⚠️  Running Risk Analysis...')
             try:
-                from core.tasks import run_risk_analysis
-                # Call the function directly without self
-                risk_result = run_risk_analysis.__wrapped__(mock_task, str(job.id))
+                from core.sync_analysis import run_risk_analysis_sync
+                risk_result = run_risk_analysis_sync(str(job.id))
                 analysis_results['risk_analysis'] = risk_result
                 self.stdout.write(f'   ✅ Risk Analysis completed')
             except Exception as e:

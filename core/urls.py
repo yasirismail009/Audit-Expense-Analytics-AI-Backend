@@ -30,12 +30,20 @@ urlpatterns = [
     path('user-analysis/<uuid:file_id>/', views.UserAnalysisView.as_view(), name='user-analysis'),
     # Unusual days analysis endpoint
     path('unusual-days-analysis/<uuid:file_id>/', views.UnusualDaysAnalysisView.as_view(), name='unusual-days-analysis'),
+    # Unusual days entries listing endpoint
+    path('unusual-days-list/<uuid:file_id>/', views.UnusualDaysListView.as_view(), name='unusual-days-list'),
     # Closing entries analysis endpoint
     path('closing-entries-analysis/<uuid:file_id>/', views.ClosingEntriesAnalysisView.as_view(), name='closing-entries-analysis'),
+    # Closing entries listing endpoint
+    path('closing-entries-list/<uuid:file_id>/', views.ClosingEntriesListView.as_view(), name='closing-entries-list'),
     # Backdated analysis endpoint
     path('backdated-analysis/<uuid:file_id>/', views.BackdatedAnalysisView.as_view(), name='backdated-analysis'),
+    # Backdated entries listing endpoint
+    path('backdated-entries-list/<uuid:file_id>/', views.BackdatedEntriesListView.as_view(), name='backdated-entries-list'),
     # Holiday analysis endpoint
     path('holiday-analysis/<uuid:file_id>/', views.HolidayAnalysisView.as_view(), name='holiday-analysis'),
+    # Holiday entries listing endpoint
+    # path('holiday-entries-list/<uuid:file_id>/', views.HolidayListView.as_view(), name='holiday-entries-list'),
     # File GL accounts endpoint
     path('file-gl-accounts/<uuid:file_id>/', views.FileGLAccountsView.as_view(), name='file-gl-accounts'),
 ] 

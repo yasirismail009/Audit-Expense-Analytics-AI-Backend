@@ -21,7 +21,9 @@ import holidays
 from django.db import models
 from .models import (
     SAPGLPosting, OverallAnalysisResult, DuplicateAnalysisResult, 
-    BackdatedAnalysisResult, GeneralAnalysisResult, RiskScoringDocument
+    BackdatedAnalysisResult, GeneralAnalysisResult, RiskScoringDocument,
+    UserAnalysisResult, UnusualDaysAnalysisResult, ClosingEntriesAnalysisResult,
+    HolidayAnalysisResult
 )
 
 logger = logging.getLogger(__name__)

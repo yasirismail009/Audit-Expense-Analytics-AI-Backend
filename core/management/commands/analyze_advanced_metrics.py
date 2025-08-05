@@ -1,19 +1,18 @@
 from django.core.management.base import BaseCommand
 from django.db import transaction
-from core.models import ExpenseSheet, SheetAnalysis
-from core.analytics import ExpenseSheetAnalyzer
+from core.models import DataFile, FileProcessingJob, OverallAnalysisResult, RiskScoringDocument, UserAnalysisResult, DuplicateAnalysisResult, BackdatedAnalysisResult, HolidayAnalysisResult, ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult
+from django.utils import timezone
 import json
 
 class Command(BaseCommand):
-    help = 'Run advanced expense analytics on all expense sheets'
+    help = 'Run overall analysis on all data files and generate comprehensive reports'
 
     def add_arguments(self, parser):
         parser.add_argument(
-            '--sheet-id',
-            type=int,
-            help='Analyze specific expense sheet by ID',
+            '--file-id',
+            type=str,
+            help='Analyze specific file by ID',
         )
-        # Removed --output argument
         parser.add_argument(
             '--verbose',
             action='store_true',
@@ -21,144 +20,196 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        analyzer = ExpenseSheetAnalyzer()
+        self.stdout.write("🔍 Starting Overall Analysis...")
         
-        # Get expense sheets to analyze
-        if options['sheet_id']:
+        # Get files to analyze
+        if options['file_id']:
             try:
-                sheets = [ExpenseSheet.objects.get(id=options['sheet_id'])]
-                self.stdout.write(f"Analyzing specific sheet: {sheets[0].display_name}")
-            except ExpenseSheet.DoesNotExist:
-                self.stdout.write(self.style.ERROR(f"Expense sheet with ID {options['sheet_id']} not found"))
+                files = [DataFile.objects.get(id=options['file_id'])]
+                self.stdout.write(f"Analyzing specific file: {files[0].file_name}")
+            except DataFile.DoesNotExist:
+                self.stdout.write(self.style.ERROR(f"File with ID {options['file_id']} not found"))
                 return
         else:
-            sheets = ExpenseSheet.objects.all()
-            self.stdout.write(f"Analyzing {sheets.count()} expense sheets")
+            files = DataFile.objects.filter(status='COMPLETED')
+            self.stdout.write(f"Analyzing {files.count()} completed files")
 
         results = []
         
-        for sheet in sheets:
-            self.stdout.write(f"\nAnalyzing: {sheet.display_name}")
+        for data_file in files:
+            self.stdout.write(f"\n📊 Analyzing: {data_file.file_name}")
             
             try:
-                # Run analysis
-                sheet_analysis = analyzer.analyze_sheet(sheet)
+                # Get all analysis results for this file
+                analysis_summary = self._analyze_file(data_file)
                 
-                if sheet_analysis:
-                    # Get the advanced metrics from the analysis
-                    advanced_metrics = getattr(sheet_analysis, 'expense_velocity_ratio', None)
+                if analysis_summary:
+                    results.append(analysis_summary)
                     
-                    if advanced_metrics is not None:
-                        # Extract advanced metrics from the analysis
-                        basic_metrics = getattr(sheet_analysis, 'basic_metrics', {})
-                        risk_indicators = getattr(sheet_analysis, 'risk_indicators', {})
-                        
-                        result = {
-                            'sheet_id': sheet.id,
-                            'sheet_name': sheet.display_name,
-                            'basic_metrics': basic_metrics,
-                            'expense_velocity_ratio': getattr(sheet_analysis, 'expense_velocity_ratio', 0),
-                            'approval_concentration_index': getattr(sheet_analysis, 'approval_concentration_index', 0),
-                            'payment_method_risk_score': getattr(sheet_analysis, 'payment_method_risk_score', 0),
-                            'vendor_concentration_ratio': getattr(sheet_analysis, 'vendor_concentration_ratio', 0),
-                            'high_value_expense_frequency': getattr(sheet_analysis, 'high_value_expense_frequency', {}),
-                            'risk_indicators': risk_indicators,
-                            'overall_fraud_score': getattr(sheet_analysis, 'overall_fraud_score', 0),
-                            'risk_level': getattr(sheet_analysis, 'risk_level', 'UNKNOWN')
-                        }
-                        
-                        results.append(result)
-                        
-                        if options['verbose']:
-                            self._print_detailed_results(result)
-                        else:
-                            self._print_summary_results(result)
+                    if options['verbose']:
+                        self._print_detailed_results(analysis_summary)
                     else:
-                        self.stdout.write(self.style.WARNING("No advanced metrics found in analysis"))
+                        self._print_summary_results(analysis_summary)
                 else:
-                    self.stdout.write(self.style.WARNING("Analysis returned no results"))
+                    self.stdout.write(self.style.WARNING("No analysis results found for this file"))
                     
             except Exception as e:
-                self.stdout.write(self.style.ERROR(f"Error analyzing sheet {sheet.id}: {str(e)}"))
+                self.stdout.write(self.style.ERROR(f"Error analyzing file {data_file.id}: {str(e)}"))
                 continue
         
-        # Removed file saving block
         # Print overall summary
         if results:
             self._print_overall_summary(results)
         else:
             self.stdout.write(self.style.WARNING("No analysis results to display"))
 
+    def _analyze_file(self, data_file):
+        """Analyze a single file and return summary"""
+        try:
+            # Get processing job
+            job = FileProcessingJob.objects.filter(data_file=data_file, status='COMPLETED').first()
+            if not job:
+                return None
+            
+            # Get various analysis results
+            overall_analysis = OverallAnalysisResult.objects.filter(data_file=data_file).first()
+            risk_document = RiskScoringDocument.objects.filter(data_file=data_file).first()
+            user_analysis = UserAnalysisResult.objects.filter(data_file=data_file).first()
+            duplicate_analysis = DuplicateAnalysisResult.objects.filter(data_file=data_file).first()
+            backdated_analysis = BackdatedAnalysisResult.objects.filter(data_file=data_file).first()
+            holiday_analysis = HolidayAnalysisResult.objects.filter(data_file=data_file).first()
+            closing_entries_analysis = ClosingEntriesAnalysisResult.objects.filter(data_file=data_file).first()
+            unusual_days_analysis = UnusualDaysAnalysisResult.objects.filter(data_file=data_file).first()
+            
+            # Calculate summary statistics
+            total_transactions = getattr(overall_analysis, 'transaction_summary', {}).get('total_transactions', 0) if overall_analysis else 0
+            total_amount = getattr(overall_analysis, 'transaction_summary', {}).get('total_amount', 0) if overall_analysis else 0
+            
+            # Risk analysis
+            risk_level = 'UNKNOWN'
+            risk_score = 0.0
+            if risk_document:
+                risk_score = risk_document.overall_risk_score
+                if risk_score >= 80:
+                    risk_level = 'CRITICAL'
+                elif risk_score >= 60:
+                    risk_level = 'HIGH'
+                elif risk_score >= 40:
+                    risk_level = 'MEDIUM'
+                else:
+                    risk_level = 'LOW'
+            
+            # Anomaly counts
+            duplicate_count = duplicate_analysis.get_duplicate_count() if duplicate_analysis else 0
+            backdated_count = backdated_analysis.get_backdated_count() if backdated_analysis else 0
+            holiday_count = len(holiday_analysis.holiday_postings) if holiday_analysis and holiday_analysis.holiday_postings else 0
+            user_anomalies = len(user_analysis.user_anomalies) if user_analysis and user_analysis.user_anomalies else 0
+            unusual_days_count = unusual_days_analysis.get_weekend_transactions_count() if unusual_days_analysis else 0
+            closing_entries_count = closing_entries_analysis.get_closing_entries_count() if closing_entries_analysis else 0
+            
+            # Calculate total anomalies
+            total_anomalies = duplicate_count + backdated_count + holiday_count + user_anomalies + unusual_days_count + closing_entries_count
+            
+            return {
+                'file_id': str(data_file.id),
+                'file_name': data_file.file_name,
+                'total_transactions': total_transactions,
+                'total_amount': total_amount,
+                'risk_level': risk_level,
+                'risk_score': risk_score,
+                'duplicate_count': duplicate_count,
+                'backdated_count': backdated_count,
+                'holiday_count': holiday_count,
+                'holiday_breakdown': holiday_analysis.analysis_info.get('holiday_breakdown', []) if holiday_analysis else [],
+                'user_anomalies': user_anomalies,
+                'unusual_days_count': unusual_days_count,
+                'closing_entries_count': closing_entries_count,
+                'total_anomalies': total_anomalies,
+                'anomaly_percentage': (total_anomalies / total_transactions * 100) if total_transactions > 0 else 0,
+                'has_overall_analysis': overall_analysis is not None,
+                'has_risk_analysis': risk_document is not None,
+                'has_user_analysis': user_analysis is not None,
+                'has_duplicate_analysis': duplicate_analysis is not None,
+                'has_backdated_analysis': backdated_analysis is not None,
+                'has_holiday_analysis': holiday_analysis is not None,
+                'has_closing_entries_analysis': closing_entries_analysis is not None,
+                'has_unusual_days_analysis': unusual_days_analysis is not None,
+            }
+            
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"Error in _analyze_file: {str(e)}"))
+            return None
+
     def _print_summary_results(self, result):
         """Print summary of analysis results"""
-        self.stdout.write(f"  Risk Level: {result['risk_level']}")
-        self.stdout.write(f"  Fraud Score: {result['overall_fraud_score']:.1f}")
-        self.stdout.write(f"  EVR: ${result['expense_velocity_ratio']:.2f}/day")
-        self.stdout.write(f"  ACI: {result['approval_concentration_index']:.1f}%")
-        self.stdout.write(f"  PMRS: {result['payment_method_risk_score']:.1f}%")
-        self.stdout.write(f"  VCR: {result['vendor_concentration_ratio']:.1f}%")
+        self.stdout.write(f"  📊 Transactions: {result['total_transactions']:,}")
+        self.stdout.write(f"  💰 Total Amount: ${result['total_amount']:,.2f}")
+        self.stdout.write(f"  ⚠️  Risk Level: {result['risk_level']} ({result['risk_score']:.1f})")
+        self.stdout.write(f"  🚨 Anomalies: {result['total_anomalies']} ({result['anomaly_percentage']:.1f}%)")
 
     def _print_detailed_results(self, result):
         """Print detailed analysis results"""
-        self.stdout.write("\n" + "="*50)
-        self.stdout.write(f"Detailed Analysis: {result['sheet_name']}")
-        self.stdout.write("="*50)
+        self.stdout.write("\n" + "="*60)
+        self.stdout.write(f"Detailed Analysis: {result['file_name']}")
+        self.stdout.write("="*60)
         
         # Basic metrics
-        basic = result['basic_metrics']
         self.stdout.write(f"\n📊 BASIC METRICS:")
-        self.stdout.write(f"   Total Expenses: {basic.get('total_expenses', 0)}")
-        self.stdout.write(f"   Total Amount: ${basic.get('total_amount', 0):,.2f}")
-        self.stdout.write(f"   Average Expense: ${basic.get('average_expense', 0):.2f}")
-        self.stdout.write(f"   Date Range: {basic.get('date_range_days', 0)} days")
+        self.stdout.write(f"   Total Transactions: {result['total_transactions']:,}")
+        self.stdout.write(f"   Total Amount: ${result['total_amount']:,.2f}")
+        self.stdout.write(f"   Average Transaction: ${result['total_amount']/result['total_transactions']:,.2f}" if result['total_transactions'] > 0 else "   Average Transaction: N/A")
         
-        # Key ratios
-        self.stdout.write(f"\n📈 KEY RATIOS:")
-        self.stdout.write(f"   Expense Velocity Ratio: ${result['expense_velocity_ratio']:.2f}/day")
-        self.stdout.write(f"   Approval Concentration: {result['approval_concentration_index']:.1f}%")
-        self.stdout.write(f"   Payment Method Risk: {result['payment_method_risk_score']:.1f}%")
-        self.stdout.write(f"   Vendor Concentration: {result['vendor_concentration_ratio']:.1f}%")
-        
-        # High-value expenses
-        hvef = result['high_value_expense_frequency']
-        self.stdout.write(f"\n💰 HIGH-VALUE EXPENSES:")
-        self.stdout.write(f"   Frequency: {hvef.get('percentage', 0):.1f}%")
-        self.stdout.write(f"   Threshold: ${hvef.get('threshold', 0):.2f}")
-        self.stdout.write(f"   Count: {hvef.get('count', 0)} out of {hvef.get('total_count', 0)}")
-        
-        # Risk indicators
-        risks = result['risk_indicators']
-        self.stdout.write(f"\n⚠️  RISK INDICATORS:")
-        self.stdout.write(f"   High ACI: {'YES' if risks.get('high_aci_warning') else 'NO'}")
-        self.stdout.write(f"   High PMRS: {'YES' if risks.get('high_pmrs_warning') else 'NO'}")
-        self.stdout.write(f"   High VCR: {'YES' if risks.get('high_vcr_warning') else 'NO'}")
-        self.stdout.write(f"   High HVEF: {'YES' if risks.get('high_hvef_warning') else 'NO'}")
-        self.stdout.write(f"   Complex Expenses: {risks.get('complex_expenses', 0)}")
-        
-        # Overall assessment
-        self.stdout.write(f"\n🎯 OVERALL ASSESSMENT:")
+        # Risk analysis
+        self.stdout.write(f"\n⚠️  RISK ANALYSIS:")
         self.stdout.write(f"   Risk Level: {result['risk_level']}")
-        self.stdout.write(f"   Fraud Score: {result['overall_fraud_score']:.1f}/100")
+        self.stdout.write(f"   Risk Score: {result['risk_score']:.1f}/100")
         
-        self.stdout.write("\n" + "="*50 + "\n")
+        # Anomaly breakdown
+        self.stdout.write(f"\n🚨 ANOMALY BREAKDOWN:")
+        self.stdout.write(f"   Duplicate Entries: {result['duplicate_count']}")
+        self.stdout.write(f"   Backdated Entries: {result['backdated_count']}")
+        self.stdout.write(f"   Holiday Postings: {result['holiday_count']}")
+        
+        # Show holiday breakdown if available
+        if result.get('holiday_breakdown'):
+            self.stdout.write(f"   📅 Holiday Details:")
+            for holiday_name, count in result['holiday_breakdown']:
+                self.stdout.write(f"      • {holiday_name}: {count} transactions")
+        
+        self.stdout.write(f"   User Anomalies: {result['user_anomalies']}")
+        self.stdout.write(f"   Unusual Days (Weekend): {result.get('unusual_days_count', 0)}")
+        self.stdout.write(f"   Closing Entries: {result.get('closing_entries_count', 0)}")
+        self.stdout.write(f"   Total Anomalies: {result['total_anomalies']} ({result['anomaly_percentage']:.1f}%)")
+        
+        # Analysis coverage
+        self.stdout.write(f"\n📋 ANALYSIS COVERAGE:")
+        analyses = [
+            ('Overall Analysis', result['has_overall_analysis']),
+            ('Risk Analysis', result['has_risk_analysis']),
+            ('User Analysis', result['has_user_analysis']),
+            ('Duplicate Analysis', result['has_duplicate_analysis']),
+            ('Backdated Analysis', result['has_backdated_analysis']),
+            ('Holiday Analysis', result['has_holiday_analysis']),
+            ('Closing Entries Analysis', result['has_closing_entries_analysis']),
+            ('Unusual Days Analysis', result['has_unusual_days_analysis']),
+        ]
+        
+        for analysis_name, has_analysis in analyses:
+            status = "✅" if has_analysis else "❌"
+            self.stdout.write(f"   {status} {analysis_name}")
+        
+        self.stdout.write("="*60 + "\n")
 
     def _print_overall_summary(self, results):
         """Print overall summary of all analyses"""
-        self.stdout.write("\n" + "="*60)
+        self.stdout.write("\n" + "="*70)
         self.stdout.write("OVERALL SUMMARY")
-        self.stdout.write("="*60)
+        self.stdout.write("="*70)
         
-        total_sheets = len(results)
-        high_risk_sheets = len([r for r in results if r['risk_level'] in ['HIGH', 'CRITICAL']])
-        avg_fraud_score = sum(r['overall_fraud_score'] for r in results) / total_sheets
-        avg_evr = sum(r['expense_velocity_ratio'] for r in results) / total_sheets
-        avg_aci = sum(r['approval_concentration_index'] for r in results) / total_sheets
-        
-        self.stdout.write(f"\n📋 ANALYZED SHEETS: {total_sheets}")
-        self.stdout.write(f"⚠️  HIGH RISK SHEETS: {high_risk_sheets} ({high_risk_sheets/total_sheets*100:.1f}%)")
-        self.stdout.write(f"📊 AVERAGE FRAUD SCORE: {avg_fraud_score:.1f}/100")
-        self.stdout.write(f"💰 AVERAGE EVR: ${avg_evr:.2f}/day")
-        self.stdout.write(f"👤 AVERAGE ACI: {avg_aci:.1f}%")
+        total_files = len(results)
+        total_transactions = sum(r['total_transactions'] for r in results)
+        total_amount = sum(r['total_amount'] for r in results)
+        total_anomalies = sum(r['total_anomalies'] for r in results)
         
         # Risk level distribution
         risk_levels = {}
@@ -166,9 +217,28 @@ class Command(BaseCommand):
             level = result['risk_level']
             risk_levels[level] = risk_levels.get(level, 0) + 1
         
-        self.stdout.write(f"\n🎯 RISK LEVEL DISTRIBUTION:")
-        for level, count in sorted(risk_levels.items()):
-            percentage = count / total_sheets * 100
-            self.stdout.write(f"   {level}: {count} sheets ({percentage:.1f}%)")
+        # High risk files
+        high_risk_files = len([r for r in results if r['risk_level'] in ['HIGH', 'CRITICAL']])
         
-        self.stdout.write("="*60 + "\n") 
+        self.stdout.write(f"\n📋 ANALYZED FILES: {total_files}")
+        self.stdout.write(f"📊 TOTAL TRANSACTIONS: {total_transactions:,}")
+        self.stdout.write(f"💰 TOTAL AMOUNT: ${total_amount:,.2f}")
+        self.stdout.write(f"🚨 TOTAL ANOMALIES: {total_anomalies:,}")
+        self.stdout.write(f"⚠️  HIGH RISK FILES: {high_risk_files} ({high_risk_files/total_files*100:.1f}%)")
+        
+        # Risk level distribution
+        self.stdout.write(f"\n🎯 RISK LEVEL DISTRIBUTION:")
+        for level in ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']:
+            count = risk_levels.get(level, 0)
+            percentage = count / total_files * 100 if total_files > 0 else 0
+            self.stdout.write(f"   {level}: {count} files ({percentage:.1f}%)")
+        
+        # Average metrics
+        avg_risk_score = sum(r['risk_score'] for r in results) / total_files if total_files > 0 else 0
+        avg_anomaly_percentage = sum(r['anomaly_percentage'] for r in results) / total_files if total_files > 0 else 0
+        
+        self.stdout.write(f"\n📈 AVERAGE METRICS:")
+        self.stdout.write(f"   Average Risk Score: {avg_risk_score:.1f}/100")
+        self.stdout.write(f"   Average Anomaly Rate: {avg_anomaly_percentage:.1f}%")
+        
+        self.stdout.write("="*70 + "\n") 

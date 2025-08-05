@@ -733,3 +733,238 @@ class MLAnomalyResultsSerializer(serializers.Serializer):
     total_anomalies = serializers.IntegerField(help_text='Total anomalies detected')
     model_performance = serializers.DictField(help_text='Performance metrics for each model')
     processing_time = serializers.FloatField(help_text='Processing time in seconds') 
+
+class ClosingEntriesListSerializer(serializers.Serializer):
+    """Serializer for closing entries listing with pagination"""
+    
+    # Basic transaction information from actual data structure
+    transaction_id = serializers.CharField(help_text='Transaction ID')
+    document_number = serializers.CharField(help_text='SAP Document Number')
+    posting_date = serializers.CharField(help_text='Posting Date')
+    account = serializers.CharField(help_text='G/L Account Number')
+    amount = serializers.FloatField(help_text='Amount in Local Currency')
+    user = serializers.CharField(help_text='User Name')
+    
+    # Closing entry specific information
+    risk_level = serializers.CharField(help_text='Risk level (LOW, MEDIUM, HIGH, CRITICAL)')
+    days_from_month_end = serializers.IntegerField(help_text='Days from month end')
+    
+    # Additional computed fields
+    is_high_value = serializers.SerializerMethodField(help_text='Whether this is a high value transaction')
+    amount_formatted = serializers.SerializerMethodField(help_text='Formatted amount with currency')
+    risk_color = serializers.SerializerMethodField(help_text='Risk color for UI display')
+    month_end_indicator = serializers.SerializerMethodField(help_text='Whether this is a month-end transaction')
+    amount_category = serializers.SerializerMethodField(help_text='Amount category (High/Medium/Low)')
+    
+    def get_is_high_value(self, obj):
+        """Check if transaction is high value (> 10M)"""
+        return float(obj.get('amount', 0)) > 10000000
+    
+    def get_amount_formatted(self, obj):
+        """Format amount with currency"""
+        amount = float(obj.get('amount', 0))
+        return f"{amount:,.2f} SAR"
+    
+    def get_risk_color(self, obj):
+        """Get risk color for UI display"""
+        risk_level = obj.get('risk_level', 'LOW')
+        risk_colors = {
+            'LOW': '#28a745',      # Green
+            'MEDIUM': '#ffc107',   # Yellow
+            'HIGH': '#fd7e14',     # Orange
+            'CRITICAL': '#dc3545'  # Red
+        }
+        return risk_colors.get(risk_level, '#6c757d')  # Default gray
+    
+    def get_month_end_indicator(self, obj):
+        """Check if this is a month-end transaction (0-1 days from month end)"""
+        days_from_month_end = obj.get('days_from_month_end', 0)
+        return days_from_month_end <= 1
+    
+    def get_amount_category(self, obj):
+        """Get amount category"""
+        amount = float(obj.get('amount', 0))
+        if amount > 10000000:  # > 10M
+            return 'HIGH'
+        elif amount > 1000000:  # 1M-10M
+            return 'MEDIUM'
+        else:  # < 1M
+            return 'LOW' 
+
+class BackdatedEntriesListSerializer(serializers.Serializer):
+    """Serializer for backdated entries listing with pagination"""
+    
+    # Basic transaction information from actual data structure
+    transaction_id = serializers.CharField(help_text='Transaction ID')
+    document_number = serializers.CharField(help_text='SAP Document Number')
+    posting_date = serializers.CharField(help_text='Posting Date')
+    document_date = serializers.CharField(help_text='Document Date')
+    account = serializers.CharField(help_text='G/L Account Number')
+    amount = serializers.FloatField(help_text='Amount in Local Currency')
+    user = serializers.CharField(help_text='User Name')
+    
+    # Backdated specific information
+    risk_level = serializers.CharField(help_text='Risk level (LOW, MEDIUM, HIGH, CRITICAL)')
+    days_difference = serializers.IntegerField(help_text='Days difference between posting and document date')
+    
+    # Additional computed fields
+    is_high_value = serializers.SerializerMethodField(help_text='Whether this is a high value transaction')
+    amount_formatted = serializers.SerializerMethodField(help_text='Formatted amount with currency')
+    risk_color = serializers.SerializerMethodField(help_text='Risk color for UI display')
+    backdated_severity = serializers.SerializerMethodField(help_text='Backdated severity level')
+    amount_category = serializers.SerializerMethodField(help_text='Amount category (High/Medium/Low)')
+    
+    def get_is_high_value(self, obj):
+        """Check if transaction is high value (> 10M)"""
+        return float(obj.get('amount', 0)) > 10000000
+    
+    def get_amount_formatted(self, obj):
+        """Format amount with currency"""
+        amount = float(obj.get('amount', 0))
+        return f"{amount:,.2f} SAR"
+    
+    def get_risk_color(self, obj):
+        """Get risk color for UI display"""
+        risk_level = obj.get('risk_level', 'LOW')
+        risk_colors = {
+            'LOW': '#28a745',      # Green
+            'MEDIUM': '#ffc107',   # Yellow
+            'HIGH': '#fd7e14',     # Orange
+            'CRITICAL': '#dc3545'  # Red
+        }
+        return risk_colors.get(risk_level, '#6c757d')  # Default gray
+    
+    def get_backdated_severity(self, obj):
+        """Get backdated severity level based on days difference"""
+        days_difference = obj.get('days_difference', 0)
+        if days_difference <= 7:
+            return 'MINOR'
+        elif days_difference <= 30:
+            return 'MODERATE'
+        elif days_difference <= 90:
+            return 'SIGNIFICANT'
+        else:
+            return 'CRITICAL'
+    
+    def get_amount_category(self, obj):
+        """Get amount category"""
+        amount = float(obj.get('amount', 0))
+        if amount > 10000000:  # > 10M
+            return 'HIGH'
+        elif amount > 1000000:  # 1M-10M
+            return 'MEDIUM'
+        else:  # < 1M
+            return 'LOW' 
+
+class UnusualDaysListSerializer(serializers.Serializer):
+    """Serializer for unusual days entries listing with pagination"""
+    transaction_id = serializers.CharField(help_text='Transaction ID')
+    document_number = serializers.CharField(help_text='SAP Document Number')
+    posting_date = serializers.CharField(help_text='Posting Date')
+    account = serializers.CharField(help_text='G/L Account Number')
+    amount = serializers.FloatField(help_text='Amount in Local Currency')
+    user = serializers.CharField(help_text='User Name')
+    risk_level = serializers.CharField(help_text='Risk level (LOW, MEDIUM, HIGH, CRITICAL)')
+    day_of_week = serializers.CharField(help_text='Day of the week')
+    is_high_value = serializers.SerializerMethodField(help_text='Whether this is a high value transaction')
+    amount_formatted = serializers.SerializerMethodField(help_text='Formatted amount with currency')
+    risk_color = serializers.SerializerMethodField(help_text='Risk color for UI display')
+    day_type = serializers.SerializerMethodField(help_text='Type of day (Weekend, Holiday, etc.)')
+    amount_category = serializers.SerializerMethodField(help_text='Amount category (High/Medium/Low)')
+
+    def get_is_high_value(self, obj):
+        return float(obj.get('amount', 0)) > 10000000
+
+    def get_amount_formatted(self, obj):
+        return f"{float(obj.get('amount', 0)):,.2f} SAR"
+
+    def get_risk_color(self, obj):
+        risk_colors = {
+            'LOW': '#28a745', 
+            'MEDIUM': '#ffc107', 
+            'HIGH': '#fd7e14', 
+            'CRITICAL': '#dc3545'
+        }
+        return risk_colors.get(obj.get('risk_level', 'LOW'), '#6c757d') 
+
+    def get_day_type(self, obj):
+        day_of_week = obj.get('day_of_week', '').lower()
+        if day_of_week in ['saturday', 'sunday']:
+            return 'WEEKEND'
+        return 'WEEKDAY'
+
+    def get_amount_category(self, obj):
+        amount = float(obj.get('amount', 0))
+        if amount > 10000000:
+            return 'HIGH'
+        elif amount > 1000000:
+            return 'MEDIUM'
+        else:
+            return 'LOW' 
+
+
+class HolidayListSerializer(serializers.Serializer):
+    """Serializer for holiday entries listing with pagination"""
+    
+    # Basic transaction information from actual data structure
+    transaction_id = serializers.CharField(help_text='Transaction ID')
+    document_number = serializers.CharField(help_text='SAP Document Number')
+    posting_date = serializers.CharField(help_text='Posting Date')
+    account = serializers.CharField(help_text='G/L Account Number')
+    amount = serializers.FloatField(help_text='Amount in Local Currency')
+    user = serializers.CharField(help_text='User Name')
+    
+    # Holiday specific information
+    holiday_name = serializers.CharField(help_text='Name of the holiday')
+    holiday_type = serializers.CharField(help_text='Type of holiday (Public holiday, Observance, etc.)')
+    risk_level = serializers.CharField(help_text='Risk level (LOW, MEDIUM, HIGH, CRITICAL)')
+    risk_score = serializers.FloatField(help_text='Risk score (0-100)')
+    
+    # Additional computed fields
+    is_high_value = serializers.SerializerMethodField(help_text='Whether this is a high value transaction')
+    amount_formatted = serializers.SerializerMethodField(help_text='Formatted amount with currency')
+    risk_color = serializers.SerializerMethodField(help_text='Risk color for UI display')
+    holiday_severity = serializers.SerializerMethodField(help_text='Holiday severity level')
+    amount_category = serializers.SerializerMethodField(help_text='Amount category (High/Medium/Low)')
+    
+    def get_is_high_value(self, obj):
+        """Check if transaction is high value (> 10M)"""
+        return float(obj.get('amount', 0)) > 10000000
+    
+    def get_amount_formatted(self, obj):
+        """Format amount with currency"""
+        amount = float(obj.get('amount', 0))
+        return f"{amount:,.2f} SAR"
+    
+    def get_risk_color(self, obj):
+        """Get risk color for UI display"""
+        risk_level = obj.get('risk_level', 'LOW')
+        risk_colors = {
+            'LOW': '#28a745',      # Green
+            'MEDIUM': '#ffc107',   # Yellow
+            'HIGH': '#fd7e14',     # Orange
+            'CRITICAL': '#dc3545'  # Red
+        }
+        return risk_colors.get(risk_level, '#6c757d')  # Default gray
+    
+    def get_holiday_severity(self, obj):
+        """Get holiday severity level based on risk score"""
+        risk_score = float(obj.get('risk_score', 0))
+        if risk_score >= 80:
+            return 'CRITICAL'
+        elif risk_score >= 60:
+            return 'HIGH'
+        elif risk_score >= 30:
+            return 'MODERATE'
+        else:
+            return 'LOW'
+    
+    def get_amount_category(self, obj):
+        """Get amount category"""
+        amount = float(obj.get('amount', 0))
+        if amount > 10000000:  # > 10M
+            return 'HIGH'
+        elif amount > 1000000:  # 1M-10M
+            return 'MEDIUM'
+        else:  # < 1M
+            return 'LOW' 
