@@ -147,6 +147,4 @@ debug.log
 
 # OS
 .DS_Store
-Thumbs.db 
-debug.log"debug.log" 
-"debug.log" 
+Thumbs.db
