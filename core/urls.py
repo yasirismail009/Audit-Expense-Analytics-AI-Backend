@@ -25,9 +25,13 @@ urlpatterns = [
     path('filter-dropdowns/<uuid:file_id>/', views.FilterDropdownDataView.as_view(), name='filter-dropdowns'),
     # Duplicate analysis endpoint
     path('duplicate-analysis/<uuid:file_id>/', views.DuplicateAnalysisView.as_view(), name='duplicate-analysis'),
+    # Duplicate entries listing endpoint
+    path('duplicate-list/<uuid:file_id>/', views.DuplicateListView.as_view(), name='duplicate-list'),
 
     # User analysis endpoint
     path('user-analysis/<uuid:file_id>/', views.UserAnalysisView.as_view(), name='user-analysis'),
+    # User entries listing endpoint
+    path('user-list/<uuid:file_id>/', views.UserListView.as_view(), name='user-list'),
     # Unusual days analysis endpoint
     path('unusual-days-analysis/<uuid:file_id>/', views.UnusualDaysAnalysisView.as_view(), name='unusual-days-analysis'),
     # Unusual days entries listing endpoint
@@ -43,7 +47,7 @@ urlpatterns = [
     # Holiday analysis endpoint
     path('holiday-analysis/<uuid:file_id>/', views.HolidayAnalysisView.as_view(), name='holiday-analysis'),
     # Holiday entries listing endpoint
-    # path('holiday-entries-list/<uuid:file_id>/', views.HolidayListView.as_view(), name='holiday-entries-list'),
+    path('holiday-entries-list/<uuid:file_id>/', views.HolidayListView.as_view(), name='holiday-entries-list'),
     # File GL accounts endpoint
     path('file-gl-accounts/<uuid:file_id>/', views.FileGLAccountsView.as_view(), name='file-gl-accounts'),
 ] 

@@ -1308,15 +1308,24 @@ def run_holiday_analysis_sync(job_id):
         # Run basic holiday analysis without ML orchestrator
         from datetime import datetime, timedelta
         
-        # Simple holiday detection (major US holidays)
-        major_holidays = [
-            (1, 1),   # New Year's Day
-            (7, 4),   # Independence Day
-            (12, 25), # Christmas
-            (11, 11), # Veterans Day
-            (9, 5),   # Labor Day (first Monday)
-            (5, 30),  # Memorial Day (last Monday)
-        ]
+        # Use holiday_utils to get dynamic Saudi Arabian holidays
+        from .holiday_utils import get_holidays, is_holiday
+        
+        # Get date range for holiday detection
+        start_date = data_file.audit_start_date if data_file.audit_start_date else datetime(data_file.fiscal_year, 1, 1).date()
+        end_date = data_file.audit_end_date if data_file.audit_end_date else datetime(data_file.fiscal_year, 12, 31).date()
+        
+        # Get Saudi Arabian holidays for the date range
+        try:
+            holidays = get_holidays('saudiarabian', start_date, end_date, include_observances=True)
+            holiday_dates = {h.date for h in holidays}
+            holiday_info = {h.date: {'name': h.name, 'type': h.holiday_type} for h in holidays}
+            logger.info(f"Retrieved {len(holidays)} Saudi Arabian holidays from {start_date} to {end_date}")
+        except Exception as e:
+            logger.error(f"Error retrieving holidays: {e}")
+            holidays = []
+            holiday_dates = set()
+            holiday_info = {}
         
         holiday_transactions = []
         holiday_by_user = {}
@@ -1324,24 +1333,13 @@ def run_holiday_analysis_sync(job_id):
         
         for t in transactions:
             if t.posting_date:
-                # Check if posting is on a major holiday
-                is_holiday = False
-                holiday_name = None
+                # Check if posting is on a Saudi Arabian holiday using pre-fetched holiday data
+                posting_date_str = t.posting_date.strftime('%Y-%m-%d')
                 
-                for month, day in major_holidays:
-                    if t.posting_date.month == month and t.posting_date.day == day:
-                        is_holiday = True
-                        if month == 1 and day == 1:
-                            holiday_name = "New Year's Day"
-                        elif month == 7 and day == 4:
-                            holiday_name = "Independence Day"
-                        elif month == 12 and day == 25:
-                            holiday_name = "Christmas"
-                        elif month == 11 and day == 11:
-                            holiday_name = "Veterans Day"
-                        break
-                
-                if is_holiday:
+                # Check if the posting date is in our pre-fetched holiday dates
+                if posting_date_str in holiday_dates:
+                    holiday_name = holiday_info.get(posting_date_str, {}).get('name', 'Saudi Holiday')
+                    
                     holiday_transactions.append({
                         'transaction_id': str(t.id),
                         'document_number': t.document_number,
@@ -1405,6 +1403,13 @@ def run_holiday_analysis_sync(job_id):
             'processing_duration': (timezone.now() - start_time).total_seconds()
         }
         
+        # Calculate overall risk score based on holiday transactions
+        total_amount = sum(float(t.get('amount', 0)) for t in holiday_transactions)
+        holiday_percentage = (len(holiday_transactions) / len(transactions) * 100) if transactions else 0.0
+        
+        # Risk score calculation: higher score for more holiday transactions and higher amounts
+        risk_score = min(100.0, (len(holiday_transactions) * 10) + (holiday_percentage * 2) + (total_amount / 1000000))
+        
         # Save to HolidayAnalysisResult table
         holiday_analysis_result = HolidayAnalysisResult.objects.create(
             data_file=data_file,
@@ -1415,8 +1420,10 @@ def run_holiday_analysis_sync(job_id):
                 'total_transactions': len(transactions),
                 'holiday_transactions_count': len(holiday_transactions),
                 'holiday_breakdown': _generate_holiday_breakdown(holiday_transactions),
-                'total_holiday_amount': sum(float(t.get('amount', 0)) for t in holiday_transactions),
-                'holidays_detected': list(set(t.get('holiday_name') for t in holiday_transactions))
+                'total_holiday_amount': total_amount,
+                'holidays_detected': list(set(t.get('holiday_name') for t in holiday_transactions)),
+                'overall_risk_score': risk_score,
+                'holiday_percentage': holiday_percentage
             },
             holiday_postings=holiday_transactions,
             chart_data=holiday_results.get('chart_data', {}),

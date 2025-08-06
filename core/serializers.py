@@ -894,13 +894,164 @@ class UnusualDaysListSerializer(serializers.Serializer):
         return 'WEEKDAY'
 
     def get_amount_category(self, obj):
+        """Get amount category"""
         amount = float(obj.get('amount', 0))
-        if amount > 10000000:
+        if amount > 10000000:  # > 10M
             return 'HIGH'
-        elif amount > 1000000:
+        elif amount > 1000000:  # 1M-10M
+            return 'MEDIUM'
+        else:  # < 1M
+            return 'LOW' 
+
+
+class DuplicateListSerializer(serializers.Serializer):
+    """Serializer for duplicate entries listing with pagination"""
+    
+    # Basic transaction information
+    transaction_id = serializers.CharField(help_text='Transaction ID')
+    document_number = serializers.CharField(help_text='SAP Document Number')
+    posting_date = serializers.CharField(help_text='Posting Date')
+    account = serializers.CharField(help_text='G/L Account Number')
+    amount = serializers.FloatField(help_text='Amount in Local Currency')
+    user = serializers.CharField(help_text='User Name')
+    
+    # Duplicate specific information
+    duplicate_type = serializers.CharField(help_text='Type of duplicate (Type 1-6)')
+    risk_level = serializers.CharField(help_text='Risk level (LOW, MEDIUM, HIGH, CRITICAL)')
+    risk_score = serializers.FloatField(help_text='Risk score (0-100)')
+    similarity_score = serializers.FloatField(help_text='Similarity score (0-1)')
+    matching_fields = serializers.ListField(help_text='Fields that match between duplicates')
+    
+    # Additional computed fields
+    is_high_value = serializers.SerializerMethodField(help_text='Whether this is a high value transaction')
+    amount_formatted = serializers.SerializerMethodField(help_text='Formatted amount with currency')
+    risk_color = serializers.SerializerMethodField(help_text='Risk color for UI display')
+    duplicate_severity = serializers.SerializerMethodField(help_text='Duplicate severity level')
+    amount_category = serializers.SerializerMethodField(help_text='Amount category (High/Medium/Low)')
+    duplicate_group_id = serializers.CharField(help_text='Unique identifier for the duplicate group')
+    
+    def get_is_high_value(self, obj):
+        """Check if transaction is high value (> 10M)"""
+        return float(obj.get('amount', 0)) > 10000000
+    
+    def get_amount_formatted(self, obj):
+        """Format amount with currency"""
+        amount = float(obj.get('amount', 0))
+        return f"{amount:,.2f} SAR"
+    
+    def get_risk_color(self, obj):
+        """Get risk color for UI display"""
+        risk_level = obj.get('risk_level', 'LOW')
+        risk_colors = {
+            'LOW': '#28a745',      # Green
+            'MEDIUM': '#ffc107',   # Yellow
+            'HIGH': '#fd7e14',     # Orange
+            'CRITICAL': '#dc3545'  # Red
+        }
+        return risk_colors.get(risk_level, '#6c757d')  # Default gray
+    
+    def get_duplicate_severity(self, obj):
+        """Get duplicate severity level based on type and risk score"""
+        duplicate_type = obj.get('duplicate_type', '')
+        risk_score = float(obj.get('risk_score', 0))
+        
+        if 'Type 6' in duplicate_type or risk_score > 80:
+            return 'CRITICAL'
+        elif 'Type 5' in duplicate_type or risk_score > 60:
+            return 'HIGH'
+        elif 'Type 4' in duplicate_type or risk_score > 40:
             return 'MEDIUM'
         else:
-            return 'LOW' 
+            return 'LOW'
+    
+    def get_amount_category(self, obj):
+        """Get amount category"""
+        amount = float(obj.get('amount', 0))
+        if amount > 10000000:  # > 10M
+            return 'HIGH'
+        elif amount > 1000000:  # 1M-10M
+            return 'MEDIUM'
+        else:  # < 1M
+            return 'LOW'
+
+
+class UserListSerializer(serializers.Serializer):
+    """Serializer for user entries listing with pagination"""
+    
+    # Basic user information
+    user = serializers.CharField(help_text='User Name')
+    transaction_count = serializers.IntegerField(help_text='Number of transactions')
+    total_amount = serializers.FloatField(help_text='Total amount of transactions')
+    avg_amount = serializers.FloatField(help_text='Average transaction amount')
+    
+    # User specific information
+    risk_level = serializers.CharField(help_text='Risk level (LOW, MEDIUM, HIGH, CRITICAL)')
+    risk_score = serializers.FloatField(help_text='Risk score (0-100)')
+    anomaly_count = serializers.IntegerField(help_text='Number of anomalies detected')
+    accounts = serializers.ListField(help_text='List of accounts used by user')
+    
+    # Additional computed fields
+    is_high_activity = serializers.SerializerMethodField(help_text='Whether this is a high activity user')
+    amount_formatted = serializers.SerializerMethodField(help_text='Formatted total amount with currency')
+    avg_amount_formatted = serializers.SerializerMethodField(help_text='Formatted average amount with currency')
+    risk_color = serializers.SerializerMethodField(help_text='Risk color for UI display')
+    user_severity = serializers.SerializerMethodField(help_text='User severity level')
+    activity_category = serializers.SerializerMethodField(help_text='Activity category (Low/Medium/High)')
+    accounts_count = serializers.SerializerMethodField(help_text='Number of unique accounts')
+    
+    def get_is_high_activity(self, obj):
+        """Check if user has high activity (> 50 transactions)"""
+        return int(obj.get('transaction_count', 0)) > 50
+    
+    def get_amount_formatted(self, obj):
+        """Format total amount with currency"""
+        amount = float(obj.get('total_amount', 0))
+        return f"{amount:,.2f} SAR"
+    
+    def get_avg_amount_formatted(self, obj):
+        """Format average amount with currency"""
+        amount = float(obj.get('avg_amount', 0))
+        return f"{amount:,.2f} SAR"
+    
+    def get_risk_color(self, obj):
+        """Get risk color for UI display"""
+        risk_level = obj.get('risk_level', 'LOW')
+        risk_colors = {
+            'LOW': '#28a745',      # Green
+            'MEDIUM': '#ffc107',   # Yellow
+            'HIGH': '#fd7e14',     # Orange
+            'CRITICAL': '#dc3545'  # Red
+        }
+        return risk_colors.get(risk_level, '#6c757d')  # Default gray
+    
+    def get_user_severity(self, obj):
+        """Get user severity level based on risk score and anomalies"""
+        risk_score = float(obj.get('risk_score', 0))
+        anomaly_count = int(obj.get('anomaly_count', 0))
+        
+        if risk_score > 80 or anomaly_count > 10:
+            return 'CRITICAL'
+        elif risk_score > 60 or anomaly_count > 5:
+            return 'HIGH'
+        elif risk_score > 40 or anomaly_count > 2:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    
+    def get_activity_category(self, obj):
+        """Get activity category based on transaction count"""
+        transaction_count = int(obj.get('transaction_count', 0))
+        if transaction_count > 100:
+            return 'HIGH'
+        elif transaction_count > 20:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    
+    def get_accounts_count(self, obj):
+        """Get number of unique accounts"""
+        accounts = obj.get('accounts', [])
+        return len(accounts) if isinstance(accounts, list) else 0
 
 
 class HolidayListSerializer(serializers.Serializer):
@@ -915,10 +1066,20 @@ class HolidayListSerializer(serializers.Serializer):
     user = serializers.CharField(help_text='User Name')
     
     # Holiday specific information
-    holiday_name = serializers.CharField(help_text='Name of the holiday')
-    holiday_type = serializers.CharField(help_text='Type of holiday (Public holiday, Observance, etc.)')
+    holiday_name = serializers.CharField(help_text='Name of the holiday', allow_null=True)
     risk_level = serializers.CharField(help_text='Risk level (LOW, MEDIUM, HIGH, CRITICAL)')
-    risk_score = serializers.FloatField(help_text='Risk score (0-100)')
+    risk_score = serializers.SerializerMethodField(help_text='Risk score (0-100)')
+    
+    def get_risk_score(self, obj):
+        """Calculate risk score based on risk level"""
+        risk_level = obj.get('risk_level', 'LOW')
+        risk_scores = {
+            'LOW': 25.0,
+            'MEDIUM': 50.0,
+            'HIGH': 75.0,
+            'CRITICAL': 100.0
+        }
+        return risk_scores.get(risk_level, 0.0)
     
     # Additional computed fields
     is_high_value = serializers.SerializerMethodField(help_text='Whether this is a high value transaction')

@@ -24,7 +24,7 @@ from .serializers import (
     DataFileSerializer, DataFileUploadSerializer, DataUploadResponseSerializer,
     FileProcessingJobSerializer, MLModelTrainingSerializer, TargetedAnomalyUploadSerializer,
     SAPGLPostingListSerializer, ClosingEntriesListSerializer, BackdatedEntriesListSerializer,
-    UnusualDaysListSerializer,HolidayListSerializer
+    UnusualDaysListSerializer,HolidayListSerializer, DuplicateListSerializer, UserListSerializer
 )
 from .tasks import run_restructured_analysis
 
@@ -1422,16 +1422,36 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
             # Holiday Analysis
             if holiday_analysis:
                 try:
-                    holiday_count = holiday_analysis.get_holiday_postings_count()
-                    holiday_percentage = holiday_analysis.get_holiday_percentage()
-                    unique_holidays = holiday_analysis.get_unique_holidays()
+                    # Get data from analysis_info first, then fallback to model methods
+                    analysis_info = holiday_analysis.analysis_info or {}
+                    
+                    # Extract holiday data from analysis_info
+                    holiday_count = analysis_info.get('holiday_transactions_count', 0)
+                    if holiday_count == 0:
+                        holiday_count = holiday_analysis.get_holiday_postings_count()
+                    
+                    holiday_percentage = analysis_info.get('holiday_percentage', 0)
+                    if holiday_percentage == 0:
+                        holiday_percentage = holiday_analysis.get_holiday_percentage()
+                    
+                    # Count unique holidays from breakdown
+                    holiday_breakdown = analysis_info.get('holiday_breakdown', [])
+                    unique_holidays = len([h for h in holiday_breakdown if h and len(h) > 1 and h[1] > 0])
+                    if unique_holidays == 0:
+                        unique_holidays = holiday_analysis.get_unique_holidays()
+                    
                     overall_risk_score = holiday_analysis.get_overall_risk_score()
+                    
+                    # Calculate total holiday amount
+                    total_holiday_amount = analysis_info.get('total_holiday_amount', 0)
+                    
                 except Exception as e:
                     logger.warning(f"Error getting holiday analysis data: {e}")
                     holiday_count = 0
                     holiday_percentage = 0
                     unique_holidays = 0
                     overall_risk_score = 0
+                    total_holiday_amount = 0
                 
                 anomaly_stats['holiday_analysis'] = {
                     'analysis_id': str(holiday_analysis.id),
@@ -1440,6 +1460,7 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'holiday_percentage': holiday_percentage,
                     'unique_holidays': unique_holidays,
                     'overall_risk_score': overall_risk_score,
+                    'total_holiday_amount': total_holiday_amount,
                     'analysis_info': holiday_analysis.analysis_info or {}
                 }
                 anomaly_stats['total_anomalies'] += holiday_count
@@ -1518,6 +1539,22 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
             }
             
             response_data['summary_dashboard'] = summary_dashboard
+            
+            # Add methodology clarification
+            response_data['methodology_notes'] = {
+                'overall_analysis': {
+                    'description': 'Overall analysis uses flag-based detection focusing on specific anomaly types (duplicates, backdated, weekend, holiday, closing entries)',
+                    'flagging_criteria': 'Transactions are flagged based on specific anomaly detection rules',
+                    'risk_assessment': 'Simple risk scoring based on flagged transaction patterns'
+                },
+                'risk_analysis': {
+                    'description': 'Risk analysis uses comprehensive ML-based scoring considering multiple risk factors',
+                    'scoring_methodology': 'Advanced risk scoring using machine learning models and statistical analysis',
+                    'risk_factors': 'Considers duplicate risk, backdated risk, user anomalies, unusual days, closing entries, and holiday postings',
+                    'version': '2.0.0'
+                },
+                'data_discrepancy_explanation': 'Overall analysis and risk analysis use different methodologies, which may result in different transaction counts. Overall analysis focuses on specific anomaly flags, while risk analysis provides comprehensive risk scoring.'
+            }
             
             return Response(response_data, status=status.HTTP_200_OK)
             
@@ -4512,7 +4549,6 @@ class HolidayAnalysisView(generics.GenericAPIView):
     - GL activity by holiday
     - Risk assessment for holiday postings
     - Chart data for visualizations
-    - Export-ready data
     """
     
     def get(self, request, file_id):
@@ -4552,18 +4588,23 @@ class HolidayAnalysisView(generics.GenericAPIView):
                     'risk_level': holiday_analysis.get_risk_level(),
                     'overall_risk_score': holiday_analysis.get_overall_risk_score(),
                     'high_value_holiday_count': len(holiday_analysis.get_high_value_holiday_postings()),
-                    'total_holiday_amount': sum(p.get('amount', 0) for p in holiday_analysis.holiday_postings or [])
+                    'total_holiday_amount': sum(p.get('amount', 0) for p in holiday_analysis.holiday_postings or []),
+                    'compliance_issues': self._generate_compliance_issues(holiday_analysis),
+                    'high_priority_recommendations': self._generate_high_priority_recommendations(holiday_analysis)
                 },
                 'detailed_results': {
                     'holiday_postings': holiday_analysis.holiday_postings or [],
+                    'holiday_patterns': self._generate_holiday_patterns(holiday_analysis),
                     'holiday_by_fs_line': holiday_analysis.holiday_by_fs_line or [],
                     'holiday_by_account': holiday_analysis.holiday_by_account or [],
                     'holiday_by_user': holiday_analysis.holiday_by_user or [],
                     'gl_activity_by_holiday': holiday_analysis.gl_activity_by_holiday or {},
-                    'audit_recommendations': holiday_analysis.audit_recommendations or {},
+                    'audit_recommendations': self._generate_audit_recommendations(holiday_analysis),
                     'detection_methods': ['holiday_utils', 'business_rules', 'risk_scoring'],
                     'confidence_scores': self._generate_confidence_scores(holiday_analysis),
-                    'false_positive_indicators': self._generate_false_positive_indicators(holiday_analysis)
+                    'false_positive_indicators': self._generate_false_positive_indicators(holiday_analysis),
+                    'risk_assessment': self._generate_risk_assessment(holiday_analysis),
+                    'compliance_analysis': self._generate_compliance_analysis(holiday_analysis)
                 },
                 'visualizations': {
                     'chart_data': holiday_analysis.chart_data or {},
@@ -4575,10 +4616,6 @@ class HolidayAnalysisView(generics.GenericAPIView):
                         'accounts': self._extract_unique_accounts(holiday_analysis.holiday_postings or []),
                         'fs_lines': self._extract_unique_fs_lines(holiday_analysis.holiday_postings or [])
                     }
-                },
-                'export_data': {
-                    'summary_table': self._generate_summary_table(holiday_analysis),
-                    'detailed_export': holiday_analysis.export_data or []
                 }
             }
             
@@ -4664,37 +4701,7 @@ class HolidayAnalysisView(generics.GenericAPIView):
         
         return indicators
     
-    def _generate_summary_table(self, holiday_analysis):
-        """Generate summary table for export"""
-        if not holiday_analysis.holiday_postings:
-            return []
-        
-        summary_data = []
-        
-        # Group by holiday
-        holiday_groups = {}
-        for posting in holiday_analysis.holiday_postings:
-            holiday_name = posting.get('holiday_name', 'Unknown')
-            if holiday_name not in holiday_groups:
-                holiday_groups[holiday_name] = []
-            holiday_groups[holiday_name].append(posting)
-        
-        for holiday_name, postings in holiday_groups.items():
-            total_amount = sum(p.get('amount', 0) for p in postings)
-            high_value_count = len([p for p in postings if p.get('amount', 0) > 1000000])
-            
-            summary_data.append({
-                'holiday_name': holiday_name,
-                'holiday_type': postings[0].get('holiday_type', 'Unknown'),
-                'transaction_count': len(postings),
-                'total_amount': total_amount,
-                'high_value_count': high_value_count,
-                'unique_users': len(set(p.get('user_name') for p in postings)),
-                'unique_accounts': len(set(p.get('gl_account') for p in postings)),
-                'avg_risk_score': sum(p.get('risk_score', 0) for p in postings) / len(postings)
-            })
-        
-        return summary_data
+
     
     def _extract_unique_users(self, holiday_postings):
         """Extract unique users from holiday postings"""
@@ -4722,6 +4729,268 @@ class HolidayAnalysisView(generics.GenericAPIView):
             if fs_line:
                 fs_lines.add(fs_line)
         return list(fs_lines)
+    
+    def _generate_compliance_issues(self, holiday_analysis):
+        """Generate compliance issues for holiday analysis"""
+        if not holiday_analysis.holiday_postings:
+            return []
+        
+        compliance_issues = []
+        total_amount = sum(p.get('amount', 0) for p in holiday_analysis.holiday_postings)
+        
+        # High value holiday transactions
+        high_value_count = len([p for p in holiday_analysis.holiday_postings if p.get('amount', 0) > 1000000])
+        if high_value_count > 0:
+            compliance_issues.append({
+                'issue_type': 'HIGH_VALUE_HOLIDAY_TRANSACTIONS',
+                'severity': 'HIGH',
+                'description': f'{high_value_count} high-value transactions posted on holidays',
+                'recommendation': 'Review all high-value holiday transactions for business justification'
+            })
+        
+        # Multiple users posting on same holiday
+        holiday_users = {}
+        for posting in holiday_analysis.holiday_postings:
+            holiday_name = posting.get('holiday_name')
+            user = posting.get('user')
+            if holiday_name and user:
+                if holiday_name not in holiday_users:
+                    holiday_users[holiday_name] = set()
+                holiday_users[holiday_name].add(user)
+        
+        for holiday, users in holiday_users.items():
+            if len(users) > 3:
+                compliance_issues.append({
+                    'issue_type': 'MULTIPLE_USERS_HOLIDAY_ACTIVITY',
+                    'severity': 'MEDIUM',
+                    'description': f'{len(users)} users posted transactions on {holiday}',
+                    'recommendation': 'Investigate why multiple users were active on this holiday'
+                })
+        
+        return compliance_issues
+    
+    def _generate_high_priority_recommendations(self, holiday_analysis):
+        """Generate high priority recommendations for holiday analysis"""
+        if not holiday_analysis.holiday_postings:
+            return []
+        
+        recommendations = []
+        total_amount = sum(p.get('amount', 0) for p in holiday_analysis.holiday_postings)
+        
+        if total_amount > 1000000:
+            recommendations.append({
+                'priority': 'HIGH',
+                'action': 'Review all holiday transactions',
+                'description': f'Total holiday transaction amount: {total_amount:,.2f} SAR',
+                'impact': 'Financial risk'
+            })
+        
+        high_value_count = len([p for p in holiday_analysis.holiday_postings if p.get('amount', 0) > 1000000])
+        if high_value_count > 0:
+            recommendations.append({
+                'priority': 'CRITICAL',
+                'action': 'Immediate review of high-value holiday transactions',
+                'description': f'{high_value_count} transactions over 1M SAR posted on holidays',
+                'impact': 'High financial risk'
+            })
+        
+        return recommendations
+    
+    def _generate_holiday_patterns(self, holiday_analysis):
+        """Generate holiday patterns analysis"""
+        if not holiday_analysis.holiday_postings:
+            return {}
+        
+        patterns = {
+            'holiday_distribution': {},
+            'user_activity_patterns': {},
+            'amount_patterns': {},
+            'temporal_patterns': {}
+        }
+        
+        # Holiday distribution
+        holiday_counts = {}
+        for posting in holiday_analysis.holiday_postings:
+            holiday_name = posting.get('holiday_name', 'Unknown')
+            holiday_counts[holiday_name] = holiday_counts.get(holiday_name, 0) + 1
+        
+        patterns['holiday_distribution'] = holiday_counts
+        
+        # User activity patterns
+        user_activity = {}
+        for posting in holiday_analysis.holiday_postings:
+            user = posting.get('user', 'Unknown')
+            if user not in user_activity:
+                user_activity[user] = {'count': 0, 'total_amount': 0}
+            user_activity[user]['count'] += 1
+            user_activity[user]['total_amount'] += posting.get('amount', 0)
+        
+        patterns['user_activity_patterns'] = user_activity
+        
+        # Amount patterns
+        amounts = [p.get('amount', 0) for p in holiday_analysis.holiday_postings]
+        patterns['amount_patterns'] = {
+            'min_amount': min(amounts) if amounts else 0,
+            'max_amount': max(amounts) if amounts else 0,
+            'avg_amount': sum(amounts) / len(amounts) if amounts else 0,
+            'high_value_count': len([a for a in amounts if a > 1000000])
+        }
+        
+        return patterns
+    
+    def _generate_audit_recommendations(self, holiday_analysis):
+        """Generate audit recommendations for holiday analysis"""
+        if not holiday_analysis.holiday_postings:
+            return {}
+        
+        recommendations = {
+            'immediate_actions': [],
+            'follow_up_actions': [],
+            'monitoring_actions': []
+        }
+        
+        total_amount = sum(p.get('amount', 0) for p in holiday_analysis.holiday_postings)
+        high_value_count = len([p for p in holiday_analysis.holiday_postings if p.get('amount', 0) > 1000000])
+        
+        if high_value_count > 0:
+            recommendations['immediate_actions'].append({
+                'action': 'Review all high-value holiday transactions',
+                'priority': 'CRITICAL',
+                'reason': f'{high_value_count} transactions over 1M SAR posted on holidays'
+            })
+        
+        if total_amount > 1000000:
+            recommendations['immediate_actions'].append({
+                'action': 'Investigate holiday posting patterns',
+                'priority': 'HIGH',
+                'reason': f'Total holiday amount: {total_amount:,.2f} SAR'
+            })
+        
+        recommendations['follow_up_actions'].append({
+            'action': 'Implement holiday posting controls',
+            'priority': 'MEDIUM',
+            'reason': 'Prevent unauthorized holiday postings'
+        })
+        
+        recommendations['monitoring_actions'].append({
+            'action': 'Monitor holiday posting patterns',
+            'priority': 'LOW',
+            'reason': 'Track holiday activity for future audits'
+        })
+        
+        return recommendations
+    
+    def _generate_risk_assessment(self, holiday_analysis):
+        """Generate comprehensive risk assessment for holiday analysis"""
+        if not holiday_analysis.holiday_postings:
+            return {}
+        
+        risk_assessment = {
+            'overall_risk_level': 'LOW',
+            'risk_factors': [],
+            'risk_score': 0,
+            'risk_distribution': {
+                'low_risk': 0,
+                'medium_risk': 0,
+                'high_risk': 0,
+                'critical_risk': 0
+            }
+        }
+        
+        total_amount = sum(p.get('amount', 0) for p in holiday_analysis.holiday_postings)
+        high_value_count = len([p for p in holiday_analysis.holiday_postings if p.get('amount', 0) > 1000000])
+        
+        # Calculate risk score
+        risk_score = 0
+        if high_value_count > 0:
+            risk_score += 40
+        if total_amount > 1000000:
+            risk_score += 30
+        if len(holiday_analysis.holiday_postings) > 10:
+            risk_score += 20
+        if len(holiday_analysis.holiday_postings) > 50:
+            risk_score += 10
+        
+        risk_assessment['risk_score'] = risk_score
+        
+        # Determine risk level
+        if risk_score >= 80:
+            risk_assessment['overall_risk_level'] = 'CRITICAL'
+        elif risk_score >= 60:
+            risk_assessment['overall_risk_level'] = 'HIGH'
+        elif risk_score >= 40:
+            risk_assessment['overall_risk_level'] = 'MEDIUM'
+        else:
+            risk_assessment['overall_risk_level'] = 'LOW'
+        
+        # Risk factors
+        if high_value_count > 0:
+            risk_assessment['risk_factors'].append({
+                'factor': 'High-value holiday transactions',
+                'count': high_value_count,
+                'impact': 'HIGH'
+            })
+        
+        if total_amount > 1000000:
+            risk_assessment['risk_factors'].append({
+                'factor': 'High total holiday amount',
+                'amount': total_amount,
+                'impact': 'MEDIUM'
+            })
+        
+        return risk_assessment
+    
+    def _generate_compliance_analysis(self, holiday_analysis):
+        """Generate compliance analysis for holiday transactions"""
+        if not holiday_analysis.holiday_postings:
+            return {}
+        
+        compliance_analysis = {
+            'compliance_score': 100,
+            'compliance_issues': [],
+            'regulatory_implications': [],
+            'internal_control_weaknesses': []
+        }
+        
+        total_amount = sum(p.get('amount', 0) for p in holiday_analysis.holiday_postings)
+        high_value_count = len([p for p in holiday_analysis.holiday_postings if p.get('amount', 0) > 1000000])
+        
+        # Calculate compliance score
+        compliance_score = 100
+        if high_value_count > 0:
+            compliance_score -= 30
+        if total_amount > 1000000:
+            compliance_score -= 20
+        if len(holiday_analysis.holiday_postings) > 10:
+            compliance_score -= 10
+        
+        compliance_analysis['compliance_score'] = max(0, compliance_score)
+        
+        # Compliance issues
+        if high_value_count > 0:
+            compliance_analysis['compliance_issues'].append({
+                'issue': 'High-value holiday transactions',
+                'severity': 'HIGH',
+                'description': f'{high_value_count} transactions over 1M SAR posted on holidays'
+            })
+        
+        # Regulatory implications
+        if total_amount > 1000000:
+            compliance_analysis['regulatory_implications'].append({
+                'regulation': 'Internal Control Requirements',
+                'implication': 'Holiday postings may indicate control weaknesses',
+                'action_required': 'Review and strengthen controls'
+            })
+        
+        # Internal control weaknesses
+        if len(holiday_analysis.holiday_postings) > 10:
+            compliance_analysis['internal_control_weaknesses'].append({
+                'weakness': 'Multiple holiday postings',
+                'description': 'Multiple transactions posted on holidays',
+                'recommendation': 'Implement holiday posting restrictions'
+            })
+        
+        return compliance_analysis
 
 class GLAccountsPagination(PageNumberPagination):
     page_size = 50
@@ -4735,29 +5004,571 @@ class FileGLAccountsView(APIView):
             from .models import DataFile, SAPGLPosting
             data_file = DataFile.objects.get(id=file_id)
             transactions = SAPGLPosting.objects.filter(data_file=data_file)
-            all_gl_accounts = self._generate_all_gl_accounts_data(transactions)
+            
+            # Check if risk analysis has been run
+            risk_analysis_status = self._check_risk_analysis_status(data_file)
+            
+            all_gl_accounts = self._generate_all_gl_accounts_data(transactions, data_file)
 
             paginator = GLAccountsPagination()
             page = paginator.paginate_queryset(all_gl_accounts, request)
 
+            # Calculate comprehensive summary statistics
+            summary_stats = self._calculate_comprehensive_summary_stats(all_gl_accounts)
+            
             # The paginated response expects the main data to be the paginated list
-            # We'll add total_accounts and summary as extra fields
+            # We'll add comprehensive summary statistics as extra fields
             response_data = {
                 'total_accounts': len(all_gl_accounts),
                 'accounts': page,
-                'summary': {
-                    'total_transactions': sum(acc['transaction_count'] for acc in all_gl_accounts),
-                    'total_amount': sum(acc['total_amount'] for acc in all_gl_accounts),
-                    'avg_risk_score': sum(acc['avg_risk_score'] for acc in all_gl_accounts) / len(all_gl_accounts) if all_gl_accounts else 0,
-                    'accounts_with_anomalies': len([acc for acc in all_gl_accounts if acc['anomaly_counts']['total_anomalies'] > 0]),
-                    'high_risk_accounts': len([acc for acc in all_gl_accounts if acc['risk_level'] in ['HIGH', 'CRITICAL']])
-                }
+                'summary': summary_stats,
+                'risk_analysis_status': risk_analysis_status
             }
             return paginator.get_paginated_response(response_data)
         except DataFile.DoesNotExist:
             return Response({'error': f'File with ID {file_id} not found'}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def _generate_all_gl_accounts_data(self, transactions, data_file):
+        """Generate comprehensive GL account data for all accounts in the file"""
+        from django.db.models import Sum, Count, Avg, Q, Max, Min
+        from decimal import Decimal
+        
+        # Debug: Check if risk scores are populated
+        risk_score_stats = transactions.aggregate(
+            avg_risk=Avg('overall_risk_score'),
+            max_risk=Max('overall_risk_score'),
+            min_risk=Min('overall_risk_score'),
+            non_zero_risk=Count('id', filter=Q(overall_risk_score__gt=0))
+        )
+        print(f"DEBUG: Risk score stats - Avg: {risk_score_stats['avg_risk']}, Max: {risk_score_stats['max_risk']}, Min: {risk_score_stats['min_risk']}, Non-zero: {risk_score_stats['non_zero_risk']}")
+        
+        # Get all unique GL accounts with their aggregated data
+        gl_accounts_data = transactions.values('gl_account').annotate(
+            transaction_count=Count('id'),
+            total_amount=Sum('amount_local_currency'),
+            total_debits=Sum('amount_local_currency', filter=Q(transaction_type='DEBIT')),
+            total_credits=Sum('amount_local_currency', filter=Q(transaction_type='CREDIT')),
+            avg_amount=Avg('amount_local_currency'),
+            avg_risk_score=Avg('overall_risk_score'),
+            max_risk_score=Max('overall_risk_score'),
+            min_risk_score=Min('overall_risk_score'),
+            unique_users=Count('user_name', distinct=True),
+            high_risk_transactions=Count('id', filter=Q(overall_risk_score__gte=60)),
+            critical_risk_transactions=Count('id', filter=Q(overall_risk_score__gte=80)),
+            duplicate_transactions=Count('id', filter=Q(is_duplicate=True)),
+            backdated_transactions=Count('id', filter=Q(is_backdated=True)),
+            holiday_transactions=Count('id', filter=Q(is_holiday_posting=True)),
+            unusual_days_transactions=Count('id', filter=Q(anomaly_types__contains=['unusual_days'])),
+            closing_entries_transactions=Count('id', filter=Q(anomaly_types__contains=['closing_entries']))
+        ).order_by('gl_account')
+        
+        # Debug: Check anomaly detection
+        print(f"DEBUG: Total transactions: {transactions.count()}")
+        print(f"DEBUG: Transactions with is_duplicate=True: {transactions.filter(is_duplicate=True).count()}")
+        print(f"DEBUG: Transactions with is_backdated=True: {transactions.filter(is_backdated=True).count()}")
+        print(f"DEBUG: Transactions with is_holiday_posting=True: {transactions.filter(is_holiday_posting=True).count()}")
+        print(f"DEBUG: Transactions with anomaly_types containing 'unusual_days': {transactions.filter(anomaly_types__contains=['unusual_days']).count()}")
+        print(f"DEBUG: Transactions with anomaly_types containing 'closing_entries': {transactions.filter(anomaly_types__contains=['closing_entries']).count()}")
+        
+        # Use database flags for anomaly counts (they are correct based on debug output)
+        # The database flags show the correct counts that match the dashboard
+        actual_anomaly_counts = {
+            'duplicate_transactions': transactions.filter(is_duplicate=True).count(),
+            'backdated_transactions': transactions.filter(is_backdated=True).count(),
+            'holiday_transactions': transactions.filter(is_holiday_posting=True).count(),
+            'unusual_days_transactions': transactions.filter(anomaly_types__contains=['unusual_days']).count(),
+            'closing_entries_transactions': transactions.filter(anomaly_types__contains=['closing_entries']).count(),
+            'user_anomalies': transactions.filter(anomaly_types__contains=['user_analysis']).count(),
+            'risk_anomalies': transactions.filter(anomaly_types__contains=['risk_analysis']).count(),
+            'total_anomalies': 0  # Will be calculated below
+        }
+        
+        # Calculate total anomalies
+        actual_anomaly_counts['total_anomalies'] = sum([
+            actual_anomaly_counts['duplicate_transactions'],
+            actual_anomaly_counts['backdated_transactions'],
+            actual_anomaly_counts['holiday_transactions'],
+            actual_anomaly_counts['unusual_days_transactions'],
+            actual_anomaly_counts['closing_entries_transactions'],
+            actual_anomaly_counts['user_anomalies'],
+            actual_anomaly_counts['risk_anomalies']
+        ])
+        
+        print(f"DEBUG: Using database flags for anomaly counts: {actual_anomaly_counts}")
+        
+        all_gl_accounts = []
+        
+        for account_data in gl_accounts_data:
+            gl_account = account_data['gl_account']
+            
+            # Use the actual anomaly counts we calculated above
+            anomaly_counts = {
+                'total_anomalies': actual_anomaly_counts['total_anomalies'],
+                'duplicate_transactions': actual_anomaly_counts['duplicate_transactions'],
+                'backdated_transactions': actual_anomaly_counts['backdated_transactions'],
+                'holiday_transactions': actual_anomaly_counts['holiday_transactions'],
+                'unusual_days_transactions': actual_anomaly_counts['unusual_days_transactions'],
+                'closing_entries_transactions': actual_anomaly_counts['closing_entries_transactions'],
+                'user_anomalies': actual_anomaly_counts['user_anomalies'],
+                'risk_anomalies': actual_anomaly_counts['risk_anomalies'],
+                'high_risk_transactions': account_data['high_risk_transactions'] or 0,
+                'critical_risk_transactions': account_data['critical_risk_transactions'] or 0
+            }
+            
+            print(f"DEBUG: Account {gl_account} - Using anomaly counts: {anomaly_counts}")
+            
+            # Calculate risk level based on average risk score, with fallback to anomaly-based calculation
+            avg_risk_score = float(account_data['avg_risk_score'] or 0)
+            max_risk_score = float(account_data['max_risk_score'] or 0)
+            
+            # Calculate risk level considering both stored scores and anomalies
+            if avg_risk_score == 0 and max_risk_score == 0:
+                # Calculate risk score based on anomalies
+                calculated_risk_score = self._calculate_risk_score_from_anomalies(anomaly_counts, account_data['transaction_count'])
+                risk_level = self._get_risk_level(calculated_risk_score)
+                avg_risk_score = calculated_risk_score
+                print(f"DEBUG: Account {gl_account} - No risk scores found, calculated: {calculated_risk_score}, risk_level: {risk_level}")
+            else:
+                # Use stored risk scores but also consider anomaly impact
+                base_risk_level = self._get_risk_level(avg_risk_score)
+                
+                # Check if anomalies should elevate the risk level
+                elevated_risk_level = self._calculate_elevated_risk_level(anomaly_counts, account_data['transaction_count'], avg_risk_score)
+                
+                # Use the higher risk level
+                if self._get_risk_level_numeric(elevated_risk_level) > self._get_risk_level_numeric(base_risk_level):
+                    risk_level = elevated_risk_level
+                    print(f"DEBUG: Account {gl_account} - Risk level elevated from {base_risk_level} to {elevated_risk_level} due to anomalies")
+                else:
+                    risk_level = base_risk_level
+                
+                print(f"DEBUG: Account {gl_account} - Using stored risk scores - avg: {avg_risk_score}, max: {max_risk_score}, risk_level: {risk_level}")
+            
+            # Calculate balance
+            total_debits = float(account_data['total_debits'] or 0)
+            total_credits = float(account_data['total_credits'] or 0)
+            balance = total_debits - total_credits
+            
+            # Get account details from GLAccount model if available
+            account_details = self._get_account_details(gl_account)
+            
+            # Create account data structure
+            account_info = {
+                'gl_account': gl_account,
+                'account_name': account_details.get('account_name', 'Unknown'),
+                'account_type': account_details.get('account_type', 'Unknown'),
+                'account_category': account_details.get('account_category', 'Unknown'),
+                'transaction_count': account_data['transaction_count'],
+                'total_amount': float(account_data['total_amount'] or 0),
+                'total_debits': total_debits,
+                'total_credits': total_credits,
+                'balance': balance,
+                'avg_amount': float(account_data['avg_amount'] or 0),
+                'avg_risk_score': avg_risk_score,
+                'max_risk_score': max_risk_score,
+                'min_risk_score': float(account_data['min_risk_score'] or 0),
+                'unique_users': account_data['unique_users'],
+                'risk_level': risk_level,
+                'anomaly_counts': anomaly_counts,
+                'anomaly_percentage': (anomaly_counts['total_anomalies'] / account_data['transaction_count'] * 100) if account_data['transaction_count'] > 0 else 0,
+                'high_risk_percentage': (account_data['high_risk_transactions'] / account_data['transaction_count'] * 100) if account_data['transaction_count'] > 0 else 0,
+                'critical_risk_percentage': (account_data['critical_risk_transactions'] / account_data['transaction_count'] * 100) if account_data['transaction_count'] > 0 else 0,
+                'balance_percentage': (abs(balance) / float(account_data['total_amount'] or 1) * 100) if account_data['total_amount'] else 0,
+                'is_balanced': abs(balance) < 0.01,
+                'has_anomalies': anomaly_counts['total_anomalies'] > 0,
+                'is_high_risk': risk_level in ['HIGH', 'CRITICAL'],
+                'activity_level': self._get_activity_level(account_data['transaction_count']),
+                'amount_category': self._get_amount_category(float(account_data['total_amount'] or 0))
+            }
+            
+            all_gl_accounts.append(account_info)
+        
+        return all_gl_accounts
+
+    def _calculate_risk_score_from_anomalies(self, anomaly_counts, total_transactions):
+        """Calculate risk score based on anomalies when overall_risk_score is not available"""
+        if total_transactions == 0:
+            return 0.0
+        
+        # Base risk score
+        risk_score = 0.0
+        
+        # Add risk points for each anomaly type
+        if anomaly_counts['duplicate_transactions'] > 0:
+            risk_score += 80.0 * (anomaly_counts['duplicate_transactions'] / total_transactions)
+        
+        if anomaly_counts['backdated_transactions'] > 0:
+            risk_score += 70.0 * (anomaly_counts['backdated_transactions'] / total_transactions)
+        
+        if anomaly_counts['holiday_transactions'] > 0:
+            risk_score += 60.0 * (anomaly_counts['holiday_transactions'] / total_transactions)
+        
+        if anomaly_counts['unusual_days_transactions'] > 0:
+            risk_score += 40.0 * (anomaly_counts['unusual_days_transactions'] / total_transactions)
+        
+        if anomaly_counts['closing_entries_transactions'] > 0:
+            risk_score += 30.0 * (anomaly_counts['closing_entries_transactions'] / total_transactions)
+        
+        if anomaly_counts['user_anomalies'] > 0:
+            risk_score += 50.0 * (anomaly_counts['user_anomalies'] / total_transactions)
+        
+        if anomaly_counts['risk_anomalies'] > 0:
+            risk_score += 90.0 * (anomaly_counts['risk_anomalies'] / total_transactions)
+        
+        # Cap at 100
+        return min(risk_score, 100.0)
+
+    def _get_actual_anomaly_counts(self, data_file):
+        """Get actual anomaly counts from analysis results"""
+        from .models import DuplicateAnalysisResult, BackdatedAnalysisResult, HolidayAnalysisResult, UnusualDaysAnalysisResult, ClosingEntriesAnalysisResult
+        
+        actual_counts = {
+            'duplicate_transactions': 0,
+            'backdated_transactions': 0,
+            'holiday_transactions': 0,
+            'unusual_days_transactions': 0,
+            'closing_entries_transactions': 0,
+            'total_anomalies': 0
+        }
+        
+        # Get duplicate analysis results
+        duplicate_analysis = DuplicateAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-created_at').first()
+        
+        if duplicate_analysis and duplicate_analysis.duplicate_list:
+            actual_counts['duplicate_transactions'] = len(duplicate_analysis.duplicate_list) * 2  # Each duplicate has 2 transactions
+        
+        # Get backdated analysis results
+        backdated_analysis = BackdatedAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-created_at').first()
+        
+        if backdated_analysis and backdated_analysis.backdated_entries:
+            actual_counts['backdated_transactions'] = len(backdated_analysis.backdated_entries)
+        
+        # Get holiday analysis results
+        holiday_analysis = HolidayAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-created_at').first()
+        
+        if holiday_analysis and holiday_analysis.holiday_postings:
+            actual_counts['holiday_transactions'] = len(holiday_analysis.holiday_postings)
+        
+        # Get unusual days analysis results
+        unusual_days_analysis = UnusualDaysAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-created_at').first()
+        
+        if unusual_days_analysis and unusual_days_analysis.weekend_postings:
+            actual_counts['unusual_days_transactions'] = len(unusual_days_analysis.weekend_postings)
+        
+        # Get closing entries analysis results
+        closing_entries_analysis = ClosingEntriesAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-created_at').first()
+        
+        if closing_entries_analysis and closing_entries_analysis.closing_entries:
+            actual_counts['closing_entries_transactions'] = len(closing_entries_analysis.closing_entries)
+        
+        # Calculate total anomalies
+        actual_counts['total_anomalies'] = sum([
+            actual_counts['duplicate_transactions'],
+            actual_counts['backdated_transactions'],
+            actual_counts['holiday_transactions'],
+            actual_counts['unusual_days_transactions'],
+            actual_counts['closing_entries_transactions']
+        ])
+        
+        return actual_counts
+
+    def _calculate_elevated_risk_level(self, anomaly_counts, total_transactions, current_risk_score):
+        """Calculate elevated risk level based on anomalies"""
+        if total_transactions == 0:
+            return 'LOW'
+        
+        # Calculate anomaly percentage
+        total_anomalies = anomaly_counts['total_anomalies']
+        anomaly_percentage = (total_anomalies / total_transactions) * 100
+        
+        # Calculate high/critical risk transaction percentage
+        high_risk_transactions = anomaly_counts['high_risk_transactions']
+        critical_risk_transactions = anomaly_counts['critical_risk_transactions']
+        high_critical_percentage = ((high_risk_transactions + critical_risk_transactions) / total_transactions) * 100
+        
+        # Risk level elevation rules
+        if critical_risk_transactions > 0 or anomaly_counts['risk_anomalies'] > 0:
+            return 'CRITICAL'
+        elif high_risk_transactions > 0 or anomaly_percentage > 30:
+            return 'HIGH'
+        elif anomaly_percentage > 15:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+
+    def _get_risk_level_numeric(self, risk_level):
+        """Convert risk level to numeric value for comparison"""
+        risk_level_map = {
+            'CRITICAL': 4,
+            'HIGH': 3,
+            'MEDIUM': 2,
+            'LOW': 1
+        }
+        return risk_level_map.get(risk_level, 1)
+
+    def _check_risk_analysis_status(self, data_file):
+        """Check if risk analysis has been run for this file"""
+        from .models import RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult, HolidayAnalysisResult, UnusualDaysAnalysisResult, ClosingEntriesAnalysisResult
+        
+        # Check if risk scoring document exists
+        risk_document = RiskScoringDocument.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-created_at').first()
+        
+        # Check if individual analyses exist
+        duplicate_analysis = DuplicateAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).first()
+        
+        backdated_analysis = BackdatedAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).first()
+        
+        holiday_analysis = HolidayAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).first()
+        
+        unusual_days_analysis = UnusualDaysAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).first()
+        
+        closing_entries_analysis = ClosingEntriesAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).first()
+        
+        return {
+            'risk_scoring_document_exists': risk_document is not None,
+            'duplicate_analysis_exists': duplicate_analysis is not None,
+            'backdated_analysis_exists': backdated_analysis is not None,
+            'holiday_analysis_exists': holiday_analysis is not None,
+            'unusual_days_analysis_exists': unusual_days_analysis is not None,
+            'closing_entries_analysis_exists': closing_entries_analysis is not None,
+            'all_analyses_complete': all([
+                duplicate_analysis is not None,
+                backdated_analysis is not None,
+                holiday_analysis is not None,
+                unusual_days_analysis is not None,
+                closing_entries_analysis is not None
+            ]),
+            'risk_document_id': str(risk_document.id) if risk_document else None,
+            'last_analysis_date': risk_document.created_at.isoformat() if risk_document else None
+        }
+
+    def _calculate_comprehensive_summary_stats(self, all_gl_accounts):
+        """Calculate comprehensive summary statistics for GL accounts"""
+        if not all_gl_accounts:
+            return {
+                'total_accounts': 0,
+                'total_transactions': 0,
+                'total_amount': 0.0,
+                'total_debits': 0.0,
+                'total_credits': 0.0,
+                'trading_equity': 0.0,
+                'currency': 'SAR',
+                'avg_risk_score': 0.0,
+                'accounts_with_anomalies': 0,
+                'high_risk_accounts': 0,
+                'critical_risk_accounts': 0,
+                'medium_risk_accounts': 0,
+                'low_risk_accounts': 0,
+                'anomaly_rate': 0.0,
+                'avg_amount_per_account': 0.0,
+                'avg_transactions_per_account': 0.0,
+                'risk_distribution': {
+                    'critical': 0,
+                    'high': 0,
+                    'medium': 0,
+                    'low': 0
+                },
+                'anomaly_distribution': {
+                    'duplicate_transactions': 0,
+                    'backdated_transactions': 0,
+                    'holiday_transactions': 0,
+                    'unusual_days_transactions': 0,
+                    'closing_entries_transactions': 0,
+                    'total_anomalies': 0
+                },
+                'activity_distribution': {
+                    'high_activity': 0,
+                    'medium_activity': 0,
+                    'low_activity': 0,
+                    'minimal_activity': 0
+                },
+                'amount_distribution': {
+                    'very_high': 0,
+                    'high': 0,
+                    'medium': 0,
+                    'low': 0,
+                    'minimal': 0
+                }
+            }
+        
+        # Calculate basic totals
+        total_accounts = len(all_gl_accounts)
+        total_transactions = sum(acc['transaction_count'] for acc in all_gl_accounts)
+        total_amount = sum(acc['total_amount'] for acc in all_gl_accounts)
+        total_debits = sum(acc['total_debits'] for acc in all_gl_accounts)
+        total_credits = sum(acc['total_credits'] for acc in all_gl_accounts)
+        trading_equity = total_debits - total_credits
+        
+        # Calculate risk statistics
+        avg_risk_score = sum(acc['avg_risk_score'] for acc in all_gl_accounts) / total_accounts if total_accounts > 0 else 0
+        accounts_with_anomalies = len([acc for acc in all_gl_accounts if acc['anomaly_counts']['total_anomalies'] > 0])
+        
+        # Count accounts by risk level (using the corrected risk levels)
+        high_risk_accounts = len([acc for acc in all_gl_accounts if acc['risk_level'] in ['HIGH', 'CRITICAL']])
+        critical_risk_accounts = len([acc for acc in all_gl_accounts if acc['risk_level'] == 'CRITICAL'])
+        medium_risk_accounts = len([acc for acc in all_gl_accounts if acc['risk_level'] == 'MEDIUM'])
+        low_risk_accounts = len([acc for acc in all_gl_accounts if acc['risk_level'] == 'LOW'])
+        
+        # Debug: Print risk level distribution
+        print(f"DEBUG: Risk level distribution - Critical: {critical_risk_accounts}, High: {high_risk_accounts - critical_risk_accounts}, Medium: {medium_risk_accounts}, Low: {low_risk_accounts}")
+        for acc in all_gl_accounts:
+            print(f"DEBUG: Account {acc['gl_account']} - Risk Level: {acc['risk_level']}, Anomalies: {acc['anomaly_counts']['total_anomalies']}, Anomaly %: {acc['anomaly_percentage']:.2f}%")
+        
+        # Calculate anomaly statistics
+        total_anomalies = sum(acc['anomaly_counts']['total_anomalies'] for acc in all_gl_accounts)
+        anomaly_rate = (total_anomalies / total_transactions * 100) if total_transactions > 0 else 0
+        
+        # Calculate averages
+        avg_amount_per_account = total_amount / total_accounts if total_accounts > 0 else 0
+        avg_transactions_per_account = total_transactions / total_accounts if total_accounts > 0 else 0
+        
+        # Calculate distributions
+        risk_distribution = {
+            'critical': len([acc for acc in all_gl_accounts if acc['risk_level'] == 'CRITICAL']),
+            'high': len([acc for acc in all_gl_accounts if acc['risk_level'] == 'HIGH']),
+            'medium': len([acc for acc in all_gl_accounts if acc['risk_level'] == 'MEDIUM']),
+            'low': len([acc for acc in all_gl_accounts if acc['risk_level'] == 'LOW'])
+        }
+        
+        anomaly_distribution = {
+            'duplicate_transactions': sum(acc['anomaly_counts']['duplicate_transactions'] for acc in all_gl_accounts),
+            'backdated_transactions': sum(acc['anomaly_counts']['backdated_transactions'] for acc in all_gl_accounts),
+            'holiday_transactions': sum(acc['anomaly_counts']['holiday_transactions'] for acc in all_gl_accounts),
+            'unusual_days_transactions': sum(acc['anomaly_counts']['unusual_days_transactions'] for acc in all_gl_accounts),
+            'closing_entries_transactions': sum(acc['anomaly_counts']['closing_entries_transactions'] for acc in all_gl_accounts),
+            'total_anomalies': total_anomalies
+        }
+        
+        activity_distribution = {
+            'high_activity': len([acc for acc in all_gl_accounts if acc['activity_level'] == 'HIGH']),
+            'medium_activity': len([acc for acc in all_gl_accounts if acc['activity_level'] == 'MEDIUM']),
+            'low_activity': len([acc for acc in all_gl_accounts if acc['activity_level'] == 'LOW']),
+            'minimal_activity': len([acc for acc in all_gl_accounts if acc['activity_level'] == 'MINIMAL'])
+        }
+        
+        amount_distribution = {
+            'very_high': len([acc for acc in all_gl_accounts if acc['amount_category'] == 'VERY_HIGH']),
+            'high': len([acc for acc in all_gl_accounts if acc['amount_category'] == 'HIGH']),
+            'medium': len([acc for acc in all_gl_accounts if acc['amount_category'] == 'MEDIUM']),
+            'low': len([acc for acc in all_gl_accounts if acc['amount_category'] == 'LOW']),
+            'minimal': len([acc for acc in all_gl_accounts if acc['amount_category'] == 'MINIMAL'])
+        }
+        
+        return {
+            'total_accounts': total_accounts,
+            'total_transactions': total_transactions,
+            'total_amount': total_amount,
+            'total_debits': total_debits,
+            'total_credits': total_credits,
+            'trading_equity': trading_equity,
+            'currency': 'SAR',
+            'avg_risk_score': avg_risk_score,
+            'accounts_with_anomalies': accounts_with_anomalies,
+            'high_risk_accounts': high_risk_accounts,
+            'critical_risk_accounts': critical_risk_accounts,
+            'medium_risk_accounts': medium_risk_accounts,
+            'low_risk_accounts': low_risk_accounts,
+            'anomaly_rate': anomaly_rate,
+            'avg_amount_per_account': avg_amount_per_account,
+            'avg_transactions_per_account': avg_transactions_per_account,
+            'risk_distribution': risk_distribution,
+            'anomaly_distribution': anomaly_distribution,
+            'activity_distribution': activity_distribution,
+            'amount_distribution': amount_distribution
+        }
+
+    def _get_account_details(self, gl_account):
+        """Get account details from GLAccount model"""
+        try:
+            from .models import GLAccount
+            account = GLAccount.objects.get(account_id=gl_account)
+            return {
+                'account_name': account.account_name,
+                'account_type': account.account_type,
+                'account_category': account.account_category,
+                'account_subcategory': account.account_subcategory,
+                'normal_balance': account.normal_balance,
+                'is_active': account.is_active
+            }
+        except GLAccount.DoesNotExist:
+            return {
+                'account_name': 'Unknown',
+                'account_type': 'Unknown',
+                'account_category': 'Unknown',
+                'account_subcategory': None,
+                'normal_balance': 'DEBIT',
+                'is_active': True
+            }
+
+    def _get_risk_level(self, risk_score):
+        """Determine risk level based on risk score"""
+        if risk_score >= 80:
+            return 'CRITICAL'
+        elif risk_score >= 60:
+            return 'HIGH'
+        elif risk_score >= 30:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+
+    def _get_activity_level(self, transaction_count):
+        """Determine activity level based on transaction count"""
+        if transaction_count >= 100:
+            return 'HIGH'
+        elif transaction_count >= 50:
+            return 'MEDIUM'
+        elif transaction_count >= 10:
+            return 'LOW'
+        else:
+            return 'MINIMAL'
+
+    def _get_amount_category(self, total_amount):
+        """Determine amount category based on total amount"""
+        if total_amount >= 1000000:
+            return 'VERY_HIGH'
+        elif total_amount >= 100000:
+            return 'HIGH'
+        elif total_amount >= 10000:
+            return 'MEDIUM'
+        elif total_amount >= 1000:
+            return 'LOW'
+        else:
+            return 'MINIMAL'
 
 class ClosingEntriesListView(generics.ListAPIView):
     """API view for listing closing entries with pagination.
@@ -5302,6 +6113,539 @@ class UnusualDaysListView(generics.ListAPIView):
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
     
+
+class DuplicateListView(generics.ListAPIView):
+    """API view for listing duplicate entries with pagination.
+    
+    This view provides a paginated list of duplicate entries for a specific file.
+    
+    Query Parameters:
+    - page, page_size: Pagination controls
+    - user: Filter by user name
+    - account: Filter by account
+    - posting_date_from, posting_date_to: Posting date range
+    - amount_range: Comma-separated min,max (e.g., amount_range=1000,5000)
+    - risk_level: Filter by risk level (LOW, MEDIUM, HIGH, CRITICAL)
+    - duplicate_type: Filter by duplicate type (Type 1, Type 2, etc.)
+    - similarity_score_range: Comma-separated min,max (e.g., similarity_score_range=0.8,1.0)
+    - risk_score_range: Comma-separated min,max (e.g., risk_score_range=50,100)
+    - high_value: Filter by high value transactions (true/false)
+    - ordering: Field to order by (e.g., -amount, posting_date, -risk_score)
+    """
+    
+    serializer_class = DuplicateListSerializer
+    pagination_class = SAPGLPostingPagination
+    
+    def get_queryset(self):
+        """Get duplicate entries from DuplicateAnalysisResult"""
+        file_id = self.kwargs.get('file_id')
+        
+        try:
+            duplicate_analysis = DuplicateAnalysisResult.objects.filter(
+                data_file_id=file_id,
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            if not duplicate_analysis:
+                return []
+            
+            duplicate_list = duplicate_analysis.duplicate_list or []
+            return self._apply_filters(duplicate_list)
+            
+        except Exception as e:
+            logger.error(f"Error fetching duplicate data: {e}")
+            return []
+    
+    def _apply_filters(self, duplicate_list):
+        """Apply filters to duplicate entries"""
+        filtered_entries = []
+        
+        # Flatten duplicate list to individual entries
+        for duplicate in duplicate_list:
+            if isinstance(duplicate, dict):
+                # Add transaction1
+                transaction1 = duplicate.get('transaction1', {})
+                if transaction1:
+                    entry = {
+                        'transaction_id': transaction1.get('id', ''),
+                        'document_number': transaction1.get('document_number', ''),
+                        'posting_date': transaction1.get('posting_date', ''),
+                        'account': transaction1.get('account', ''),
+                        'amount': float(transaction1.get('amount', 0)),
+                        'user': transaction1.get('user', ''),
+                        'duplicate_type': duplicate.get('duplicate_type', ''),
+                        'risk_level': duplicate.get('risk_level', 'LOW'),
+                        'risk_score': float(duplicate.get('risk_score', 0)),
+                        'similarity_score': float(duplicate.get('similarity_score', 0)),
+                        'matching_fields': duplicate.get('matching_fields', []),
+                        'duplicate_group_id': f"{transaction1.get('id', '')}_{duplicate.get('duplicate_type', '')}"
+                    }
+                    filtered_entries.append(entry)
+                
+                # Add transaction2
+                transaction2 = duplicate.get('transaction2', {})
+                if transaction2:
+                    entry = {
+                        'transaction_id': transaction2.get('id', ''),
+                        'document_number': transaction2.get('document_number', ''),
+                        'posting_date': transaction2.get('posting_date', ''),
+                        'account': transaction2.get('account', ''),
+                        'amount': float(transaction2.get('amount', 0)),
+                        'user': transaction2.get('user', ''),
+                        'duplicate_type': duplicate.get('duplicate_type', ''),
+                        'risk_level': duplicate.get('risk_level', 'LOW'),
+                        'risk_score': float(duplicate.get('risk_score', 0)),
+                        'similarity_score': float(duplicate.get('similarity_score', 0)),
+                        'matching_fields': duplicate.get('matching_fields', []),
+                        'duplicate_group_id': f"{transaction2.get('id', '')}_{duplicate.get('duplicate_type', '')}"
+                    }
+                    filtered_entries.append(entry)
+        
+        # Apply filters
+        # User filter
+        user_filter = self.request.query_params.get('user')
+        if user_filter:
+            user_terms = [term.strip().lower() for term in user_filter.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if any(term in entry.get('user', '').lower() for term in user_terms)
+            ]
+        
+        # Account filter
+        account_filter = self.request.query_params.get('account')
+        if account_filter:
+            account_terms = [term.strip() for term in account_filter.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if entry.get('account', '') in account_terms
+            ]
+        
+        # Posting date range filter
+        date_from = self.request.query_params.get('posting_date_from')
+        date_to = self.request.query_params.get('posting_date_to')
+        if date_from or date_to:
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if self._is_date_in_range(entry.get('posting_date', ''), date_from, date_to)
+            ]
+        
+        # Amount range filter
+        amount_range = self.request.query_params.get('amount_range')
+        if amount_range:
+            try:
+                min_amount, max_amount = map(float, amount_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_amount <= float(entry.get('amount', 0)) <= max_amount
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Risk level filter
+        risk_level = self.request.query_params.get('risk_level')
+        if risk_level:
+            risk_levels = [level.strip().upper() for level in risk_level.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if entry.get('risk_level', '').upper() in risk_levels
+            ]
+        
+        # Duplicate type filter
+        duplicate_type = self.request.query_params.get('duplicate_type')
+        if duplicate_type:
+            types = [type_name.strip() for type_name in duplicate_type.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if entry.get('duplicate_type', '') in types
+            ]
+        
+        # Similarity score range filter
+        similarity_range = self.request.query_params.get('similarity_score_range')
+        if similarity_range:
+            try:
+                min_score, max_score = map(float, similarity_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_score <= float(entry.get('similarity_score', 0)) <= max_score
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Risk score range filter
+        risk_score_range = self.request.query_params.get('risk_score_range')
+        if risk_score_range:
+            try:
+                min_score, max_score = map(float, risk_score_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_score <= float(entry.get('risk_score', 0)) <= max_score
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # High value filter
+        high_value = self.request.query_params.get('high_value')
+        if high_value is not None:
+            is_high_value = high_value.lower() == 'true'
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if (float(entry.get('amount', 0)) > 10000000) == is_high_value
+            ]
+        
+        # Sorting
+        ordering = self.request.query_params.get('ordering', '-risk_score')
+        reverse = ordering.startswith('-')
+        field = ordering[1:] if reverse else ordering
+        
+        if field in ['amount', 'posting_date', 'risk_level', 'user', 'account', 'duplicate_type', 'risk_score', 'similarity_score']:
+            try:
+                filtered_entries.sort(
+                    key=lambda x: (
+                        float(x.get('amount', 0)) if field == 'amount' else
+                        x.get('posting_date', '') if field == 'posting_date' else
+                        x.get('risk_level', '') if field == 'risk_level' else
+                        x.get('user', '') if field == 'user' else
+                        x.get('account', '') if field == 'account' else
+                        x.get('duplicate_type', '') if field == 'duplicate_type' else
+                        float(x.get('risk_score', 0)) if field == 'risk_score' else
+                        float(x.get('similarity_score', 0)) if field == 'similarity_score' else
+                        0
+                    ),
+                    reverse=reverse
+                )
+            except (ValueError, TypeError):
+                pass
+        
+        return filtered_entries
+    
+    def _is_date_in_range(self, posting_date, date_from, date_to):
+        """Check if posting date is within the specified range"""
+        try:
+            if not posting_date:
+                return False
+            
+            posting_date_obj = datetime.strptime(posting_date, '%Y-%m-%d').date()
+            
+            if date_from:
+                from_date = datetime.strptime(date_from, '%Y-%m-%d').date()
+                if posting_date_obj < from_date:
+                    return False
+            
+            if date_to:
+                to_date = datetime.strptime(date_to, '%Y-%m-%d').date()
+                if posting_date_obj > to_date:
+                    return False
+            
+            return True
+        except (ValueError, TypeError):
+            return False
+    
+    def list(self, request, *args, **kwargs):
+        """Return only paginated duplicate entries listing"""
+        queryset = self.get_queryset()
+        
+        # Apply pagination
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+
+class UserListView(generics.ListAPIView):
+    """API view for listing user entries with pagination.
+    
+    This view provides a paginated list of user entries for a specific file.
+    
+    Query Parameters:
+    - page, page_size: Pagination controls
+    - user: Filter by user name
+    - risk_level: Filter by risk level (LOW, MEDIUM, HIGH, CRITICAL)
+    - risk_score_range: Comma-separated min,max (e.g., risk_score_range=50,100)
+    - transaction_count_range: Comma-separated min,max (e.g., transaction_count_range=10,100)
+    - amount_range: Comma-separated min,max (e.g., amount_range=1000,5000)
+    - anomaly_count_range: Comma-separated min,max (e.g., anomaly_count_range=1,10)
+    - activity_category: Filter by activity category (LOW, MEDIUM, HIGH)
+    - user_severity: Filter by user severity (LOW, MEDIUM, HIGH, CRITICAL)
+    - high_activity: Filter by high activity users (true/false)
+    - ordering: Field to order by (e.g., -risk_score, transaction_count, -total_amount)
+    """
+    
+    serializer_class = UserListSerializer
+    pagination_class = SAPGLPostingPagination
+    
+    def get_queryset(self):
+        """Get user entries from UserAnalysisResult"""
+        file_id = self.kwargs.get('file_id')
+        
+        try:
+            user_analysis = UserAnalysisResult.objects.filter(
+                data_file_id=file_id,
+                status='COMPLETED'
+            ).order_by('-analysis_date').first()
+            
+            if not user_analysis:
+                return []
+            
+            user_transaction_summary = user_analysis.user_transaction_summary or []
+            user_anomalies = user_analysis.user_anomalies or []
+            user_risk_assessment = user_analysis.user_risk_assessment or {}
+            
+            return self._apply_filters(user_transaction_summary, user_anomalies, user_risk_assessment)
+            
+        except Exception as e:
+            logger.error(f"Error fetching user data: {e}")
+            return []
+    
+    def _apply_filters(self, user_transaction_summary, user_anomalies, user_risk_assessment):
+        """Apply filters to user entries"""
+        filtered_entries = []
+        
+        # Create a mapping of user anomalies and risk assessment
+        anomalies_by_user = {}
+        risk_by_user = {}
+        
+        # Process anomalies
+        for anomaly in user_anomalies:
+            if isinstance(anomaly, dict):
+                user = anomaly.get('user', '')
+                if user not in anomalies_by_user:
+                    anomalies_by_user[user] = []
+                anomalies_by_user[user].append(anomaly)
+        
+        # Process risk assessment
+        if isinstance(user_risk_assessment, list):
+            for risk in user_risk_assessment:
+                if isinstance(risk, dict):
+                    user = risk.get('user', '')
+                    risk_by_user[user] = risk
+        elif isinstance(user_risk_assessment, dict):
+            # Try different possible structures
+            user_risk_scores = user_risk_assessment.get('user_risk_scores', [])
+            if not user_risk_scores:
+                user_risk_scores = user_risk_assessment.get('user_risk_assessment', [])
+            if not user_risk_scores:
+                # If it's a direct mapping, try to extract user data
+                for key, value in user_risk_assessment.items():
+                    if isinstance(value, dict) and 'user' in value:
+                        user = value.get('user', '')
+                        risk_by_user[user] = value
+            
+            for risk in user_risk_scores:
+                if isinstance(risk, dict):
+                    user = risk.get('user', '')
+                    risk_by_user[user] = risk
+        
+        # Combine user transaction summary with anomalies and risk data
+        for user_data in user_transaction_summary:
+            if isinstance(user_data, dict):
+                user = user_data.get('user', '')
+                
+                # Get anomaly count for this user
+                anomaly_count = len(anomalies_by_user.get(user, []))
+                
+                # Get risk data for this user
+                risk_data = risk_by_user.get(user, {})
+                
+                # Try different possible field names for risk level and score
+                risk_level = risk_data.get('risk_level', risk_data.get('level', 'LOW'))
+                risk_score = risk_data.get('risk_score', risk_data.get('score', 0.0))
+                
+                # If risk_score is still 0, try to calculate from other fields
+                if float(risk_score) == 0.0:
+                    # Try to get risk score from different possible sources
+                    if 'risk_factors' in risk_data:
+                        # Calculate risk score based on risk factors
+                        risk_factors = risk_data.get('risk_factors', [])
+                        risk_score = len(risk_factors) * 20.0  # 20 points per risk factor
+                    elif 'anomaly_type' in risk_data:
+                        # Calculate risk score based on anomaly type
+                        anomaly_type = risk_data.get('anomaly_type', '')
+                        if 'HIGH_ACTIVITY' in anomaly_type:
+                            risk_score = 80.0
+                        elif 'MEDIUM_ACTIVITY' in anomaly_type:
+                            risk_score = 60.0
+                        else:
+                            risk_score = 40.0
+                
+                # Ensure risk level matches the score
+                if float(risk_score) > 80:
+                    risk_level = 'CRITICAL'
+                elif float(risk_score) > 60:
+                    risk_level = 'HIGH'
+                elif float(risk_score) > 40:
+                    risk_level = 'MEDIUM'
+                else:
+                    risk_level = 'LOW'
+                
+                entry = {
+                    'user': user,
+                    'transaction_count': user_data.get('transaction_count', 0),
+                    'total_amount': float(user_data.get('total_amount', 0)),
+                    'avg_amount': float(user_data.get('avg_amount', 0)),
+                    'risk_level': risk_level,
+                    'risk_score': float(risk_score),
+                    'anomaly_count': anomaly_count,
+                    'accounts': user_data.get('accounts', [])
+                }
+                filtered_entries.append(entry)
+        
+        # Apply filters
+        # User filter
+        user_filter = self.request.query_params.get('user')
+        if user_filter:
+            user_terms = [term.strip().lower() for term in user_filter.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if any(term in entry.get('user', '').lower() for term in user_terms)
+            ]
+        
+        # Risk level filter
+        risk_level = self.request.query_params.get('risk_level')
+        if risk_level:
+            risk_levels = [level.strip().upper() for level in risk_level.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if entry.get('risk_level', '').upper() in risk_levels
+            ]
+        
+        # Risk score range filter
+        risk_score_range = self.request.query_params.get('risk_score_range')
+        if risk_score_range:
+            try:
+                min_score, max_score = map(float, risk_score_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_score <= float(entry.get('risk_score', 0)) <= max_score
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Transaction count range filter
+        transaction_count_range = self.request.query_params.get('transaction_count_range')
+        if transaction_count_range:
+            try:
+                min_count, max_count = map(int, transaction_count_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_count <= int(entry.get('transaction_count', 0)) <= max_count
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Amount range filter
+        amount_range = self.request.query_params.get('amount_range')
+        if amount_range:
+            try:
+                min_amount, max_amount = map(float, amount_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_amount <= float(entry.get('total_amount', 0)) <= max_amount
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Anomaly count range filter
+        anomaly_count_range = self.request.query_params.get('anomaly_count_range')
+        if anomaly_count_range:
+            try:
+                min_count, max_count = map(int, anomaly_count_range.split(','))
+                filtered_entries = [
+                    entry for entry in filtered_entries
+                    if min_count <= int(entry.get('anomaly_count', 0)) <= max_count
+                ]
+            except (ValueError, TypeError):
+                pass
+        
+        # Activity category filter
+        activity_category = self.request.query_params.get('activity_category')
+        if activity_category:
+            categories = [cat.strip().upper() for cat in activity_category.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if self._get_activity_category(entry) in categories
+            ]
+        
+        # User severity filter
+        user_severity = self.request.query_params.get('user_severity')
+        if user_severity:
+            severities = [sev.strip().upper() for sev in user_severity.split(',')]
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if self._get_user_severity(entry) in severities
+            ]
+        
+        # High activity filter
+        high_activity = self.request.query_params.get('high_activity')
+        if high_activity is not None:
+            is_high_activity = high_activity.lower() == 'true'
+            filtered_entries = [
+                entry for entry in filtered_entries
+                if (int(entry.get('transaction_count', 0)) > 50) == is_high_activity
+            ]
+        
+        # Sorting
+        ordering = self.request.query_params.get('ordering', '-risk_score')
+        reverse = ordering.startswith('-')
+        field = ordering[1:] if reverse else ordering
+        
+        if field in ['risk_score', 'transaction_count', 'total_amount', 'avg_amount', 'anomaly_count', 'user']:
+            try:
+                filtered_entries.sort(
+                    key=lambda x: (
+                        float(x.get('risk_score', 0)) if field == 'risk_score' else
+                        int(x.get('transaction_count', 0)) if field == 'transaction_count' else
+                        float(x.get('total_amount', 0)) if field == 'total_amount' else
+                        float(x.get('avg_amount', 0)) if field == 'avg_amount' else
+                        int(x.get('anomaly_count', 0)) if field == 'anomaly_count' else
+                        x.get('user', '')
+                    ),
+                    reverse=reverse
+                )
+            except (ValueError, TypeError):
+                pass
+        
+        return filtered_entries
+    
+    def _get_activity_category(self, entry):
+        """Get activity category based on transaction count"""
+        transaction_count = int(entry.get('transaction_count', 0))
+        if transaction_count > 100:
+            return 'HIGH'
+        elif transaction_count > 20:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    
+    def _get_user_severity(self, entry):
+        """Get user severity level based on risk score and anomalies"""
+        risk_score = float(entry.get('risk_score', 0))
+        anomaly_count = int(entry.get('anomaly_count', 0))
+        
+        if risk_score > 80 or anomaly_count > 10:
+            return 'CRITICAL'
+        elif risk_score > 60 or anomaly_count > 5:
+            return 'HIGH'
+        elif risk_score > 40 or anomaly_count > 2:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    
+    def list(self, request, *args, **kwargs):
+        """Return only paginated user entries listing"""
+        queryset = self.get_queryset()
+        
+        # Apply pagination
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
 
 class HolidayListView(generics.ListAPIView):
     """API view for listing holiday entries with pagination.

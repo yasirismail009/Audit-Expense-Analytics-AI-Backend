@@ -1918,9 +1918,9 @@ class HolidayAnalysisResult(models.Model):
     
     def get_overall_risk_score(self):
         """Get overall risk score"""
-        if not self.audit_recommendations:
+        if not self.analysis_info:
             return 0.0
-        return self.audit_recommendations.get('overall_risk_score', 0.0)
+        return self.analysis_info.get('overall_risk_score', 0.0)
     
     def get_recommendations(self):
         """Get risk-based recommendations"""
