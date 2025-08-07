@@ -1040,8 +1040,8 @@ def run_unusual_days_analysis_sync(job_id):
         
         for t in transactions:
             if t.posting_date:
-                # Check if posting is on weekend (Saturday = 5, Sunday = 6)
-                if t.posting_date.weekday() >= 5:
+                # Check if posting is on weekend (Friday = 4, Saturday = 5)
+                if t.posting_date.weekday() in [4, 5]:
                     unusual_days_transactions.append({
                         'transaction_id': str(t.id),
                         'document_number': t.document_number,

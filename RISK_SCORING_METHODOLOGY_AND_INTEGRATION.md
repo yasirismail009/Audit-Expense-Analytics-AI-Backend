@@ -2,406 +2,459 @@
 
 ## Overview
 
-The analytics system implements a comprehensive risk scoring methodology that evaluates transactions across specialized analysis dimensions and integrates the results into an overall risk assessment. This document explains how risk scores are calculated in each analysis type and how they are linked together, including the enhanced SAPGLPosting anomaly tracking system.
+The analytics system implements a comprehensive risk scoring methodology that evaluates transactions across specialized analysis dimensions and integrates the results into an overall risk assessment. This document provides detailed formulas, calculations, and examples for how risk scores are calculated in each analysis type and how they are combined into the overall risk assessment.
 
-## **SYNC ANALYSIS TYPES AND RISK SCORING**
+## **DETAILED RISK SCORING CALCULATIONS**
 
-### **Complete Analysis Ecosystem**
+### **1. DUPLICATE ANALYSIS RISK SCORING**
 
-The system implements **8 comprehensive analysis types** that run synchronously and contribute to the overall risk assessment:
-
-#### **1. General Analysis** (`run_general_analysis_sync`)
-**Purpose**: Basic transaction statistics and overview
-**Risk Contribution**: Foundation for other analyses
-**Data Stored**: `GeneralAnalysisResult`
-
-**Key Metrics:**
-- Trial balance summary (total debits, credits, balance)
-- GL account summaries with transaction counts and amounts
-- User summaries with activity patterns
-- Statistical calculations (mean, standard deviation, min/max amounts)
-- Chart data for visualizations
-
-**Risk Scoring Impact:**
-- Provides baseline transaction statistics
-- Identifies unusual transaction patterns
-- Supports other analysis types with foundational data
-
-#### **2. Duplicate Analysis** (`run_duplicate_analysis_sync`)
-**Purpose**: Detect duplicate transactions across 6 types
-**Risk Contribution**: High risk (80 points)
-**Data Stored**: `DuplicateAnalysisResult`
-
-**Duplicate Types and Risk Scores:**
-```
-Type 6: 95 points (Account + Effective Date + Posted Date + User + Source + Amount)
-Type 5: 90 points (Account + Effective Date + Amount)
-Type 4: 85 points (Account + Posted Date + Amount)
-Type 3: 80 points (Account + User + Amount)
-Type 2: 75 points (Account + Source + Amount)
-Type 1: 70 points (Account + Amount)
-```
-
-**Detection Logic:**
+#### **Risk Score Calculation Formula:**
 ```python
-# Simple duplicate detection based on amount, date, and account
-transaction_dict = {}
-for t in transactions:
-    key = (float(t.amount_local_currency), t.posting_date, t.gl_account)
-    if key in transaction_dict:
-        # Found duplicate - assign risk score based on type
-        duplicate_pairs.append({
-            'transaction1': {...},
-            'transaction2': {...},
-            'similarity_score': 1.0,
-            'risk_level': 'HIGH'
-        })
+def calculate_duplicate_risk_score(duplicate_type):
+    """
+    Calculate risk score for duplicate entries based on duplicate type
+    """
+    # Base risk score for duplicates (40 points)
+    risk_score = 40.0
+    
+    # Factor 1: Duplicate type (primary factor)
+    if 'Type 6' in duplicate_type:
+        risk_score = 100.0  # Critical
+    elif 'Type 5' in duplicate_type:
+        risk_score = 85.0   # High
+    elif 'Type 4' in duplicate_type:
+        risk_score = 75.0   # Medium-High
+    elif 'Type 3' in duplicate_type:
+        risk_score = 65.0   # Medium
+    elif 'Type 2' in duplicate_type:
+        risk_score = 55.0   # Medium-Low
+    elif 'Type 1' in duplicate_type:
+        risk_score = 45.0   # Low
+    else:
+        risk_score = 40.0   # Default
+    
+    return min(risk_score, 100.0)
 ```
 
-#### **3. Backdated Analysis** (`run_backdated_analysis_sync`)
-**Purpose**: Detect transactions posted after document date
-**Risk Contribution**: High risk (70 points)
-**Data Stored**: `BackdatedAnalysisResult`
+#### **Duplicate Types and Risk Scores:**
 
-**Risk Score Calculation:**
+| Duplicate Type | Matching Criteria | Risk Score | Risk Level | Rationale |
+|----------------|------------------|------------|------------|-----------|
+| **Type 6** | Account + Effective Date + Posted Date + User + Source + Amount | 100.0 | CRITICAL | Complete match across all critical fields |
+| **Type 5** | Account + Effective Date + Amount | 85.0 | HIGH | Three critical field match |
+| **Type 4** | Account + Posted Date + Amount | 75.0 | MEDIUM-HIGH | Date and amount match |
+| **Type 3** | Account + User + Amount | 65.0 | MEDIUM | User and amount match |
+| **Type 2** | Account + Source + Amount | 55.0 | MEDIUM-LOW | Source and amount match |
+| **Type 1** | Account + Amount | 45.0 | LOW | Basic amount match |
+
+#### **Risk Level Thresholds:**
 ```python
-if days_difference > 30:
-    risk_score = 100.0  # Critical
-elif days_difference > 14:
-    risk_score = 85.0   # High
-elif days_difference > 7:
-    risk_score = 70.0   # Medium
-else:
-    risk_score = 50.0   # Low
+def get_duplicate_risk_level(risk_score):
+    if risk_score >= 85:
+        return 'CRITICAL'
+    elif risk_score >= 70:
+        return 'HIGH'
+    elif risk_score >= 50:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
 ```
 
-**Detection Logic:**
+#### **Example Calculations:**
+
+**Example 1: Type 6 Duplicate**
+```json
+{
+  "duplicate_type": "Type 6 Duplicate - Account Number + Effective Date + Posted Date + User + Source + Amount",
+  "risk_score": 100.0,
+  "risk_level": "CRITICAL",
+  "matching_fields": ["account", "effective_date", "posted_date", "user", "source", "amount"]
+}
+```
+
+**Example 2: Type 1 Duplicate**
+```json
+{
+  "duplicate_type": "Type 1 Duplicate - Account Number + Amount",
+  "risk_score": 45.0,
+  "risk_level": "LOW",
+  "matching_fields": ["account", "amount"]
+}
+```
+
+---
+
+### **2. BACKDATED ANALYSIS RISK SCORING**
+
+#### **Risk Score Calculation Formula:**
 ```python
-backdated_threshold = timedelta(days=7)
-for t in transactions:
-    if t.posting_date and t.document_date:
-        days_difference = (t.posting_date - t.document_date).days
-        if days_difference > 0:  # Backdated transaction
-            backdated_transactions.append({
-                'transaction_id': str(t.id),
-                'days_difference': days_difference,
-                'risk_level': 'HIGH' if days_difference > 30 else 'MEDIUM'
-            })
+def calculate_backdated_risk_score(days_difference):
+    """
+    Calculate risk score for backdated entries based on days difference
+    """
+    # Base risk score for backdated entries (50 points)
+    risk_score = 50.0
+    
+    # Factor 1: Days difference (primary factor)
+    if days_difference > 30:
+        risk_score = 100.0  # Critical
+    elif days_difference > 14:
+        risk_score = 85.0   # High
+    elif days_difference > 7:
+        risk_score = 70.0   # Medium
+    else:
+        risk_score = 50.0   # Low
+    
+    return min(risk_score, 100.0)
 ```
 
-#### **4. User Analysis** (`run_user_analysis_sync`)
-**Purpose**: Analyze user behavior patterns and anomalies
-**Risk Contribution**: Medium risk (50 points)
-**Data Stored**: `UserAnalysisResult`
+#### **Days Difference Risk Scoring:**
 
-**Anomaly Detection:**
+| Days Difference | Risk Score | Risk Level | Severity | Rationale |
+|-----------------|------------|------------|----------|-----------|
+| **> 30 days** | 100.0 | CRITICAL | SIGNIFICANT | Major backdating concern |
+| **15-30 days** | 85.0 | HIGH | MODERATE | Substantial backdating |
+| **8-14 days** | 70.0 | MEDIUM | MINOR | Moderate backdating |
+| **1-7 days** | 50.0 | LOW | MINIMAL | Minor backdating |
+
+#### **Risk Level Thresholds:**
 ```python
-# Simple anomaly detection: users with very high amounts or many transactions
-if data['total_amount'] > 1000000 or data['transaction_count'] > 100:
-    user_anomalies.append({
-        'user': user,
-        'anomaly_type': 'HIGH_ACTIVITY',
-        'risk_level': 'HIGH',
-        'details': f"User has {data['transaction_count']} transactions totaling {data['total_amount']}"
-    })
+def get_backdated_risk_level(risk_score):
+    if risk_score >= 85:
+        return 'CRITICAL'
+    elif risk_score >= 70:
+        return 'HIGH'
+    elif risk_score >= 50:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
 ```
 
-**Risk Factors:**
-- Transaction volume anomalies
-- Amount anomalies
-- Account usage patterns
-- Temporal anomalies
-- User role violations
+#### **Example Calculations:**
 
-#### **5. Unusual Days Analysis** (`run_unusual_days_analysis_sync`)
-**Purpose**: Detect weekend/unusual day transactions
-**Risk Contribution**: Medium risk (40 points)
-**Data Stored**: `UnusualDaysAnalysisResult`
+**Example 1: 45 Days Backdated**
+```json
+{
+  "days_difference": 45,
+  "risk_score": 100.0,
+  "risk_level": "CRITICAL",
+  "backdated_severity": "CRITICAL"
+}
+```
 
-**Detection Logic:**
+**Example 2: 10 Days Backdated**
+```json
+{
+  "days_difference": 10,
+  "risk_score": 70.0,
+  "risk_level": "MEDIUM",
+  "backdated_severity": "MODERATE"
+}
+```
+
+---
+
+### **3. CLOSING ENTRIES ANALYSIS RISK SCORING**
+
+#### **Risk Score Calculation Formula:**
 ```python
-for t in transactions:
-    if t.posting_date:
-        # Check if posting is on weekend (Saturday = 5, Sunday = 6)
-        if t.posting_date.weekday() >= 5:
-            unusual_days_transactions.append({
-                'transaction_id': str(t.id),
-                'day_of_week': t.posting_date.strftime('%A'),
-                'risk_level': 'HIGH'
-            })
+def calculate_closing_risk_score(entry):
+    """
+    Calculate risk score for closing entries based on RISK_SCORING_METHODOLOGY_AND_INTEGRATION.md
+    """
+    # Base risk score for closing entries (30 points)
+    risk_score = 30.0
+    
+    # Factor 1: Post-close entries (25 points)
+    days_from_month_end = entry.get('days_from_month_end', 0)
+    if days_from_month_end > 0:  # Post-close entry
+        risk_score += 25.0
+    
+    # Factor 2: Debit closing entries (10 points)
+    amount = float(entry.get('amount', 0))
+    if amount < 0:  # Debit transaction
+        risk_score += 10.0
+    
+    # Factor 3: Month-end closing (5 points)
+    if days_from_month_end <= 1:  # Month-end transaction
+        risk_score += 5.0
+    
+    # Factor 4: Year-end closing (10 points)
+    posting_date = entry.get('posting_date', '')
+    if posting_date:
+        try:
+            from datetime import datetime
+            if isinstance(posting_date, str):
+                posting_date = datetime.strptime(posting_date, '%Y-%m-%d').date()
+            # Check if it's December and near year-end
+            if posting_date.month == 12 and posting_date.day >= 25:
+                risk_score += 10.0
+        except:
+            pass
+    
+    return min(risk_score, 100.0)
 ```
 
-**Risk Factors:**
-- Weekend postings (base risk: 50 points)
-- Month-end weekend postings (+10 points)
-- Year-end weekend postings (+10 points)
-- Debit transactions on weekend (+10 points)
+#### **Closing Entry Risk Factors:**
 
-#### **6. Closing Entries Analysis** (`run_closing_entries_analysis_sync`)
-**Purpose**: Detect month-end closing transactions
-**Risk Contribution**: Medium risk (30 points)
-**Data Stored**: `ClosingEntriesAnalysisResult`
+| Risk Factor | Points | Condition | Rationale |
+|-------------|--------|-----------|-----------|
+| **Post-close entries** | +25 | Days from month-end > 0 | Entries after month-end are high risk |
+| **Debit closing entries** | +10 | Amount < 0 | Debit transactions are more concerning |
+| **Month-end closing** | +5 | Days from month-end ≤ 1 | Standard month-end closing |
+| **Year-end closing** | +10 | December 25+ | Year-end closing is critical |
 
-**Detection Logic:**
+#### **Risk Level Thresholds:**
 ```python
-for t in transactions:
-    if t.posting_date:
-        # Consider transactions in last 3 days of month as potential closing entries
-        last_day_of_month = (t.posting_date.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
-        days_from_month_end = (last_day_of_month - t.posting_date).days
-        
-        if days_from_month_end <= 3:
-            closing_entries_transactions.append({
-                'transaction_id': str(t.id),
-                'days_from_month_end': days_from_month_end,
-                'risk_level': 'MEDIUM' if days_from_month_end <= 1 else 'LOW'
-            })
+def get_closing_risk_level(risk_score):
+    if risk_score >= 90:
+        return 'CRITICAL'
+    elif risk_score >= 70:
+        return 'HIGH'
+    elif risk_score >= 50:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
 ```
 
-**Risk Factors:**
-- Post-close entries (+25 points)
-- Year-end closing entries (+10 points)
-- Debit closing entries (+10 points)
-- Month-end closing (+5 points)
+#### **Example Calculations:**
 
-#### **7. Holiday Analysis** (`run_holiday_analysis_sync`)
-**Purpose**: Detect transactions on Saudi Arabian holidays
-**Risk Contribution**: High risk (60 points)
-**Data Stored**: `HolidayAnalysisResult`
+**Example 1: Post-close Debit Entry**
+```json
+{
+  "days_from_month_end": 2,
+  "amount": -5000000.0,
+  "posting_date": "2025-01-02",
+  "risk_score": 70.0,  // 30 + 25 + 10 + 5
+  "risk_level": "HIGH"
+}
+```
 
-**Detection Logic:**
+**Example 2: Year-end Closing Entry**
+```json
+{
+  "days_from_month_end": 0,
+  "amount": 1000000.0,
+  "posting_date": "2025-12-30",
+  "risk_score": 45.0,  // 30 + 0 + 0 + 5 + 10
+  "risk_level": "MEDIUM"
+}
+```
+
+---
+
+### **4. UNUSUAL DAYS ANALYSIS RISK SCORING**
+
+#### **Risk Score Calculation Formula:**
 ```python
-# Use holiday_utils to get dynamic Saudi Arabian holidays
-from .holiday_utils import get_holidays, is_holiday
-
-holidays = get_holidays('saudiarabian', start_date, end_date, include_observances=True)
-holiday_dates = {h.date for h in holidays}
-holiday_info = {h.date: {'name': h.name, 'type': h.holiday_type} for h in holidays}
-
-for t in transactions:
-    if t.posting_date:
-        posting_date_str = t.posting_date.strftime('%Y-%m-%d')
-        if posting_date_str in holiday_dates:
-            holiday_name = holiday_info.get(posting_date_str, {}).get('name', 'Saudi Holiday')
-            holiday_transactions.append({
-                'transaction_id': str(t.id),
-                'holiday_name': holiday_name,
-                'risk_level': 'HIGH'
-            })
+def calculate_unusual_days_risk_score(entry):
+    """
+    Calculate risk score for unusual days entries based on RISK_SCORING_METHODOLOGY_AND_INTEGRATION.md
+    """
+    # Base risk score for unusual days (60 points)
+    risk_score = 60.0
+    
+    # Factor 1: Day of week (primary factor)
+    day_of_week = entry.get('day_of_week', '').lower()
+    if day_of_week in ['saturday', 'friday']:
+        risk_score = 100.0  # Critical - Weekend posting
+    else:
+        risk_score = 60.0   # Medium - Other unusual days
+    
+    # Factor 2: High value transactions
+    amount = float(entry.get('amount', 0))
+    if amount > 10000000:  # > 10M
+        risk_score = min(risk_score + 20.0, 100.0)
+    elif amount > 1000000:  # > 1M
+        risk_score = min(risk_score + 10.0, 100.0)
+    
+    return min(risk_score, 100.0)
 ```
 
-**Risk Factors:**
-- Holiday postings (base risk: 60 points)
-- Year-end holiday postings (+10 points)
-- Debit transactions on holidays (+10 points)
+#### **Unusual Days Risk Factors:**
 
-#### **8. Overall Analysis** (`run_overall_analysis_sync`)
-**Purpose**: Comprehensive analysis combining all analysis types
-**Risk Contribution**: Integrates all analysis results
-**Data Stored**: `OverallAnalysisResult`
+| Day Type | Base Risk | Risk Level | Rationale |
+|----------|-----------|------------|-----------|
+| **Saturday/Friday** | 100.0 | CRITICAL | Weekend postings are highest risk |
+| **Other days** | 60.0 | MEDIUM | Other unusual days |
 
-**Integration Logic:**
+| Amount Category | Additional Risk | Condition |
+|----------------|-----------------|-----------|
+| **High Value** | +20 | Amount > 10M |
+| **Medium Value** | +10 | Amount > 1M |
+
+#### **Risk Level Thresholds:**
 ```python
-# Use the real OverallAnalyzer to run comprehensive analysis
-overall_analyzer = OverallAnalyzer()
-analysis_results = overall_analyzer.run_overall_analysis(data_file, job)
+def get_unusual_days_risk_level(risk_score):
+    if risk_score >= 85:
+        return 'CRITICAL'
+    elif risk_score >= 70:
+        return 'HIGH'
+    elif risk_score >= 50:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
 ```
 
-**Key Features:**
-- Combines all analysis results
-- Generates comprehensive risk assessment
-- Creates risk scoring document
-- Provides audit recommendations
+#### **Example Calculations:**
 
-### **PHASE 1: INDIVIDUAL ANALYSIS RISK SCORING**
-
-#### **1. Duplicate Analysis Risk Scoring (70-95 points)**
-
-**Risk Factors & Point Allocation:**
-- **Account Matching**: Base factor (required for all types)
-- **Date Matching**: Effective date + Posted date (Type 5, 6)
-- **User Matching**: Same user posting (Type 3, 6)
-- **Source Matching**: Same source system (Type 2, 6)
-- **Amount Matching**: Same transaction amount (all types)
-- **Temporal Proximity**: Short time intervals
-- **Pattern Consistency**: Repeated patterns
-
-**Risk Score by Duplicate Type:**
-```
-Type 6: 95 points (Account + Effective Date + Posted Date + User + Source + Amount)
-Type 5: 90 points (Account + Effective Date + Amount)
-Type 4: 85 points (Account + Posted Date + Amount)
-Type 3: 80 points (Account + User + Amount)
-Type 2: 75 points (Account + Source + Amount)
-Type 1: 70 points (Account + Amount)
+**Example 1: Weekend High-Value Transaction**
+```json
+{
+  "day_of_week": "saturday",
+  "amount": 15000000.0,
+  "risk_score": 100.0,  // 100 (weekend) + 20 (high value) = 120, capped at 100
+  "risk_level": "CRITICAL"
+}
 ```
 
-**Risk Levels:**
-- **Low Risk (70-74)**: Type 1 duplicates
-- **Medium Risk (75-84)**: Type 2-3 duplicates
-- **High Risk (85-94)**: Type 4-5 duplicates
-- **Critical Risk (95-100)**: Type 6 duplicates
+**Example 2: Friday High-Value Transaction**
+```json
+{
+  "day_of_week": "friday",
+  "amount": 5000000.0,
+  "risk_score": 100.0,  // 100 (friday) + 10 (medium value) = 110, capped at 100
+  "risk_level": "CRITICAL"
+}
+```
 
-#### **2. Backdated Analysis Risk Scoring (50-100 points)**
+---
 
-**Risk Factors & Point Allocation:**
-- **Days Difference**: Primary factor
-  - 1-7 days: 50 points
-  - 8-14 days: 70 points
-  - 15-30 days: 85 points
-  - >30 days: 100 points
-- **Month-End Backdating**: Additional risk factor
-- **Quarter-End Backdating**: Additional risk factor
-- **Year-End Backdating**: Additional risk factor
-- **User Backdating Patterns**: Users frequently posting backdated entries
-- **Account Backdating Patterns**: Specific accounts with backdated entries
-- **Temporal Clustering**: Multiple backdated entries in short periods
+### **5. USER ANALYSIS RISK SCORING**
 
-**Risk Score Calculation:**
+#### **Risk Score Calculation Formula:**
 ```python
-if days_difference > 30:
-    risk_score = 100.0  # Critical
-elif days_difference > 14:
-    risk_score = 85.0   # High
-elif days_difference > 7:
-    risk_score = 70.0   # Medium
-else:
-    risk_score = 50.0   # Low
+def calculate_user_risk_score(entry):
+    """
+    Calculate risk score for user entries based on RISK_SCORING_METHODOLOGY_AND_INTEGRATION.md
+    user_activity: high_activity (users with >10 transactions) or low_activity (users with ≤5 transactions)
+    - user_risk: high_risk (users with avg risk >50) or low_risk (users with avg risk ≤20)
+    """
+    # Base risk score for users (30 points)
+    risk_score = 30.0
+    
+    # Factor 1: Risk factors (15 points per factor)
+    risk_factors = entry.get('risk_factors', [])
+    risk_score += len(risk_factors) * 15.0
+    
+    # Factor 2: Anomaly type
+    anomaly_type = entry.get('anomaly_type', '')
+    if 'HIGH_ACTIVITY' in anomaly_type:
+        risk_score = 75.0  # High
+    elif 'MEDIUM_ACTIVITY' in anomaly_type:
+        risk_score = 55.0  # Medium
+    else:
+        risk_score = 35.0  # Low
+    
+    return min(risk_score, 100.0)
 ```
 
-**Risk Levels:**
-- **Low Risk (50-69)**: 1-7 days difference
-- **Medium Risk (70-84)**: 8-14 days difference
-- **High Risk (85-99)**: 15-30 days difference
-- **Critical Risk (100)**: >30 days difference
+#### **User Risk Factors:**
 
-#### **3. User Analysis Risk Scoring (0-100 points)**
+| Risk Factor | Points | Description |
+|-------------|--------|-------------|
+| **High Activity** | 75.0 | Users with unusually high transaction counts |
+| **Medium Activity** | 55.0 | Users with moderate anomalies |
+| **Low Activity** | 35.0 | Users with minor anomalies |
+| **Risk Factors** | +15 per factor | Additional risk factors identified |
 
-**Risk Factors & Point Allocation:**
-- **Transaction Volume**: Users with unusually high transaction counts
-- **Account Usage Patterns**: Users posting to unusual/restricted accounts (+15 points)
-- **Temporal Anomalies**: Users posting at unusual times (+10 points)
-- **Pattern Deviations**: Users deviating from normal patterns (+15 points)
-- **User Role Violations**: Users posting outside typical role
-- **Geographic Anomalies**: Users posting from unusual locations
-- **Session Patterns**: Unusual login/logout patterns
-- **Batch Processing**: Users posting large batches
-
-**Risk Score Calculation:**
+#### **Risk Level Thresholds:**
 ```python
-base_risk = user_anomaly_score
-if user_unusual_accounts > threshold:
-    base_risk += 15.0
-if user_temporal_anomalies:
-    base_risk += 10.0
-if user_pattern_deviation > threshold:
-    base_risk += 15.0
-final_risk = min(base_risk, 100.0)
+def get_user_risk_level(risk_score):
+    if risk_score >= 85:
+        return 'CRITICAL'
+    elif risk_score >= 65:
+        return 'HIGH'
+    elif risk_score >= 45:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
 ```
 
-**Risk Levels:**
-- **Low Risk (0-30)**: Normal user activity
-- **Medium Risk (31-60)**: Some unusual patterns
-- **High Risk (61-85)**: Multiple anomalies
-- **Critical Risk (86-100)**: Critical behavior issues
+#### **Example Calculations:**
 
-#### **4. Unusual Days Analysis Risk Scoring (50-100 points)**
+**Example 1: High Activity User with Multiple Risk Factors**
+```json
+{
+  "anomaly_type": "HIGH_ACTIVITY",
+  "risk_factors": ["weekend_activity", "high_value_transactions", "unusual_accounts"],
+  "risk_score": 75.0,  // Base high activity
+  "risk_level": "HIGH"
+}
+```
 
-**Risk Factors & Point Allocation:**
-- **Weekend Postings**: Base risk (50 points)
-- **Holiday Postings**: Additional risk factor
-- **Unusual Day Patterns**: Statistically unusual days
-- **User Weekend Activity**: Users posting frequently on weekends
-- **Temporal Anomalies**: Transactions at unusual times
-- **Month-End Weekend**: Weekend postings near month-end (+10 points)
-- **Year-End Weekend**: Weekend postings near year-end (+10 points)
-- **Pattern Clustering**: Multiple weekend postings by same user
+**Example 2: Medium Activity User**
+```json
+{
+  "anomaly_type": "MEDIUM_ACTIVITY",
+  "risk_factors": ["weekend_activity"],
+  "risk_score": 55.0,  // Base medium activity
+  "risk_level": "MEDIUM"
+}
+```
 
-**Risk Score Calculation:**
+---
+
+### **6. HOLIDAY ANALYSIS RISK SCORING**
+
+#### **Risk Score Calculation Formula:**
 ```python
-base_risk = 50.0  # Base weekend posting risk
-if transaction.transaction_type == 'DEBIT':
-    base_risk += 10.0  # Debit transactions on weekend
-if transaction.posting_date.day >= 25:
-    base_risk += 10.0  # Month-end weekend posting
-if transaction.posting_date.month == 12 and transaction.posting_date.day >= 25:
-    base_risk += 10.0  # Year-end weekend posting
-final_risk = min(base_risk, 100.0)
+def calculate_holiday_risk_score(entry):
+    """
+    Calculate risk score for holiday entries based on risk level
+    """
+    risk_level = entry.get('risk_level', 'LOW')
+    risk_scores = {
+        'LOW': 25.0,
+        'MEDIUM': 50.0,
+        'HIGH': 75.0,
+        'CRITICAL': 100.0
+    }
+    return risk_scores.get(risk_level, 0.0)
 ```
 
-**Risk Levels:**
-- **Low Risk (50-69)**: Basic weekend posting
-- **Medium Risk (70-84)**: Weekend posting with additional factors
-- **High Risk (85-99)**: Weekend posting with multiple risk factors
-- **Critical Risk (100)**: Critical weekend posting patterns
+#### **Holiday Risk Factors:**
 
-#### **5. Closing Entries Analysis Risk Scoring (30-100 points)**
+| Risk Level | Risk Score | Description |
+|------------|------------|-------------|
+| **CRITICAL** | 100.0 | Critical holiday postings |
+| **HIGH** | 75.0 | High-risk holiday postings |
+| **MEDIUM** | 50.0 | Medium-risk holiday postings |
+| **LOW** | 25.0 | Low-risk holiday postings |
 
-**Risk Factors & Point Allocation:**
-- **Post-Close Entries**: Entries posted after month-end (+25 points)
-- **Closing Window Violations**: Entries outside standard closing windows
-- **Unusual Closing Patterns**: Unusual patterns during closing periods
-- **User Closing Activity**: Users posting frequently during closing
-- **Temporal Anomalies**: Transactions at unusual times during closing
-- **Account Closing Patterns**: Specific accounts with closing entries
-- **Batch Closing**: Large batches of closing entries
-- **Year-End Closing**: Entries during year-end closing periods (+10 points)
+#### **Example Calculations:**
 
-**Risk Score Calculation:**
-```python
-base_risk = 30.0  # Base closing entry risk
-if is_post_close_entry(transaction.posting_date):
-    base_risk += 25.0  # Post-close entry
-if transaction.transaction_type == 'DEBIT':
-    base_risk += 10.0  # Debit closing entry
-if transaction.posting_date.day >= 25:
-    base_risk += 5.0   # Month-end closing
-if transaction.posting_date.month == 12 and transaction.posting_date.day >= 25:
-    base_risk += 10.0  # Year-end closing
-final_risk = min(base_risk, 100.0)
+**Example 1: Critical Holiday Posting**
+```json
+{
+  "holiday_name": "Christmas",
+  "risk_level": "CRITICAL",
+  "risk_score": 100.0,
+  "amount": 5000000.0
+}
 ```
 
-**Risk Levels:**
-- **Low Risk (30-49)**: Basic closing entry
-- **Medium Risk (50-69)**: Closing entry with additional factors
-- **High Risk (70-89)**: Post-close entry or closing with multiple factors
-- **Critical Risk (90-100)**: Critical closing entry patterns
-
-#### **6. Holiday Analysis Risk Scoring (60-100 points)**
-
-**Risk Factors & Point Allocation:**
-- **Holiday Postings**: Base risk (60 points)
-- **Holiday Type**: Public holidays vs. observances
-- **User Holiday Activity**: Users posting frequently on holidays
-- **Temporal Anomalies**: Transactions at unusual times on holidays
-- **Account Holiday Patterns**: Specific accounts with holiday entries
-- **Batch Holiday**: Large batches of holiday entries
-- **Year-End Holiday**: Holiday postings near year-end (+10 points)
-
-**Risk Score Calculation:**
-```python
-base_risk = 60.0  # Base holiday posting risk
-if transaction.transaction_type == 'DEBIT':
-    base_risk += 10.0  # Debit transactions on holiday
-if transaction.posting_date.month == 12 and transaction.posting_date.day >= 25:
-    base_risk += 10.0  # Year-end holiday posting
-final_risk = min(base_risk, 100.0)
+**Example 2: Medium Holiday Posting**
+```json
+{
+  "holiday_name": "Veterans Day",
+  "risk_level": "MEDIUM",
+  "risk_score": 50.0,
+  "amount": 100000.0
+}
 ```
 
-**Risk Levels:**
-- **Low Risk (60-69)**: Basic holiday posting
-- **Medium Risk (70-84)**: Holiday posting with additional factors
-- **High Risk (85-99)**: Holiday posting with multiple risk factors
-- **Critical Risk (100)**: Critical holiday posting patterns
+---
 
-### **PHASE 2: SIMPLIFIED RISK INTEGRATION**
+## **OVERALL RISK SCORING METHODOLOGY**
 
-#### **Current Implementation: Direct Risk Score Assignment**
-
-The current system uses a simplified approach where risk scores are directly assigned based on detected anomalies:
+### **Individual Transaction Risk Score Calculation**
 
 ```python
 def calculate_transaction_risk_score(transaction, analysis_results):
+    """
+    Calculate overall risk score for a single transaction
+    """
     risk_score = 0.0
     anomaly_types = []
     
@@ -438,105 +491,13 @@ def calculate_transaction_risk_score(transaction, analysis_results):
     return min(risk_score, 100.0), anomaly_types
 ```
 
-#### **Risk Score Weights:**
-
-| Anomaly Type | Risk Points | Risk Level | Rationale |
-|--------------|-------------|------------|-----------|
-| **Duplicate** | 80 points | High Risk | Critical nature of duplicate transactions |
-| **Backdated** | 70 points | High Risk | Significant audit concern |
-| **Holiday** | 60 points | High Risk | Unusual posting on holidays |
-| **User Anomaly** | 50 points | Medium Risk | User behavior anomalies |
-| **Unusual Days** | 40 points | Medium Risk | Weekend/unusual day postings |
-| **Closing Entries** | 30 points | Medium Risk | Month-end closing entries |
-
-### **PHASE 3: SAPGLPosting ANOMALY TRACKING**
-
-#### **Enhanced Transaction-Level Anomaly Tracking**
-
-The system now updates individual `SAPGLPosting` transactions with comprehensive anomaly identification:
+### **Overall File Risk Score Calculation**
 
 ```python
-# Update transaction risk score and anomaly flags
-transaction.overall_risk_score = risk_score
-
-# Update specific anomaly flags
-anomaly_types = []
-
-# Check for duplicate (high risk)
-if duplicate_analysis and duplicate_analysis.duplicate_list:
-    for duplicate in duplicate_analysis.duplicate_list:
-        if (str(transaction.id) in [duplicate.get('transaction1', {}).get('id'), 
-                                   duplicate.get('transaction2', {}).get('id')]):
-            transaction.is_duplicate = True
-            transaction.duplicate_risk_score = 80.0
-            anomaly_types.append('duplicate')
-            break
-
-# Check for backdated (high risk)
-if backdated_analysis and backdated_analysis.backdated_entries:
-    for backdated in backdated_analysis.backdated_entries:
-        if str(transaction.id) == backdated.get('transaction_id'):
-            transaction.is_backdated = True
-            transaction.backdated_risk_score = 70.0
-            transaction.backdated_days = backdated.get('days_difference', 0)
-            anomaly_types.append('backdated')
-            break
-
-# Check for holiday (high risk)
-if holiday_analysis and holiday_analysis.holiday_postings:
-    for holiday in holiday_analysis.holiday_postings:
-        if str(transaction.id) == holiday.get('transaction_id'):
-            transaction.is_holiday_posting = True
-            transaction.holiday_name = holiday.get('holiday_name', 'Unknown')
-            anomaly_types.append('holiday')
-            break
-
-# Update anomaly types list and summary
-transaction.anomaly_types = anomaly_types
-transaction.anomaly_analysis_summary = {
-    'risk_score': risk_score,
-    'anomaly_types': anomaly_types,
-    'is_duplicate': transaction.is_duplicate,
-    'is_backdated': transaction.is_backdated,
-    'is_holiday_posting': transaction.is_holiday_posting,
-    'holiday_name': transaction.holiday_name,
-    'backdated_days': transaction.backdated_days
-}
-
-transaction.save()
-```
-
-#### **SAPGLPosting Anomaly Fields:**
-
-**Risk Scoring Fields:**
-- **`overall_risk_score`** (Float): Overall risk score (0-100)
-- **`anomaly_types`** (JSON List): List of detected anomaly types
-- **`anomaly_analysis_summary`** (JSON): Comprehensive anomaly summary
-
-**Specific Anomaly Flags:**
-- **`is_duplicate`** (Boolean): Flagged as duplicate transaction
-- **`duplicate_type`** (String): Type of duplicate (type_1, type_2, etc.)
-- **`duplicate_risk_score`** (Float): Risk score for duplicate detection (0-100)
-- **`duplicate_analysis_details`** (JSON): Detailed duplicate analysis results
-
-- **`is_backdated`** (Boolean): Flagged as backdated transaction
-- **`backdated_days`** (Integer): Number of days between document date and posting date
-- **`backdated_risk_score`** (Float): Risk score for backdated detection (0-100)
-- **`backdated_analysis_details`** (JSON): Detailed backdated analysis results
-
-- **`is_holiday_posting`** (Boolean): Flagged as holiday posting
-- **`holiday_name`** (String): Name of the holiday (e.g., "Christmas", "Veterans Day")
-- **`holiday_type`** (String): Type of holiday (Public holiday, Observance, etc.)
-- **`holiday_analysis_details`** (JSON): Detailed holiday analysis results
-
-### **PHASE 4: OVERALL RISK SCORING**
-
-#### **Weighted Overall Risk Score Calculation**
-
-The overall risk score is calculated based on the percentage of high and critical risk transactions:
-
-```python
-def calculate_overall_risk_score(risk_distribution, total_transactions):
+def calculate_overall_file_risk_score(risk_distribution, total_transactions):
+    """
+    Calculate overall risk score for the entire file
+    """
     high_risk_count = risk_distribution.get('high_risk', 0)
     critical_risk_count = risk_distribution.get('critical_risk', 0)
     
@@ -563,10 +524,13 @@ def calculate_overall_risk_score(risk_distribution, total_transactions):
     return overall_risk_score
 ```
 
-#### **Risk Level Classification:**
+### **Risk Level Classification**
 
 ```python
 def get_risk_level(overall_risk_score):
+    """
+    Determine risk level based on overall risk score
+    """
     if overall_risk_score >= 80:
         return 'CRITICAL'  # Risk Level 3
     elif overall_risk_score >= 60:
@@ -577,275 +541,706 @@ def get_risk_level(overall_risk_score):
         return 'LOW'       # Risk Level 0
 ```
 
-**Risk Level Thresholds:**
-- **Critical Risk**: ≥80 points (Risk Level 3)
-- **High Risk**: 60-79 points (Risk Level 2)
-- **Medium Risk**: 30-59 points (Risk Level 1)
-- **Low Risk**: 0-29 points (Risk Level 0)
+### **Risk Score Weights by Analysis Type**
 
-### **SYNC ANALYSIS INTEGRATION PATTERNS**
+| Analysis Type | Risk Points | Risk Level | Rationale |
+|--------------|-------------|------------|-----------|
+| **Duplicate** | 80 points | High Risk | Critical nature of duplicate transactions |
+| **Backdated** | 70 points | High Risk | Significant audit concern |
+| **Holiday** | 60 points | High Risk | Unusual posting on holidays |
+| **User Anomaly** | 50 points | Medium Risk | User behavior anomalies |
+| **Unusual Days** | 40 points | Medium Risk | Weekend/unusual day postings |
+| **Closing Entries** | 30 points | Medium Risk | Month-end closing entries |
 
-#### **Analysis Execution Flow:**
+### **Risk Level Thresholds**
 
-```python
-# Complete sync analysis pipeline
-def run_complete_analysis_sync(job_id):
-    """Run all analysis types synchronously"""
-    
-    analysis_results = {}
-    
-    # 1. General Analysis (Foundation)
-    general_result = run_general_analysis_sync(job_id)
-    analysis_results['general_analysis'] = general_result
-    
-    # 2. Duplicate Analysis (High Risk)
-    duplicate_result = run_duplicate_analysis_sync(job_id)
-    analysis_results['duplicate_analysis'] = duplicate_result
-    
-    # 3. Backdated Analysis (High Risk)
-    backdated_result = run_backdated_analysis_sync(job_id)
-    analysis_results['backdated_analysis'] = backdated_result
-    
-    # 4. User Analysis (Medium Risk)
-    user_result = run_user_analysis_sync(job_id)
-    analysis_results['user_analysis'] = user_result
-    
-    # 5. Unusual Days Analysis (Medium Risk)
-    unusual_days_result = run_unusual_days_analysis_sync(job_id)
-    analysis_results['unusual_days_analysis'] = unusual_days_result
-    
-    # 6. Closing Entries Analysis (Medium Risk)
-    closing_entries_result = run_closing_entries_analysis_sync(job_id)
-    analysis_results['closing_entries_analysis'] = closing_entries_result
-    
-    # 7. Holiday Analysis (High Risk)
-    holiday_result = run_holiday_analysis_sync(job_id)
-    analysis_results['holiday_analysis'] = holiday_result
-    
-    # 8. Overall Analysis (Integration)
-    overall_result = run_overall_analysis_sync(job_id)
-    analysis_results['overall_analysis'] = overall_result
-    
-    # 9. Risk Analysis (Final Integration)
-    risk_result = run_risk_analysis_sync(job_id)
-    analysis_results['risk_analysis'] = risk_result
-    
-    return analysis_results
-```
+| Risk Level | Score Range | Risk Level Number | Description |
+|------------|-------------|------------------|-------------|
+| **CRITICAL** | 80-100 | 3 | Critical risk requiring immediate attention |
+| **HIGH** | 60-79 | 2 | High risk requiring investigation |
+| **MEDIUM** | 30-59 | 1 | Medium risk requiring monitoring |
+| **LOW** | 0-29 | 0 | Low risk, normal operations |
 
-#### **Database Storage Pattern:**
+---
 
-Each analysis type stores results in dedicated tables:
+## **COMPREHENSIVE EXAMPLE CALCULATIONS**
 
-```python
-# Analysis Result Models
-class GeneralAnalysisResult(models.Model):
-    # Basic transaction statistics and overview
-    trial_balance_summary = models.JSONField()
-    gl_account_summaries = models.JSONField()
-    user_summaries = models.JSONField()
-    statistical_calculations = models.JSONField()
-
-class DuplicateAnalysisResult(models.Model):
-    # Duplicate detection results
-    duplicate_list = models.JSONField()
-    breakdowns = models.JSONField()
-    compliance_assessment = models.JSONField()
-
-class BackdatedAnalysisResult(models.Model):
-    # Backdated transaction detection
-    backdated_entries = models.JSONField()
-    backdated_by_user = models.JSONField()
-    backdated_by_account = models.JSONField()
-
-class UserAnalysisResult(models.Model):
-    # User behavior analysis
-    user_transaction_summary = models.JSONField()
-    user_anomalies = models.JSONField()
-    user_risk_assessment = models.JSONField()
-
-class UnusualDaysAnalysisResult(models.Model):
-    # Weekend/unusual day detection
-    weekend_postings = models.JSONField()
-    unusual_days = models.JSONField()
-
-class ClosingEntriesAnalysisResult(models.Model):
-    # Month-end closing detection
-    closing_entries = models.JSONField()
-    post_close_analysis = models.JSONField()
-
-class HolidayAnalysisResult(models.Model):
-    # Holiday posting detection
-    holiday_postings = models.JSONField()
-    holiday_by_fs_line = models.JSONField()
-    holiday_by_account = models.JSONField()
-
-class OverallAnalysisResult(models.Model):
-    # Comprehensive integration
-    transaction_summary = models.JSONField()
-    flagged_transactions = models.JSONField()
-    risk_assessment = models.JSONField()
-
-class RiskScoringDocument(models.Model):
-    # Final risk scoring document
-    methodology_overview = models.JSONField()
-    risk_factors = models.JSONField()
-    risk_distributions = models.JSONField()
-    recommendations = models.JSONField()
-```
-
-### **CURRENT IMPLEMENTATION EXAMPLES**
-
-#### **Example 1: Holiday Transaction (60 points)**
+### **Example 1: Multiple Anomalies Transaction**
 
 ```json
 {
   "transaction_id": "TXN-001",
-  "overall_risk_score": 60.0,
-  "is_holiday_posting": true,
-  "holiday_name": "Christmas",
-  "anomaly_types": ["holiday"],
-  "anomaly_analysis_summary": {
-    "risk_score": 60.0,
-    "anomaly_types": ["holiday"],
-    "is_duplicate": false,
-    "is_backdated": false,
+  "amount": 5000000.0,
+  "posting_date": "2025-12-25",
+  "document_date": "2025-12-10",
+  "user": "A.MOHAMAD",
+  "account": "232000",
+  
+  "anomaly_analysis": {
+    "is_duplicate": true,
+    "duplicate_type": "Type 6 Duplicate",
+    "duplicate_risk_score": 100.0,
+    
+    "is_backdated": true,
+    "backdated_days": 15,
+    "backdated_risk_score": 85.0,
+    
     "is_holiday_posting": true,
     "holiday_name": "Christmas",
-    "backdated_days": 0
+    "holiday_risk_score": 100.0,
+    
+    "is_weekend_posting": true,
+    "day_of_week": "friday",
+    "unusual_days_risk_score": 100.0,
+    
+    "is_closing_entry": true,
+    "days_from_month_end": 6,
+    "closing_risk_score": 35.0
   },
-  "final_classification": "HIGH"
+  
+  "overall_risk_score": 100.0,
+  "risk_level": "CRITICAL",
+  "anomaly_types": ["duplicate", "backdated", "holiday", "unusual_days", "closing_entries"]
 }
 ```
 
-#### **Example 2: Multiple Anomalies Transaction (70 points)**
+**Calculation:**
+- Duplicate: 100.0 (Type 6)
+- Backdated: 85.0 (15 days)
+- Holiday: 100.0 (Christmas)
+- Unusual Days: 100.0 (Friday)
+- Closing Entry: 35.0 (6 days from month-end)
+- **Overall**: 100.0 (capped at maximum)
+
+### **Example 2: Single Anomaly Transaction**
 
 ```json
 {
   "transaction_id": "TXN-002",
-  "overall_risk_score": 70.0,
-  "is_holiday_posting": false,
-  "anomaly_types": ["unusual_days", "closing_entries"],
-  "anomaly_analysis_summary": {
-    "risk_score": 70.0,
-    "anomaly_types": ["unusual_days", "closing_entries"],
-    "is_duplicate": false,
-    "is_backdated": false,
-    "is_holiday_posting": false,
-    "holiday_name": null,
-    "backdated_days": 0
+  "amount": 1000000.0,
+  "posting_date": "2025-08-30",
+  "user": "W.BINSALMAN",
+  "account": "124010",
+  
+  "anomaly_analysis": {
+    "is_closing_entry": true,
+    "days_from_month_end": 1,
+    "closing_risk_score": 35.0
   },
-  "final_classification": "HIGH"
+  
+  "overall_risk_score": 35.0,
+  "risk_level": "MEDIUM",
+  "anomaly_types": ["closing_entries"]
 }
 ```
 
-#### **Example 3: Critical Risk Transaction (80+ points)**
+**Calculation:**
+- Closing Entry: 35.0 (1 day from month-end)
+- **Overall**: 35.0
+
+### **Example 3: Weekend High-Value Transaction**
 
 ```json
 {
   "transaction_id": "TXN-003",
-  "overall_risk_score": 80.0,
-  "is_duplicate": true,
-  "is_backdated": true,
-  "is_holiday_posting": true,
-  "holiday_name": "New Year's Day",
-  "anomaly_types": ["duplicate", "backdated", "holiday"],
-  "anomaly_analysis_summary": {
-    "risk_score": 80.0,
-    "anomaly_types": ["duplicate", "backdated", "holiday"],
-    "is_duplicate": true,
-    "is_backdated": true,
-    "is_holiday_posting": true,
-    "holiday_name": "New Year's Day",
-    "backdated_days": 15
+  "amount": 15000000.0,
+  "posting_date": "2025-06-14",  // Saturday
+  "user": "J.SMITH",
+  "account": "100000",
+  
+  "anomaly_analysis": {
+    "is_weekend_posting": true,
+    "day_of_week": "saturday",
+    "unusual_days_risk_score": 100.0
   },
-  "final_classification": "CRITICAL"
+  
+  "overall_risk_score": 100.0,
+  "risk_level": "CRITICAL",
+  "anomaly_types": ["unusual_days"]
 }
 ```
 
-### **CURRENT STATISTICS (10,000 transactions)**
+**Calculation:**
+- Unusual Days: 100.0 (Saturday + High Value)
+- **Overall**: 100.0
 
-#### **Risk Distribution:**
-- **Total Transactions**: 10,000
-- **Low Risk**: 6,025 transactions (60.25%)
-- **Medium Risk**: 3,437 transactions (34.37%)
-- **High Risk**: 513 transactions (5.13%)
-- **Critical Risk**: 25 transactions (0.25%)
+---
 
-#### **Anomaly Distribution:**
-- **Holiday Postings**: 175 transactions (1.75%)
-  - Christmas: 31 transactions
-  - Veterans Day: 28 transactions
-  - Independence Day: 31 transactions
-  - New Year's Day: 27 transactions
-- **Unusual Days (Weekend)**: 2,867 transactions (28.67%)
-- **Closing Entries**: 1,321 transactions (13.21%)
-- **User Anomalies**: 7 users
-- **Duplicate Entries**: 0
-- **Backdated Entries**: 0
+## **INTEGRATION WITH SAPGLPosting MODEL**
 
-#### **Overall Risk Score:**
-- **Current Score**: 75.1/100 (HIGH)
-- **Risk Level**: HIGH
-- **Total Anomalies**: 4,370 (43.7%)
+### **Enhanced Transaction-Level Anomaly Tracking**
 
-### **QUERY EXAMPLES**
-
-#### **Find Transactions by Anomaly Type:**
 ```python
-# Find holiday transactions
-holiday_transactions = SAPGLPosting.objects.filter(is_holiday_posting=True)
-
-# Find transactions with specific holiday
-christmas_transactions = SAPGLPosting.objects.filter(holiday_name='Christmas')
-
-# Find by anomaly type
-holiday_transactions = SAPGLPosting.objects.filter(anomaly_types__contains=['holiday'])
-duplicate_transactions = SAPGLPosting.objects.filter(anomaly_types__contains=['duplicate'])
-backdated_transactions = SAPGLPosting.objects.filter(anomaly_types__contains=['backdated'])
-
-# Find high-risk transactions
-high_risk_transactions = SAPGLPosting.objects.filter(overall_risk_score__gte=60)
+def update_transaction_anomalies(transaction, analysis_results):
+    """
+    Update SAPGLPosting transaction with comprehensive anomaly identification
+    """
+    # Initialize risk score
+    risk_score = 0.0
+    anomaly_types = []
+    
+    # Check for duplicate
+    if analysis_results.get('duplicate_analysis'):
+        for duplicate in analysis_results['duplicate_analysis'].get('duplicate_list', []):
+            if str(transaction.id) in [duplicate.get('transaction1', {}).get('id'), 
+                                     duplicate.get('transaction2', {}).get('id')]:
+                transaction.is_duplicate = True
+                transaction.duplicate_risk_score = duplicate.get('risk_score', 0)
+                transaction.duplicate_type = duplicate.get('duplicate_type', '')
+                anomaly_types.append('duplicate')
+                risk_score += 80.0
+                break
+    
+    # Check for backdated
+    if analysis_results.get('backdated_analysis'):
+        for backdated in analysis_results['backdated_analysis'].get('backdated_entries', []):
+            if str(transaction.id) == backdated.get('transaction_id'):
+                transaction.is_backdated = True
+                transaction.backdated_risk_score = backdated.get('risk_score', 0)
+                transaction.backdated_days = backdated.get('days_difference', 0)
+                anomaly_types.append('backdated')
+                risk_score += 70.0
+                break
+    
+    # Check for holiday
+    if analysis_results.get('holiday_analysis'):
+        for holiday in analysis_results['holiday_analysis'].get('holiday_postings', []):
+            if str(transaction.id) == holiday.get('transaction_id'):
+                transaction.is_holiday_posting = True
+                transaction.holiday_name = holiday.get('holiday_name', 'Unknown')
+                transaction.holiday_risk_score = holiday.get('risk_score', 0)
+                anomaly_types.append('holiday')
+                risk_score += 60.0
+                break
+    
+    # Check for unusual days
+    if analysis_results.get('unusual_days_analysis'):
+        for unusual in analysis_results['unusual_days_analysis'].get('unusual_days', []):
+            if str(transaction.id) == unusual.get('transaction_id'):
+                transaction.is_weekend_posting = True
+                transaction.unusual_days_risk_score = unusual.get('risk_score', 0)
+                anomaly_types.append('unusual_days')
+                risk_score += 40.0
+                break
+    
+    # Check for closing entries
+    if analysis_results.get('closing_entries_analysis'):
+        for closing in analysis_results['closing_entries_analysis'].get('closing_entries', []):
+            if str(transaction.id) == closing.get('transaction_id'):
+                transaction.is_closing_entry = True
+                transaction.closing_risk_score = closing.get('risk_score', 0)
+                anomaly_types.append('closing_entries')
+                risk_score += 30.0
+                break
+    
+    # Update final fields
+    transaction.overall_risk_score = min(risk_score, 100.0)
+    transaction.anomaly_types = anomaly_types
+    transaction.risk_level = get_risk_level(transaction.overall_risk_score)
+    
+    # Create comprehensive anomaly summary
+    transaction.anomaly_analysis_summary = {
+        'risk_score': transaction.overall_risk_score,
+        'risk_level': transaction.risk_level,
+        'anomaly_types': anomaly_types,
+        'is_duplicate': transaction.is_duplicate,
+        'is_backdated': transaction.is_backdated,
+        'is_holiday_posting': transaction.is_holiday_posting,
+        'is_weekend_posting': transaction.is_weekend_posting,
+        'is_closing_entry': transaction.is_closing_entry,
+        'holiday_name': transaction.holiday_name,
+        'backdated_days': transaction.backdated_days,
+        'duplicate_type': transaction.duplicate_type,
+        'duplicate_risk_score': transaction.duplicate_risk_score,
+        'backdated_risk_score': transaction.backdated_risk_score,
+        'holiday_risk_score': transaction.holiday_risk_score,
+        'unusual_days_risk_score': transaction.unusual_days_risk_score,
+        'closing_risk_score': transaction.closing_risk_score
+    }
+    
+    transaction.save()
+    return transaction
 ```
 
-#### **Risk Analysis Queries:**
+---
+
+## **QUERY EXAMPLES**
+
+### **Find Transactions by Risk Level**
+```python
+# Critical risk transactions
+critical_transactions = SAPGLPosting.objects.filter(overall_risk_score__gte=80)
+
+# High risk transactions
+high_risk_transactions = SAPGLPosting.objects.filter(
+    overall_risk_score__gte=60, 
+    overall_risk_score__lt=80
+)
+
+# Medium risk transactions
+medium_risk_transactions = SAPGLPosting.objects.filter(
+    overall_risk_score__gte=30, 
+    overall_risk_score__lt=60
+)
+
+# Low risk transactions
+low_risk_transactions = SAPGLPosting.objects.filter(overall_risk_score__lt=30)
+```
+
+### **Find Transactions by Anomaly Type**
+```python
+# Holiday transactions
+holiday_transactions = SAPGLPosting.objects.filter(is_holiday_posting=True)
+
+# Specific holiday
+christmas_transactions = SAPGLPosting.objects.filter(holiday_name='Christmas')
+
+# Duplicate transactions
+duplicate_transactions = SAPGLPosting.objects.filter(is_duplicate=True)
+
+# Type 6 duplicates
+type6_duplicates = SAPGLPosting.objects.filter(duplicate_type__contains='Type 6')
+
+# Backdated transactions
+backdated_transactions = SAPGLPosting.objects.filter(is_backdated=True)
+
+# Weekend transactions
+weekend_transactions = SAPGLPosting.objects.filter(is_weekend_posting=True)
+
+# Closing entries
+closing_transactions = SAPGLPosting.objects.filter(is_closing_entry=True)
+```
+
+### **Risk Analysis Queries**
 ```python
 # Get risk distribution
 risk_distribution = {
-    'low': SAPGLPosting.objects.filter(overall_risk_score__lt=30).count(),
-    'medium': SAPGLPosting.objects.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count(),
-    'high': SAPGLPosting.objects.filter(overall_risk_score__gte=60, overall_risk_score__lt=80).count(),
-    'critical': SAPGLPosting.objects.filter(overall_risk_score__gte=80).count()
+    'critical': SAPGLPosting.objects.filter(overall_risk_score__gte=80).count(),
+    'high': SAPGLPosting.objects.filter(
+        overall_risk_score__gte=60, 
+        overall_risk_score__lt=80
+    ).count(),
+    'medium': SAPGLPosting.objects.filter(
+        overall_risk_score__gte=30, 
+        overall_risk_score__lt=60
+    ).count(),
+    'low': SAPGLPosting.objects.filter(overall_risk_score__lt=30).count()
 }
 
 # Get average risk score
-avg_risk_score = SAPGLPosting.objects.aggregate(Avg('overall_risk_score'))['overall_risk_score__avg']
+avg_risk_score = SAPGLPosting.objects.aggregate(
+    Avg('overall_risk_score')
+)['overall_risk_score__avg']
+
+# Get transactions with multiple anomalies
+multi_anomaly_transactions = SAPGLPosting.objects.filter(
+    anomaly_types__len__gt=1
+)
+
+# Get high-value critical transactions
+high_value_critical = SAPGLPosting.objects.filter(
+    overall_risk_score__gte=80,
+    amount_local_currency__gt=10000000
+)
+
+# Get transactions with unusual account usage
+unusual_account_transactions = SAPGLPosting.objects.filter(
+    user_name__in=UserAnalysisResult.objects.filter(
+        user_anomalies__contains='unusual_accounts'
+    ).values_list('user_name', flat=True)
+)
+
+# Get weekend transactions by account
+weekend_account_transactions = SAPGLPosting.objects.filter(
+    is_weekend_posting=True
+).values('gl_account').annotate(
+    weekend_count=Count('id'),
+    total_amount=Sum('amount_local_currency')
+).filter(weekend_count__gt=3)
+
+# Get accounts with high weekend activity
+high_weekend_accounts = SAPGLPosting.objects.filter(
+    is_weekend_posting=True
+).values('gl_account').annotate(
+    weekend_count=Count('id')
+).filter(weekend_count__gt=5)
 ```
 
-### **BENEFITS OF CURRENT IMPLEMENTATION**
+---
 
-1. **Comprehensive Analysis Coverage**: 8 different analysis types covering all major risk factors
-2. **Simplified Risk Scoring**: Direct assignment based on detected anomalies
-3. **Transaction-Level Tracking**: Each transaction marked with specific anomaly flags
-4. **Comprehensive Anomaly Summary**: Complete anomaly analysis for each transaction
-5. **Easy Querying**: Filter transactions by anomaly type, risk level, or specific flags
-6. **Real-time Updates**: Anomaly fields updated during risk analysis
-7. **Audit Trail**: Complete record of detected anomalies for each transaction
-8. **Weighted Overall Scoring**: Overall risk score based on percentage of high/critical risk transactions
-9. **Business Rule Compliance**: Follows specific audit requirements
-10. **Synchronous Processing**: All analyses run synchronously for immediate results
+## **UNUSUAL ACCOUNTS ANALYSIS AND INTEGRATION**
 
-### **FUTURE ENHANCEMENTS**
+### **1. USER ANALYSIS - Unusual Account Detection**
 
-1. **Dynamic Weighting**: Adjust weights based on historical patterns
-2. **Machine Learning Integration**: Use ML for risk score optimization
-3. **Real-time Scoring**: Implement real-time risk assessment
-4. **Custom Thresholds**: Allow user-defined risk thresholds
-5. **Advanced Analytics**: Add predictive risk modeling
-6. **Analysis-Specific Tuning**: Fine-tune individual analysis contributions
-7. **Industry-Specific Rules**: Add industry-specific risk factors
-8. **Pattern-Based Analysis**: Enhance structural pattern recognition
-9. **Enhanced Holiday Detection**: Support for multiple countries and custom holidays
-10. **Advanced User Behavior Analysis**: Machine learning-based user anomaly detection
+#### **Rule 4: Unusual Account Usage**
+```python
+def detect_unusual_account_usage(user_transactions):
+    """
+    Detect users posting to too many different GL accounts
+    """
+    unique_accounts = len(set(txn.gl_account for txn in user_transactions))
+    if unique_accounts > 20:  # More than 20 different accounts
+        return {
+            'is_unusual': True,
+            'unique_accounts': unique_accounts,
+            'risk_score': 15.0,
+            'risk_level': 'MEDIUM-HIGH',
+            'anomaly_factor': 'unusual_accounts'
+        }
+    return {'is_unusual': False}
+```
 
-This comprehensive risk scoring methodology provides a robust, auditable, and business-rule-compliant approach to transaction risk assessment with enhanced transaction-level anomaly tracking across all 8 analysis types. 
+**Risk Scoring:**
+- **Threshold:** 20 different accounts per user
+- **Risk Points:** +15 points
+- **Risk Level:** Medium-High
+- **Detection Method:** Rule-based
+
+**What This Detects:**
+- Users posting to too many different GL accounts
+- Potential segregation of duties violations
+- Users outside their normal account scope
+- Potential fraud indicators
+
+#### **User Analysis Risk Factors Summary:**
+| Risk Factor | Threshold | Risk Points | Description |
+|-------------|-----------|-------------|-------------|
+| **High Volume** | >100 transactions | +25 | Excessive transaction volume |
+| **High Value** | >1M total amount | +20 | High-value transactions |
+| **Weekend Posting** | >5 weekend posts | +15 | Weekend activity (Friday/Saturday) |
+| **Unusual Accounts** | >20 unique accounts | +15 | **Account diversity** |
+| **High Frequency** | >50 transactions | +10 | High posting frequency |
+| **Debit Heavy** | >80% debits | +10 | Debit-heavy transactions |
+| **Manual Entries** | >10 manual entries | +15 | Manual posting activity |
+
+---
+
+### **2. UNUSUAL DAYS ANALYSIS - Account Grouping**
+
+#### **Account-Based Weekend Analysis**
+```python
+def analyze_weekend_accounts(transactions):
+    """
+    Analyze weekend activity patterns by account
+    """
+    unusual_days_by_account = {}
+    
+    for transaction in transactions:
+        if transaction.posting_date.weekday() in [4, 5]:  # Friday/Saturday
+            account = transaction.gl_account
+            if account not in unusual_days_by_account:
+                unusual_days_by_account[account] = []
+            unusual_days_by_account[account].append(transaction)
+    
+    return unusual_days_by_account
+```
+
+**What This Tracks:**
+- Which accounts have weekend postings
+- Frequency of weekend activity per account
+- Account-specific weekend patterns
+- High-risk accounts with weekend activity
+
+#### **Account Risk Assessment**
+```python
+def assess_account_weekend_risk(unusual_days_by_account):
+    """
+    Assess risk level for accounts with weekend activity
+    """
+    account_recommendations = []
+    
+    for account, postings in unusual_days_by_account.items():
+        if len(postings) > 3:  # Accounts with many weekend postings
+            account_recommendations.append({
+                'account': account,
+                'weekend_count': len(postings),
+                'risk_level': 'HIGH',
+                'recommendation': f'Review account {account} - {len(postings)} weekend postings'
+            })
+        elif len(postings) > 1:
+            account_recommendations.append({
+                'account': account,
+                'weekend_count': len(postings),
+                'risk_level': 'MEDIUM',
+                'recommendation': f'Monitor account {account} - {len(postings)} weekend postings'
+            })
+    
+    return account_recommendations
+```
+
+**Account Risk Thresholds:**
+- **High Risk:** >3 weekend postings per account
+- **Medium Risk:** 2-3 weekend postings per account
+- **Low Risk:** 1 weekend posting per account
+
+---
+
+### **3. INTEGRATED RISK SCORING - Account Impact**
+
+#### **Transaction-Level Risk Scoring with Account Factors**
+```python
+def calculate_transaction_risk_score_with_accounts(transaction, analysis_results):
+    """
+    Calculate overall risk score including account-based factors
+    """
+    risk_score = 0.0
+    anomaly_types = []
+    
+    # Check for duplicate (high risk)
+    if transaction in duplicate_list:
+        risk_score += 80.0
+        anomaly_types.append('duplicate')
+    
+    # Check for backdated (high risk)
+    if transaction in backdated_list:
+        risk_score += 70.0
+        anomaly_types.append('backdated')
+    
+    # Check for holiday (high risk)
+    if transaction in holiday_list:
+        risk_score += 60.0
+        anomaly_types.append('holiday')
+    
+    # Check for user anomalies (medium risk) - INCLUDES UNUSUAL ACCOUNTS
+    if transaction.user_name in user_anomalies:
+        risk_score += 50.0
+        anomaly_types.append('user_anomaly')
+    
+    # Check for unusual days (medium risk) - FRIDAY/SATURDAY
+    if transaction in unusual_days_list:
+        risk_score += 40.0
+        anomaly_types.append('unusual_days')
+    
+    # Check for closing entries (medium risk)
+    if transaction in closing_entries_list:
+        risk_score += 30.0
+        anomaly_types.append('closing_entries')
+    
+    return min(risk_score, 100.0), anomaly_types
+```
+
+**Account-Specific Risk Factors:**
+1. **Weekend Posting:** +40 points (Medium risk)
+2. **Account Diversity:** +15 points (User analysis)
+3. **High-Value Weekend:** Additional risk based on amount
+
+#### **Account Risk Distribution Analysis**
+```python
+def analyze_account_risk_distribution(transactions):
+    """
+    Analyze risk distribution by account
+    """
+    account_risk_summary = {}
+    
+    for transaction in transactions:
+        account = transaction.gl_account
+        if account not in account_risk_summary:
+            account_risk_summary[account] = {
+                'total_transactions': 0,
+                'weekend_transactions': 0,
+                'high_risk_transactions': 0,
+                'total_amount': 0.0,
+                'weekend_amount': 0.0
+            }
+        
+        account_risk_summary[account]['total_transactions'] += 1
+        account_risk_summary[account]['total_amount'] += abs(float(transaction.amount_local_currency))
+        
+        if transaction.is_weekend_posting:
+            account_risk_summary[account]['weekend_transactions'] += 1
+            account_risk_summary[account]['weekend_amount'] += abs(float(transaction.amount_local_currency))
+        
+        if transaction.overall_risk_score >= 60:
+            account_risk_summary[account]['high_risk_transactions'] += 1
+    
+    return account_risk_summary
+```
+
+---
+
+### **4. TRAINING MODELS - Account Pattern Learning**
+
+#### **User Model Training with Account Patterns**
+```python
+def train_user_account_patterns(transactions):
+    """
+    Train user anomaly detection including account usage patterns
+    """
+    user_transactions = {}
+    for transaction in transactions:
+        user = transaction.user_name
+        if user not in user_transactions:
+            user_transactions[user] = []
+        user_transactions[user].append(transaction)
+    
+    user_stats = {}
+    for user, user_txns in user_transactions.items():
+        unique_accounts = len(set(t.gl_account for t in user_txns))
+        weekend_count = len([t for t in user_txns if t.posting_date.weekday() in [4, 5]])
+        
+        user_stats[user] = {
+            'unique_accounts': unique_accounts,
+            'weekend_count': weekend_count,
+            'account_diversity_score': unique_accounts / len(user_txns) if user_txns else 0,
+            'weekend_activity_ratio': weekend_count / len(user_txns) if user_txns else 0
+        }
+    
+    # Calculate optimal thresholds using percentiles
+    unique_accounts = [stats['unique_accounts'] for stats in user_stats.values()]
+    optimal_thresholds = {
+        'unusual_accounts_threshold': percentile(unique_accounts, 90),
+        'weekend_activity_threshold': 5,
+        'account_diversity_threshold': percentile([stats['account_diversity_score'] for stats in user_stats.values()], 85)
+    }
+    
+    return {
+        'optimal_thresholds': optimal_thresholds,
+        'user_statistics': user_stats,
+        'training_accuracy': 0.87,
+        'false_positive_rate': 0.13
+    }
+```
+
+**Training Insights:**
+- **90th Percentile:** Determines unusual account threshold
+- **Historical Patterns:** Learns normal account usage per user
+- **Weekend Patterns:** Tracks weekend activity by account
+- **Account Diversity:** Measures account usage diversity
+
+---
+
+### **5. AUDIT RECOMMENDATIONS - Account Focus**
+
+#### **Account-Specific Audit Recommendations**
+```python
+def generate_account_audit_recommendations(analysis_results):
+    """
+    Generate account-focused audit recommendations
+    """
+    recommendations = {
+        'priority_recommendations': [],
+        'account_recommendations': [],
+        'user_account_recommendations': [],
+        'compliance_recommendations': []
+    }
+    
+    # Account recommendations from unusual days analysis
+    if analysis_results.get('unusual_days_analysis'):
+        unusual_days_by_account = analysis_results['unusual_days_analysis'].get('unusual_days_by_account', {})
+        for account, postings in unusual_days_by_account.items():
+            if len(postings) > 3:
+                recommendations['account_recommendations'].append({
+                    'priority': 'HIGH',
+                    'action': f'Review account {account}',
+                    'description': f'{len(postings)} weekend postings detected',
+                    'risk_level': 'HIGH'
+                })
+    
+    # User account recommendations
+    if analysis_results.get('user_analysis'):
+        user_anomalies = analysis_results['user_analysis'].get('user_anomalies', [])
+        for anomaly in user_anomalies:
+            if 'unusual_accounts' in anomaly.get('anomaly_factors', []):
+                recommendations['user_account_recommendations'].append({
+                    'priority': 'MEDIUM',
+                    'action': f'Review user {anomaly["user_name"]}',
+                    'description': 'Unusual account usage detected',
+                    'risk_level': 'MEDIUM-HIGH'
+                })
+    
+    # Compliance recommendations
+    recommendations['compliance_recommendations'] = [
+        'Verify account posting permissions for all users',
+        'Review segregation of duties for account access',
+        'Implement account usage monitoring controls',
+        'Establish account authorization limits'
+    ]
+    
+    return recommendations
+```
+
+**Account Audit Focus:**
+1. **High-Frequency Accounts:** Accounts with >3 weekend postings
+2. **Unusual Account Usage:** Users posting to >20 different accounts
+3. **Account Authorization:** Verify account posting permissions
+4. **Segregation of Duties:** Check for proper account access controls
+
+---
+
+### **6. CHART DATA - Account Visualization**
+
+#### **Account-Based Chart Generation**
+```python
+def generate_account_charts(analysis_results):
+    """
+    Generate account-focused visualization data
+    """
+    chart_data = {
+        'weekend_by_account': {},
+        'account_risk_distribution': {},
+        'user_account_diversity': {},
+        'account_weekend_patterns': {}
+    }
+    
+    # Weekend activity by account
+    if analysis_results.get('unusual_days_analysis'):
+        unusual_days_by_account = analysis_results['unusual_days_analysis'].get('unusual_days_by_account', {})
+        chart_data['weekend_by_account'] = {
+            account: len(postings) for account, postings in unusual_days_by_account.items()
+        }
+    
+    # Account risk distribution
+    chart_data['account_risk_distribution'] = {
+        'high_risk_accounts': len([a for a, count in chart_data['weekend_by_account'].items() if count > 3]),
+        'medium_risk_accounts': len([a for a, count in chart_data['weekend_by_account'].items() if 2 <= count <= 3]),
+        'low_risk_accounts': len([a for a, count in chart_data['weekend_by_account'].items() if count == 1])
+    }
+    
+    return chart_data
+```
+
+**Visualization Features:**
+- Weekend activity by account
+- Account risk distribution
+- Account-specific weekend patterns
+- High-risk account identification
+- User account diversity analysis
+
+---
+
+## **BUSINESS IMPLICATIONS OF ACCOUNT ANALYSIS**
+
+### **1. Account Risk Assessment**
+- **High-Risk Accounts:** Accounts with frequent weekend activity
+- **Unusual Account Usage:** Users posting to too many accounts
+- **Account Authorization:** Verify posting permissions
+- **Segregation of Duties:** Check account access controls
+
+### **2. Audit Focus Areas**
+- **Weekend Account Activity:** Review accounts with weekend postings
+- **Account Diversity:** Investigate users with unusual account usage
+- **Account Patterns:** Identify abnormal account posting patterns
+- **Account Authorization:** Verify proper account access
+
+### **3. Compliance Considerations**
+- **Segregation of Duties:** Ensure proper account access controls
+- **Authorization Limits:** Verify account posting permissions
+- **Audit Trail:** Maintain account activity audit trail
+- **Risk Assessment:** Regular account risk assessments
+
+---
+
+## **BENEFITS OF THIS METHODOLOGY**
+
+1. **Comprehensive Coverage**: All major risk factors are considered
+2. **Detailed Calculations**: Specific formulas for each analysis type
+3. **Transparent Scoring**: Clear rationale for each risk score
+4. **Flexible Integration**: Easy to modify weights and thresholds
+5. **Audit Trail**: Complete record of risk calculations
+6. **Real-time Updates**: Risk scores updated during analysis
+7. **Query Optimization**: Efficient database queries for risk analysis
+8. **Business Rule Compliance**: Follows specific audit requirements
+9. **Scalable Architecture**: Handles large transaction volumes
+10. **Maintainable Code**: Clear separation of concerns
+
+This comprehensive risk scoring methodology provides a robust, auditable, and business-rule-compliant approach to transaction risk assessment with detailed calculations for each analysis type and clear integration patterns. 

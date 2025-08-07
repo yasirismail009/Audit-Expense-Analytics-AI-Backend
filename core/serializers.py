@@ -747,6 +747,7 @@ class ClosingEntriesListSerializer(serializers.Serializer):
     
     # Closing entry specific information
     risk_level = serializers.CharField(help_text='Risk level (LOW, MEDIUM, HIGH, CRITICAL)')
+    risk_score = serializers.FloatField(help_text='Risk score (0-100)')
     days_from_month_end = serializers.IntegerField(help_text='Days from month end')
     
     # Additional computed fields
@@ -805,6 +806,7 @@ class BackdatedEntriesListSerializer(serializers.Serializer):
     
     # Backdated specific information
     risk_level = serializers.CharField(help_text='Risk level (LOW, MEDIUM, HIGH, CRITICAL)')
+    risk_score = serializers.FloatField(help_text='Risk score (0-100)')
     days_difference = serializers.IntegerField(help_text='Days difference between posting and document date')
     
     # Additional computed fields
@@ -865,6 +867,7 @@ class UnusualDaysListSerializer(serializers.Serializer):
     amount = serializers.FloatField(help_text='Amount in Local Currency')
     user = serializers.CharField(help_text='User Name')
     risk_level = serializers.CharField(help_text='Risk level (LOW, MEDIUM, HIGH, CRITICAL)')
+    risk_score = serializers.FloatField(help_text='Risk score (0-100)')
     day_of_week = serializers.CharField(help_text='Day of the week')
     is_high_value = serializers.SerializerMethodField(help_text='Whether this is a high value transaction')
     amount_formatted = serializers.SerializerMethodField(help_text='Formatted amount with currency')
@@ -889,7 +892,7 @@ class UnusualDaysListSerializer(serializers.Serializer):
 
     def get_day_type(self, obj):
         day_of_week = obj.get('day_of_week', '').lower()
-        if day_of_week in ['saturday', 'sunday']:
+        if day_of_week in ['friday', 'saturday']:
             return 'WEEKEND'
         return 'WEEKDAY'
 

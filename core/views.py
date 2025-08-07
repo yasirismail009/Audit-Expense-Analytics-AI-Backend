@@ -2197,11 +2197,12 @@ class DuplicateAnalysisView(generics.GenericAPIView):
     """API view for retrieving duplicate analysis results by file ID.
     
     This view provides comprehensive duplicate analysis results including:
-    - Summary statistics
-    - Detailed duplicate entries
+    - Summary statistics and risk assessment
+    - Detailed duplicate entries with transaction details
+    - Duplicate patterns and analysis breakdowns
+    - Audit recommendations and compliance assessment
     - Chart data for visualizations
     - Export-ready data
-    - Risk assessment
     """
     
     def get(self, request, file_id):
@@ -2236,31 +2237,35 @@ class DuplicateAnalysisView(generics.GenericAPIView):
                     'total_duplicates': len(duplicate_analysis.duplicate_list or []),
                     'total_amount': duplicate_analysis.get_total_amount(),
                     'risk_distribution': duplicate_analysis.get_risk_distribution(),
+                    'overall_risk_score': self._calculate_overall_risk_score(duplicate_analysis),
+                    'overall_risk_level': self._calculate_overall_risk_level(duplicate_analysis),
                     'compliance_issues': duplicate_analysis.get_compliance_issues(),
                     'high_priority_recommendations': duplicate_analysis.get_high_priority_recommendations()
                 },
                 'detailed_results': {
-                    'duplicate_entries': duplicate_analysis.duplicate_list or [],
-                    'duplicate_patterns': duplicate_analysis.breakdowns or {},
-                    'audit_recommendations': duplicate_analysis.breakdowns.get('audit_recommendations', {}) if duplicate_analysis.breakdowns else {},
+                    'duplicate_entries': self._enhance_duplicate_entries(duplicate_analysis.duplicate_list or []),
+                    'duplicate_patterns': self._generate_duplicate_patterns(duplicate_analysis),
+                    'duplicate_by_type': self._generate_duplicate_by_type(duplicate_analysis),
+                    'duplicate_by_user': self._generate_duplicate_by_user(duplicate_analysis),
+                    'duplicate_by_account': self._generate_duplicate_by_account(duplicate_analysis),
+                    'duplicate_by_amount_range': self._generate_duplicate_by_amount_range(duplicate_analysis),
+                    'audit_recommendations': self._generate_audit_recommendations(duplicate_analysis),
                     'detection_methods': ['business_rules', 'comprehensive_analysis', 'risk_scoring'],
                     'confidence_scores': self._generate_confidence_scores(duplicate_analysis),
-                    'false_positive_indicators': self._generate_false_positive_indicators(duplicate_analysis)
+                    'false_positive_indicators': self._generate_false_positive_indicators(duplicate_analysis),
+                    'risk_assessment': self._generate_risk_assessment(duplicate_analysis),
+                    'compliance_analysis': self._generate_compliance_analysis(duplicate_analysis)
                 },
                 'visualizations': {
                     'chart_data': duplicate_analysis.chart_data or {},
                     'slicer_filters': {
                         'risk_levels': ['low', 'medium', 'high', 'critical'],
-                        'duplicate_types': ['type_1', 'type_2', 'type_3', 'type_4', 'type_5', 'type_6'],
+                        'duplicate_types': self._get_duplicate_type_options(),
                         'amount_ranges': ['0-1000', '1000-10000', '10000-100000', '100000+'],
                         'users': self._extract_unique_users(duplicate_analysis.duplicate_list or []),
                         'accounts': self._extract_unique_accounts(duplicate_analysis.duplicate_list or [])
                     }
-                },
-                # 'export_data': {
-                #     'summary_table': self._generate_summary_table(duplicate_analysis),
-                #     'detailed_export': duplicate_analysis.export_data or []
-                # }
+                }
             }
             
             # Add compliance assessment if available
@@ -2274,6 +2279,11 @@ class DuplicateAnalysisView(generics.GenericAPIView):
             # Add detailed insights if available
             if duplicate_analysis.detailed_insights:
                 response_data['insights'] = duplicate_analysis.detailed_insights
+            
+            # Add duplicate activity summary if available
+            duplicate_activity_summary = self._generate_duplicate_activity_summary(duplicate_analysis)
+            if duplicate_activity_summary:
+                response_data['duplicate_activity_summary'] = duplicate_activity_summary
             
             # Log successful retrieval
             duplicate_count = len(duplicate_analysis.duplicate_list or [])
@@ -2297,7 +2307,14 @@ class DuplicateAnalysisView(generics.GenericAPIView):
         confidence_scores = {}
         for duplicate in duplicate_analysis.duplicate_list:
             if isinstance(duplicate, dict):
-                duplicate_type = duplicate.get('duplicate_type', 'unknown')
+                # Use inferred duplicate type if original is empty or unknown
+                duplicate_type = duplicate.get('duplicate_type', '')
+                if not duplicate_type or duplicate_type == 'unknown':
+                    duplicate_type = self._infer_duplicate_type(duplicate)
+                else:
+                    # Convert type code to descriptive name
+                    duplicate_type = self._get_duplicate_type_description(duplicate_type)
+                
                 similarity_score = duplicate.get('similarity_score', 0.0)
                 risk_score = duplicate.get('risk_score', 0)
                 
@@ -2407,6 +2424,554 @@ class DuplicateAnalysisView(generics.GenericAPIView):
                 if transaction2.get('account'):
                     accounts.add(transaction2.get('account'))
         return list(accounts)
+    
+    def _generate_duplicate_patterns(self, duplicate_analysis):
+        """Generate duplicate patterns analysis"""
+        if not duplicate_analysis.duplicate_list:
+            return {}
+        
+        patterns = {
+            'duplicate_distribution': {},
+            'user_activity_patterns': {},
+            'amount_patterns': {},
+            'temporal_patterns': {},
+            'account_patterns': {}
+        }
+        
+        # Duplicate distribution by type
+        duplicate_counts = {}
+        for duplicate in duplicate_analysis.duplicate_list:
+            duplicate_type = duplicate.get('duplicate_type', 'Unknown')
+            duplicate_counts[duplicate_type] = duplicate_counts.get(duplicate_type, 0) + 1
+        
+        patterns['duplicate_distribution'] = duplicate_counts
+        
+        # User activity patterns
+        user_activity = {}
+        for duplicate in duplicate_analysis.duplicate_list:
+            transaction1 = duplicate.get('transaction1', {})
+            transaction2 = duplicate.get('transaction2', {})
+            
+            for transaction in [transaction1, transaction2]:
+                user = transaction.get('user', 'Unknown')
+                if user not in user_activity:
+                    user_activity[user] = {'count': 0, 'total_amount': 0}
+                user_activity[user]['count'] += 1
+                user_activity[user]['total_amount'] += transaction.get('amount', 0)
+        
+        patterns['user_activity_patterns'] = user_activity
+        
+        # Amount patterns
+        amounts = []
+        for duplicate in duplicate_analysis.duplicate_list:
+            transaction1 = duplicate.get('transaction1', {})
+            amounts.append(transaction1.get('amount', 0))
+        
+        patterns['amount_patterns'] = {
+            'min_amount': min(amounts) if amounts else 0,
+            'max_amount': max(amounts) if amounts else 0,
+            'avg_amount': sum(amounts) / len(amounts) if amounts else 0,
+            'high_value_count': len([a for a in amounts if a > 1000000])
+        }
+        
+        # Account patterns
+        account_activity = {}
+        for duplicate in duplicate_analysis.duplicate_list:
+            transaction1 = duplicate.get('transaction1', {})
+            account = transaction1.get('account', 'Unknown')
+            if account not in account_activity:
+                account_activity[account] = {'count': 0, 'total_amount': 0}
+            account_activity[account]['count'] += 1
+            account_activity[account]['total_amount'] += transaction1.get('amount', 0)
+        
+        patterns['account_patterns'] = account_activity
+        
+        return patterns
+    
+    def _generate_duplicate_by_type(self, duplicate_analysis):
+        """Generate duplicate analysis by type"""
+        if not duplicate_analysis.duplicate_list:
+            return {}
+        
+        by_type = {}
+        for duplicate in duplicate_analysis.duplicate_list:
+            duplicate_type = duplicate.get('duplicate_type', 'Unknown')
+            # Map type codes to descriptive names
+            if duplicate_type.startswith('type_'):
+                duplicate_type = self._get_duplicate_type_description(duplicate_type)
+            elif duplicate_type == 'Unknown':
+                # Try to infer duplicate type from matching fields
+                duplicate_type = self._infer_duplicate_type(duplicate)
+            
+            if duplicate_type not in by_type:
+                by_type[duplicate_type] = []
+            by_type[duplicate_type].append(duplicate)
+        
+        return by_type
+    
+    def _generate_duplicate_by_user(self, duplicate_analysis):
+        """Generate duplicate analysis by user"""
+        if not duplicate_analysis.duplicate_list:
+            return {}
+        
+        by_user = {}
+        for duplicate in duplicate_analysis.duplicate_list:
+            transaction1 = duplicate.get('transaction1', {})
+            transaction2 = duplicate.get('transaction2', {})
+            
+            for transaction in [transaction1, transaction2]:
+                user = transaction.get('user', 'Unknown')
+                if user not in by_user:
+                    by_user[user] = []
+                by_user[user].append(duplicate)
+        
+        return by_user
+    
+    def _generate_duplicate_by_account(self, duplicate_analysis):
+        """Generate duplicate analysis by account"""
+        if not duplicate_analysis.duplicate_list:
+            return {}
+        
+        by_account = {}
+        for duplicate in duplicate_analysis.duplicate_list:
+            transaction1 = duplicate.get('transaction1', {})
+            account = transaction1.get('account', 'Unknown')
+            if account not in by_account:
+                by_account[account] = []
+            by_account[account].append(duplicate)
+        
+        return by_account
+    
+    def _generate_duplicate_by_amount_range(self, duplicate_analysis):
+        """Generate duplicate analysis by amount range"""
+        if not duplicate_analysis.duplicate_list:
+            return {}
+        
+        by_amount_range = {
+            '0-1000': [],
+            '1000-10000': [],
+            '10000-100000': [],
+            '100000-1000000': [],
+            '1000000+': []
+        }
+        
+        for duplicate in duplicate_analysis.duplicate_list:
+            transaction1 = duplicate.get('transaction1', {})
+            amount = transaction1.get('amount', 0)
+            
+            if amount <= 1000:
+                by_amount_range['0-1000'].append(duplicate)
+            elif amount <= 10000:
+                by_amount_range['1000-10000'].append(duplicate)
+            elif amount <= 100000:
+                by_amount_range['10000-100000'].append(duplicate)
+            elif amount <= 1000000:
+                by_amount_range['100000-1000000'].append(duplicate)
+            else:
+                by_amount_range['1000000+'].append(duplicate)
+        
+        return by_amount_range
+    
+    def _generate_audit_recommendations(self, duplicate_analysis):
+        """Generate audit recommendations for duplicate analysis"""
+        if not duplicate_analysis.duplicate_list:
+            return []
+        
+        recommendations = [
+            "Review duplicate transactions for potential errors",
+            "Verify if duplicates are intentional or data entry errors",
+            "Check for systematic duplicate patterns",
+            "Assess financial statement impact of duplicates",
+            "Review internal controls for duplicate prevention"
+        ]
+        
+        # Add specific recommendations based on analysis
+        high_value_count = len([d for d in duplicate_analysis.duplicate_list 
+                              if d.get('transaction1', {}).get('amount', 0) > 1000000])
+        
+        if high_value_count > 0:
+            recommendations.append(f"Prioritize review of {high_value_count} high-value duplicate transactions")
+        
+        return recommendations
+    
+    def _generate_risk_assessment(self, duplicate_analysis):
+        """Generate comprehensive risk assessment for duplicate analysis"""
+        if not duplicate_analysis.duplicate_list:
+            return {}
+        
+        risk_assessment = {
+            'overall_risk_level': 'LOW',
+            'risk_factors': [],
+            'risk_score': 0,
+            'risk_distribution': {
+                'low_risk': 0,
+                'medium_risk': 0,
+                'high_risk': 0,
+                'critical_risk': 0
+            }
+        }
+        
+        total_amount = sum(d.get('transaction1', {}).get('amount', 0) for d in duplicate_analysis.duplicate_list)
+        high_value_count = len([d for d in duplicate_analysis.duplicate_list 
+                              if d.get('transaction1', {}).get('amount', 0) > 1000000])
+        
+        # Calculate risk score
+        risk_score = 0
+        if high_value_count > 0:
+            risk_score += 40
+        if total_amount > 1000000:
+            risk_score += 30
+        if len(duplicate_analysis.duplicate_list) > 10:
+            risk_score += 20
+        if len(duplicate_analysis.duplicate_list) > 50:
+            risk_score += 10
+        
+        risk_assessment['risk_score'] = risk_score
+        
+        # Determine risk level
+        if risk_score >= 80:
+            risk_assessment['overall_risk_level'] = 'CRITICAL'
+        elif risk_score >= 60:
+            risk_assessment['overall_risk_level'] = 'HIGH'
+        elif risk_score >= 40:
+            risk_assessment['overall_risk_level'] = 'MEDIUM'
+        else:
+            risk_assessment['overall_risk_level'] = 'LOW'
+        
+        # Risk factors
+        if high_value_count > 0:
+            risk_assessment['risk_factors'].append({
+                'factor': 'High-value duplicate transactions',
+                'count': high_value_count,
+                'impact': 'HIGH'
+            })
+        
+        if total_amount > 1000000:
+            risk_assessment['risk_factors'].append({
+                'factor': 'High total duplicate amount',
+                'amount': total_amount,
+                'impact': 'HIGH'
+            })
+        
+        return risk_assessment
+    
+    def _generate_compliance_analysis(self, duplicate_analysis):
+        """Generate compliance analysis for duplicate analysis"""
+        if not duplicate_analysis.duplicate_list:
+            return {}
+        
+        compliance_analysis = {
+            'compliance_issues': [],
+            'regulatory_concerns': [],
+            'internal_control_gaps': [],
+            'recommendations': []
+        }
+        
+        # Check for compliance issues
+        high_value_duplicates = [d for d in duplicate_analysis.duplicate_list 
+                               if d.get('transaction1', {}).get('amount', 0) > 1000000]
+        
+        if high_value_duplicates:
+            compliance_analysis['compliance_issues'].append({
+                'issue': 'High-value duplicate transactions',
+                'count': len(high_value_duplicates),
+                'severity': 'HIGH',
+                'description': 'Large amount duplicates may indicate control weaknesses'
+            })
+        
+        # Add recommendations
+        compliance_analysis['recommendations'].extend([
+            'Implement duplicate detection controls',
+            'Review and strengthen approval processes',
+            'Consider automated duplicate prevention',
+            'Enhance monitoring and reporting'
+        ])
+        
+        return compliance_analysis
+    
+    def _generate_duplicate_activity_summary(self, duplicate_analysis):
+        """Generate summary of duplicate activity patterns"""
+        if not duplicate_analysis.duplicate_list:
+            return {}
+        
+        summary = {
+            'total_duplicates': len(duplicate_analysis.duplicate_list),
+            'unique_users_involved': len(set(
+                d.get('transaction1', {}).get('user', '') for d in duplicate_analysis.duplicate_list
+            )),
+            'unique_accounts_involved': len(set(
+                d.get('transaction1', {}).get('account', '') for d in duplicate_analysis.duplicate_list
+            )),
+            'total_duplicate_amount': sum(
+                d.get('transaction1', {}).get('amount', 0) for d in duplicate_analysis.duplicate_list
+            ),
+            'high_value_duplicates': len([
+                d for d in duplicate_analysis.duplicate_list 
+                if d.get('transaction1', {}).get('amount', 0) > 1000000
+            ]),
+            'duplicate_activity_breakdown': {}
+        }
+        
+        # Activity breakdown by user
+        user_breakdown = {}
+        for duplicate in duplicate_analysis.duplicate_list:
+            user = duplicate.get('transaction1', {}).get('user', 'Unknown')
+            if user not in user_breakdown:
+                user_breakdown[user] = {'count': 0, 'total_amount': 0}
+            user_breakdown[user]['count'] += 1
+            user_breakdown[user]['total_amount'] += duplicate.get('transaction1', {}).get('amount', 0)
+        
+        summary['duplicate_activity_breakdown']['by_user'] = user_breakdown
+        
+        return summary
+    
+    def _calculate_overall_risk_score(self, duplicate_analysis):
+        """Calculate overall risk score for duplicate analysis"""
+        if not duplicate_analysis.duplicate_list:
+            return 0
+        
+        total_amount = sum(d.get('transaction1', {}).get('amount', 0) for d in duplicate_analysis.duplicate_list)
+        high_value_count = len([d for d in duplicate_analysis.duplicate_list 
+                              if d.get('transaction1', {}).get('amount', 0) > 1000000])
+        
+        # Calculate risk score based on multiple factors
+        risk_score = 0
+        
+        # Factor 1: High value duplicates (40 points)
+        if high_value_count > 0:
+            risk_score += 40
+        
+        # Factor 2: Total amount (30 points)
+        if total_amount > 1000000:
+            risk_score += 30
+        elif total_amount > 100000:
+            risk_score += 20
+        elif total_amount > 10000:
+            risk_score += 10
+        
+        # Factor 3: Number of duplicates (20 points)
+        duplicate_count = len(duplicate_analysis.duplicate_list)
+        if duplicate_count > 50:
+            risk_score += 20
+        elif duplicate_count > 20:
+            risk_score += 15
+        elif duplicate_count > 10:
+            risk_score += 10
+        elif duplicate_count > 5:
+            risk_score += 5
+        
+        # Factor 4: Risk level distribution (10 points)
+        risk_distribution = duplicate_analysis.get_risk_distribution()
+        high_risk_count = risk_distribution.get('High', 0) + risk_distribution.get('Critical', 0)
+        if high_risk_count > 0:
+            risk_score += 10
+        
+        return min(risk_score, 100)  # Cap at 100
+    
+    def _calculate_overall_risk_level(self, duplicate_analysis):
+        """Calculate overall risk level for duplicate analysis"""
+        risk_score = self._calculate_overall_risk_score(duplicate_analysis)
+        
+        if risk_score >= 80:
+            return 'CRITICAL'
+        elif risk_score >= 60:
+            return 'HIGH'
+        elif risk_score >= 40:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    
+    def _get_duplicate_type_options(self):
+        """Get available duplicate type options for filtering"""
+        return [
+            'Type 1 Duplicate - Account Number + Amount',
+            'Type 2 Duplicate - Account Number + Source + Amount', 
+            'Type 3 Duplicate - Account Number + User + Amount',
+            'Type 4 Duplicate - Account Number + Posted Date + Amount',
+            'Type 5 Duplicate - Account Number + Effective Date + Amount',
+            'Type 6 Duplicate - Account Number + Effective Date + Posted Date + User + Source + Amount'
+        ]
+    
+    def _get_duplicate_type_description(self, duplicate_type_code):
+        """Convert duplicate type code to descriptive name"""
+        type_mapping = {
+            'type_1': 'Type 1 Duplicate - Account Number + Amount',
+            'type_2': 'Type 2 Duplicate - Account Number + Source + Amount',
+            'type_3': 'Type 3 Duplicate - Account Number + User + Amount',
+            'type_4': 'Type 4 Duplicate - Account Number + Posted Date + Amount',
+            'type_5': 'Type 5 Duplicate - Account Number + Effective Date + Amount',
+            'type_6': 'Type 6 Duplicate - Account Number + Effective Date + Posted Date + User + Source + Amount'
+        }
+        return type_mapping.get(duplicate_type_code, duplicate_type_code)
+    
+    def _infer_duplicate_type(self, duplicate):
+        """Infer duplicate type from matching fields and transaction data"""
+        try:
+            transaction1 = duplicate.get('transaction1', {})
+            transaction2 = duplicate.get('transaction2', {})
+            matching_fields = duplicate.get('matching_fields', [])
+            
+            # Check for Type 6: Account + Effective Date + Posted Date + User + Source + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('document_date') == transaction2.get('document_date') and
+                transaction1.get('posting_date') == transaction2.get('posting_date') and
+                transaction1.get('user_name') == transaction2.get('user_name') and
+                transaction1.get('source') == transaction2.get('source') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 6 Duplicate - Account Number + Effective Date + Posted Date + User + Source + Amount'
+            
+            # Check for Type 5: Account + Effective Date + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('document_date') == transaction2.get('document_date') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 5 Duplicate - Account Number + Effective Date + Amount'
+            
+            # Check for Type 4: Account + Posted Date + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('posting_date') == transaction2.get('posting_date') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 4 Duplicate - Account Number + Posted Date + Amount'
+            
+            # Check for Type 3: Account + User + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('user_name') == transaction2.get('user_name') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 3 Duplicate - Account Number + User + Amount'
+            
+            # Check for Type 2: Account + Source + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('source') == transaction2.get('source') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 2 Duplicate - Account Number + Source + Amount'
+            
+            # Check for Type 1: Account + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 1 Duplicate - Account Number + Amount'
+            
+            # If no specific pattern matches, return based on matching fields
+            if 'gl_account' in matching_fields and 'amount' in matching_fields:
+                if 'user_name' in matching_fields and 'source' in matching_fields:
+                    return 'Type 6 Duplicate - Account Number + Effective Date + Posted Date + User + Source + Amount'
+                elif 'user_name' in matching_fields:
+                    return 'Type 3 Duplicate - Account Number + User + Amount'
+                elif 'source' in matching_fields:
+                    return 'Type 2 Duplicate - Account Number + Source + Amount'
+                else:
+                    return 'Type 1 Duplicate - Account Number + Amount'
+            
+            return 'Unknown Duplicate Type'
+            
+        except Exception as e:
+            return 'Unknown Duplicate Type'
+    
+    def _enhance_duplicate_entries(self, duplicate_list):
+        """Enhance duplicate entries with inferred duplicate type and additional information"""
+        if not duplicate_list:
+            return []
+        
+        enhanced_entries = []
+        for duplicate in duplicate_list:
+            if isinstance(duplicate, dict):
+                enhanced_duplicate = duplicate.copy()
+                
+                # Add duplicate type if missing
+                if not enhanced_duplicate.get('duplicate_type'):
+                    enhanced_duplicate['duplicate_type'] = self._infer_duplicate_type(duplicate)
+                
+                # Add duplicate type description
+                enhanced_duplicate['duplicate_type_description'] = self._get_duplicate_type_description(
+                    enhanced_duplicate.get('duplicate_type', '')
+                ) or enhanced_duplicate['duplicate_type']
+                
+                # Add risk score if missing
+                if not enhanced_duplicate.get('risk_score'):
+                    enhanced_duplicate['risk_score'] = self._calculate_duplicate_risk_score(duplicate)
+                
+                # Add risk level if missing
+                if not enhanced_duplicate.get('risk_level'):
+                    enhanced_duplicate['risk_level'] = self._get_duplicate_risk_level(
+                        enhanced_duplicate.get('risk_score', 0)
+                    )
+                
+                # Add similarity score if missing
+                if not enhanced_duplicate.get('similarity_score'):
+                    enhanced_duplicate['similarity_score'] = self._calculate_similarity_score(duplicate)
+                
+                enhanced_entries.append(enhanced_duplicate)
+            else:
+                enhanced_entries.append(duplicate)
+        
+        return enhanced_entries
+    
+    def _calculate_duplicate_risk_score(self, duplicate):
+        """Calculate risk score for a duplicate entry"""
+        try:
+            transaction1 = duplicate.get('transaction1', {})
+            transaction2 = duplicate.get('transaction2', {})
+            
+            # Base risk score
+            risk_score = 50.0
+            
+            # Factor 1: High value transactions (30 points)
+            amount1 = float(transaction1.get('amount', 0))
+            amount2 = float(transaction2.get('amount', 0))
+            if amount1 > 1000000 or amount2 > 1000000:
+                risk_score += 30
+            
+            # Factor 2: Same user (10 points)
+            if transaction1.get('user') == transaction2.get('user'):
+                risk_score += 10
+            
+            # Factor 3: Same account (5 points)
+            if transaction1.get('account') == transaction2.get('account'):
+                risk_score += 5
+            
+            # Factor 4: Same posting date (5 points)
+            if transaction1.get('posting_date') == transaction2.get('posting_date'):
+                risk_score += 5
+            
+            return min(risk_score, 100.0)
+        except Exception as e:
+            return 50.0
+    
+    def _get_duplicate_risk_level(self, risk_score):
+        """Get risk level based on risk score"""
+        if risk_score >= 80:
+            return 'CRITICAL'
+        elif risk_score >= 60:
+            return 'HIGH'
+        elif risk_score >= 40:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    
+    def _calculate_similarity_score(self, duplicate):
+        """Calculate similarity score for a duplicate entry"""
+        try:
+            transaction1 = duplicate.get('transaction1', {})
+            transaction2 = duplicate.get('transaction2', {})
+            
+            matching_fields = 0
+            total_fields = 6  # account, amount, user, posting_date, document_number, source
+            
+            # Check each field for similarity
+            if transaction1.get('account') == transaction2.get('account'):
+                matching_fields += 1
+            if transaction1.get('amount') == transaction2.get('amount'):
+                matching_fields += 1
+            if transaction1.get('user') == transaction2.get('user'):
+                matching_fields += 1
+            if transaction1.get('posting_date') == transaction2.get('posting_date'):
+                matching_fields += 1
+            if transaction1.get('document_number') == transaction2.get('document_number'):
+                matching_fields += 1
+            if transaction1.get('source') == transaction2.get('source'):
+                matching_fields += 1
+            
+            return matching_fields / total_fields
+        except Exception as e:
+            return 0.5
 
 class UserAnalysisView(generics.GenericAPIView):
     """Enhanced API view for retrieving comprehensive user analysis results by file ID.
@@ -5609,7 +6174,10 @@ class ClosingEntriesListView(generics.ListAPIView):
         # Apply filters
         filtered_entries = self._apply_filters(closing_entries)
         
-        return filtered_entries
+        # Enhance entries with risk scores
+        enhanced_entries = self._enhance_closing_entries(filtered_entries)
+        
+        return enhanced_entries
     
     def _apply_filters(self, closing_entries):
         """Apply filters to closing entries based on actual data structure"""
@@ -5726,6 +6294,80 @@ class ClosingEntriesListView(generics.ListAPIView):
         except (ValueError, TypeError):
             return False
     
+    def _enhance_closing_entries(self, closing_entries):
+        """Enhance closing entries with risk scores and additional information"""
+        if not closing_entries:
+            return []
+        
+        enhanced_entries = []
+        for entry in closing_entries:
+            if isinstance(entry, dict):
+                enhanced_entry = entry.copy()
+                
+                # Add risk score if missing
+                if not enhanced_entry.get('risk_score'):
+                    enhanced_entry['risk_score'] = self._calculate_closing_risk_score(entry)
+                
+                # Add risk level if missing
+                if not enhanced_entry.get('risk_level'):
+                    enhanced_entry['risk_level'] = self._get_closing_risk_level(
+                        enhanced_entry.get('risk_score', 0)
+                    )
+                
+                enhanced_entries.append(enhanced_entry)
+            else:
+                enhanced_entries.append(entry)
+        
+        return enhanced_entries
+    
+    def _calculate_closing_risk_score(self, entry):
+        """Calculate risk score for a closing entry based on RISK_SCORING_METHODOLOGY_AND_INTEGRATION.md"""
+        try:
+            # Base risk score for closing entries (30 points)
+            risk_score = 30.0
+            
+            # Factor 1: Post-close entries (+25 points)
+            if entry.get('is_post_close', False):
+                risk_score += 25.0
+            
+            # Factor 2: Debit closing entries (+10 points)
+            amount = float(entry.get('amount', 0))
+            if amount < 0:  # Debit transaction
+                risk_score += 10.0
+            
+            # Factor 3: Month-end closing (+5 points)
+            days_from_month_end = entry.get('days_from_month_end', 0)
+            if days_from_month_end <= 1:  # Month-end or day after
+                risk_score += 5.0
+            
+            # Factor 4: Year-end closing (+10 points)
+            posting_date = entry.get('posting_date')
+            if posting_date:
+                try:
+                    from datetime import datetime
+                    if isinstance(posting_date, str):
+                        posting_date = datetime.strptime(posting_date, '%Y-%m-%d').date()
+                    # Check if it's December and near year-end
+                    if posting_date.month == 12 and posting_date.day >= 25:
+                        risk_score += 10.0
+                except:
+                    pass
+            
+            return min(risk_score, 100.0)
+        except Exception as e:
+            return 30.0
+    
+    def _get_closing_risk_level(self, risk_score):
+        """Get risk level based on risk score for closing entries"""
+        if risk_score >= 90:
+            return 'CRITICAL'
+        elif risk_score >= 70:
+            return 'HIGH'
+        elif risk_score >= 50:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    
     def list(self, request, *args, **kwargs):
         """Return only paginated closing entries listing"""
         queryset = self.get_queryset()
@@ -5781,7 +6423,10 @@ class BackdatedEntriesListView(generics.ListAPIView):
         # Apply filters
         filtered_entries = self._apply_filters(backdated_entries)
         
-        return filtered_entries
+        # Enhance entries with risk scores
+        enhanced_entries = self._enhance_backdated_entries(filtered_entries)
+        
+        return enhanced_entries
     
     def _apply_filters(self, backdated_entries):
         """Apply filters to backdated entries based on actual data structure"""
@@ -5916,6 +6561,81 @@ class BackdatedEntriesListView(generics.ListAPIView):
         except (ValueError, TypeError):
             return False
     
+    def _enhance_backdated_entries(self, backdated_entries):
+        """Enhance backdated entries with risk scores and additional information"""
+        if not backdated_entries:
+            return []
+        
+        enhanced_entries = []
+        for entry in backdated_entries:
+            if isinstance(entry, dict):
+                enhanced_entry = entry.copy()
+                
+                # Add risk score if missing
+                if not enhanced_entry.get('risk_score'):
+                    enhanced_entry['risk_score'] = self._calculate_backdated_risk_score(entry)
+                
+                # Add risk level if missing
+                if not enhanced_entry.get('risk_level'):
+                    enhanced_entry['risk_level'] = self._get_backdated_risk_level(
+                        enhanced_entry.get('risk_score', 0)
+                    )
+                
+                # Add backdated severity if missing
+                if not enhanced_entry.get('backdated_severity'):
+                    enhanced_entry['backdated_severity'] = self._get_backdated_severity(
+                        enhanced_entry.get('days_difference', 0)
+                    )
+                
+                enhanced_entries.append(enhanced_entry)
+            else:
+                enhanced_entries.append(entry)
+        
+        return enhanced_entries
+    
+    def _calculate_backdated_risk_score(self, entry):
+        """Calculate risk score for a backdated entry based on RISK_SCORING_METHODOLOGY_AND_INTEGRATION.md"""
+        try:
+            # Base risk score for backdated entries (50 points)
+            risk_score = 50.0
+            
+            # Factor 1: Days difference (primary factor)
+            days_difference = entry.get('days_difference', 0)
+            if days_difference > 30:
+                risk_score = 100.0  # Critical
+            elif days_difference > 14:
+                risk_score = 85.0   # High
+            elif days_difference > 7:
+                risk_score = 70.0   # Medium
+            else:
+                risk_score = 50.0   # Low
+            
+            return min(risk_score, 100.0)
+        except Exception as e:
+            return 50.0
+    
+    def _get_backdated_risk_level(self, risk_score):
+        """Get risk level based on risk score for backdated entries"""
+        if risk_score >= 85:
+            return 'CRITICAL'
+        elif risk_score >= 70:
+            return 'HIGH'
+        elif risk_score >= 50:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    
+    def _get_backdated_severity(self, days_difference):
+        """Get backdated severity based on days difference"""
+        if days_difference <= 7:
+            return 'MINOR'
+        elif days_difference <= 30:
+            return 'MODERATE'
+        elif days_difference <= 90:
+            return 'SIGNIFICANT'
+        else:
+            return 'CRITICAL'
+    
     def list(self, request, *args, **kwargs):
         """Return only paginated backdated entries listing"""
         queryset = self.get_queryset()
@@ -5965,7 +6685,8 @@ class UnusualDaysListView(generics.ListAPIView):
                 return []
             
             unusual_days = unusual_days_analysis.unusual_days or []
-            return self._apply_filters(unusual_days)
+            enhanced_days = self._enhance_unusual_days(unusual_days)
+            return self._apply_filters(enhanced_days)
             
         except Exception as e:
             logger.error(f"Error fetching unusual days data: {e}")
@@ -6038,12 +6759,12 @@ class UnusualDaysListView(generics.ListAPIView):
             if day_type.upper() == 'WEEKEND':
                 filtered_entries = [
                     entry for entry in filtered_entries
-                    if entry.get('day_of_week', '').lower() in ['saturday', 'sunday']
+                    if entry.get('day_of_week', '').lower() in ['friday', 'saturday']
                 ]
             elif day_type.upper() == 'WEEKDAY':
                 filtered_entries = [
                     entry for entry in filtered_entries
-                    if entry.get('day_of_week', '').lower() not in ['saturday', 'sunday']
+                    if entry.get('day_of_week', '').lower() not in ['friday', 'saturday']
                 ]
         
         # High value filter
@@ -6099,6 +6820,69 @@ class UnusualDaysListView(generics.ListAPIView):
             return True
         except (ValueError, TypeError):
             return False
+    
+    def _enhance_unusual_days(self, unusual_days):
+        """Enhance unusual days entries with risk scores and additional information"""
+        if not unusual_days:
+            return []
+        
+        enhanced_entries = []
+        for entry in unusual_days:
+            if isinstance(entry, dict):
+                enhanced_entry = entry.copy()
+                
+                # Add risk score if missing
+                if not enhanced_entry.get('risk_score'):
+                    enhanced_entry['risk_score'] = self._calculate_unusual_days_risk_score(entry)
+                
+                # Add risk level if missing
+                if not enhanced_entry.get('risk_level'):
+                    enhanced_entry['risk_level'] = self._get_unusual_days_risk_level(
+                        enhanced_entry.get('risk_score', 0)
+                    )
+                
+                enhanced_entries.append(enhanced_entry)
+            else:
+                enhanced_entries.append(entry)
+        
+        return enhanced_entries
+    
+    def _calculate_unusual_days_risk_score(self, entry):
+        """Calculate risk score for unusual days entries based on RISK_SCORING_METHODOLOGY_AND_INTEGRATION.md"""
+        try:
+            # Base risk score for unusual days (60 points)
+            risk_score = 60.0
+            
+            # Factor 1: Day of week (primary factor)
+            day_of_week = entry.get('day_of_week', '').lower()
+            if day_of_week in ['friday', 'saturday']:
+                risk_score = 100.0  # Critical - Weekend posting
+            elif day_of_week == 'friday':
+                risk_score = 85.0   # High - Friday posting
+            else:
+                risk_score = 60.0   # Medium - Other unusual days
+            
+            # Factor 2: High value transactions
+            amount = float(entry.get('amount', 0))
+            if amount > 10000000:  # > 10M
+                risk_score = min(risk_score + 20.0, 100.0)
+            elif amount > 1000000:  # > 1M
+                risk_score = min(risk_score + 10.0, 100.0)
+            
+            return min(risk_score, 100.0)
+        except Exception as e:
+            return 60.0
+    
+    def _get_unusual_days_risk_level(self, risk_score):
+        """Get risk level based on risk score for unusual days entries"""
+        if risk_score >= 85:
+            return 'CRITICAL'
+        elif risk_score >= 70:
+            return 'HIGH'
+        elif risk_score >= 50:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
     
     def list(self, request, *args, **kwargs):
         """Return only paginated unusual days entries listing"""
@@ -6166,6 +6950,13 @@ class DuplicateListView(generics.ListAPIView):
                 # Add transaction1
                 transaction1 = duplicate.get('transaction1', {})
                 if transaction1:
+                    # Get the duplicate type description for display
+                    duplicate_type_desc = self._get_duplicate_type_description(duplicate.get('duplicate_type', '')) or self._infer_duplicate_type(duplicate)
+                    
+                    # Create a modified duplicate object with the descriptive type for risk calculation
+                    duplicate_for_risk = duplicate.copy()
+                    duplicate_for_risk['duplicate_type'] = duplicate_type_desc
+                    
                     entry = {
                         'transaction_id': transaction1.get('id', ''),
                         'document_number': transaction1.get('document_number', ''),
@@ -6173,18 +6964,26 @@ class DuplicateListView(generics.ListAPIView):
                         'account': transaction1.get('account', ''),
                         'amount': float(transaction1.get('amount', 0)),
                         'user': transaction1.get('user', ''),
-                        'duplicate_type': duplicate.get('duplicate_type', ''),
+                        'duplicate_type': duplicate_type_desc,
+                        'duplicate_type_description': duplicate_type_desc,
                         'risk_level': duplicate.get('risk_level', 'LOW'),
-                        'risk_score': float(duplicate.get('risk_score', 0)),
+                        'risk_score': float(duplicate.get('risk_score', 0)) or self._calculate_duplicate_risk_score(duplicate_for_risk),
                         'similarity_score': float(duplicate.get('similarity_score', 0)),
                         'matching_fields': duplicate.get('matching_fields', []),
-                        'duplicate_group_id': f"{transaction1.get('id', '')}_{duplicate.get('duplicate_type', '')}"
+                        'duplicate_group_id': f"{transaction1.get('id', '')}_{duplicate_type_desc}"
                     }
                     filtered_entries.append(entry)
                 
                 # Add transaction2
                 transaction2 = duplicate.get('transaction2', {})
                 if transaction2:
+                    # Get the duplicate type description for display
+                    duplicate_type_desc = self._get_duplicate_type_description(duplicate.get('duplicate_type', '')) or self._infer_duplicate_type(duplicate)
+                    
+                    # Create a modified duplicate object with the descriptive type for risk calculation
+                    duplicate_for_risk = duplicate.copy()
+                    duplicate_for_risk['duplicate_type'] = duplicate_type_desc
+                    
                     entry = {
                         'transaction_id': transaction2.get('id', ''),
                         'document_number': transaction2.get('document_number', ''),
@@ -6192,12 +6991,13 @@ class DuplicateListView(generics.ListAPIView):
                         'account': transaction2.get('account', ''),
                         'amount': float(transaction2.get('amount', 0)),
                         'user': transaction2.get('user', ''),
-                        'duplicate_type': duplicate.get('duplicate_type', ''),
+                        'duplicate_type': duplicate_type_desc,
+                        'duplicate_type_description': duplicate_type_desc,
                         'risk_level': duplicate.get('risk_level', 'LOW'),
-                        'risk_score': float(duplicate.get('risk_score', 0)),
+                        'risk_score': float(duplicate.get('risk_score', 0)) or self._calculate_duplicate_risk_score(duplicate_for_risk),
                         'similarity_score': float(duplicate.get('similarity_score', 0)),
                         'matching_fields': duplicate.get('matching_fields', []),
-                        'duplicate_group_id': f"{transaction2.get('id', '')}_{duplicate.get('duplicate_type', '')}"
+                        'duplicate_group_id': f"{transaction2.get('id', '')}_{duplicate_type_desc}"
                     }
                     filtered_entries.append(entry)
         
@@ -6254,9 +7054,27 @@ class DuplicateListView(generics.ListAPIView):
         duplicate_type = self.request.query_params.get('duplicate_type')
         if duplicate_type:
             types = [type_name.strip() for type_name in duplicate_type.split(',')]
+            # Convert descriptive names to type codes for filtering
+            type_codes = []
+            for type_name in types:
+                if 'Type 1' in type_name:
+                    type_codes.append('type_1')
+                elif 'Type 2' in type_name:
+                    type_codes.append('type_2')
+                elif 'Type 3' in type_name:
+                    type_codes.append('type_3')
+                elif 'Type 4' in type_name:
+                    type_codes.append('type_4')
+                elif 'Type 5' in type_name:
+                    type_codes.append('type_5')
+                elif 'Type 6' in type_name:
+                    type_codes.append('type_6')
+                else:
+                    type_codes.append(type_name)
+            
             filtered_entries = [
                 entry for entry in filtered_entries
-                if entry.get('duplicate_type', '') in types
+                if entry.get('duplicate_type', '') in type_codes
             ]
         
         # Similarity score range filter
@@ -6352,6 +7170,109 @@ class DuplicateListView(generics.ListAPIView):
         
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+    
+    def _get_duplicate_type_description(self, duplicate_type_code):
+        """Convert duplicate type code to descriptive name"""
+        type_mapping = {
+            'type_1': 'Type 1 Duplicate - Account Number + Amount',
+            'type_2': 'Type 2 Duplicate - Account Number + Source + Amount',
+            'type_3': 'Type 3 Duplicate - Account Number + User + Amount',
+            'type_4': 'Type 4 Duplicate - Account Number + Posted Date + Amount',
+            'type_5': 'Type 5 Duplicate - Account Number + Effective Date + Amount',
+            'type_6': 'Type 6 Duplicate - Account Number + Effective Date + Posted Date + User + Source + Amount'
+        }
+        return type_mapping.get(duplicate_type_code, duplicate_type_code)
+    
+    def _infer_duplicate_type(self, duplicate):
+        """Infer duplicate type from matching fields and transaction data"""
+        try:
+            transaction1 = duplicate.get('transaction1', {})
+            transaction2 = duplicate.get('transaction2', {})
+            matching_fields = duplicate.get('matching_fields', [])
+            
+            # Check for Type 6: Account + Effective Date + Posted Date + User + Source + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('document_date') == transaction2.get('document_date') and
+                transaction1.get('posting_date') == transaction2.get('posting_date') and
+                transaction1.get('user_name') == transaction2.get('user_name') and
+                transaction1.get('source') == transaction2.get('source') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 6 Duplicate - Account Number + Effective Date + Posted Date + User + Source + Amount'
+            
+            # Check for Type 5: Account + Effective Date + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('document_date') == transaction2.get('document_date') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 5 Duplicate - Account Number + Effective Date + Amount'
+            
+            # Check for Type 4: Account + Posted Date + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('posting_date') == transaction2.get('posting_date') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 4 Duplicate - Account Number + Posted Date + Amount'
+            
+            # Check for Type 3: Account + User + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('user_name') == transaction2.get('user_name') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 3 Duplicate - Account Number + User + Amount'
+            
+            # Check for Type 2: Account + Source + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('source') == transaction2.get('source') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 2 Duplicate - Account Number + Source + Amount'
+            
+            # Check for Type 1: Account + Amount
+            if (transaction1.get('gl_account') == transaction2.get('gl_account') and
+                transaction1.get('amount') == transaction2.get('amount')):
+                return 'Type 1 Duplicate - Account Number + Amount'
+            
+            # If no specific pattern matches, return based on matching fields
+            if 'gl_account' in matching_fields and 'amount' in matching_fields:
+                if 'user_name' in matching_fields and 'source' in matching_fields:
+                    return 'Type 6 Duplicate - Account Number + Effective Date + Posted Date + User + Source + Amount'
+                elif 'user_name' in matching_fields:
+                    return 'Type 3 Duplicate - Account Number + User + Amount'
+                elif 'source' in matching_fields:
+                    return 'Type 2 Duplicate - Account Number + Source + Amount'
+                else:
+                    return 'Type 1 Duplicate - Account Number + Amount'
+            
+            return 'Unknown Duplicate Type'
+            
+        except Exception as e:
+            return 'Unknown Duplicate Type'
+    
+    def _calculate_duplicate_risk_score(self, duplicate):
+        """Calculate risk score for a duplicate entry based on RISK_SCORING_METHODOLOGY_AND_INTEGRATION.md"""
+        try:
+            transaction1 = duplicate.get('transaction1', {})
+            transaction2 = duplicate.get('transaction2', {})
+            duplicate_type = duplicate.get('duplicate_type', '')
+            
+            # Base risk score for duplicates (40 points)
+            risk_score = 40.0
+            
+            # Factor 1: Duplicate type (primary factor)
+            if 'Type 6' in duplicate_type:
+                risk_score = 100.0  # Critical
+            elif 'Type 5' in duplicate_type:
+                risk_score = 85.0   # High
+            elif 'Type 4' in duplicate_type:
+                risk_score = 75.0   # Medium-High
+            elif 'Type 3' in duplicate_type:
+                risk_score = 65.0   # Medium
+            elif 'Type 2' in duplicate_type:
+                risk_score = 55.0   # Medium-Low
+            elif 'Type 1' in duplicate_type:
+                risk_score = 45.0   # Low
+            else:
+                risk_score = 40.0   # Default
+            
+            return min(risk_score, 100.0)
+        except Exception as e:
+            return 40.0
 
 
 class UserListView(generics.ListAPIView):
@@ -6457,25 +7378,31 @@ class UserListView(generics.ListAPIView):
                 if float(risk_score) == 0.0:
                     # Try to get risk score from different possible sources
                     if 'risk_factors' in risk_data:
-                        # Calculate risk score based on risk factors
+                        # Calculate risk score based on risk factors (following RISK_SCORING_METHODOLOGY_AND_INTEGRATION.md)
                         risk_factors = risk_data.get('risk_factors', [])
-                        risk_score = len(risk_factors) * 20.0  # 20 points per risk factor
+                        # Base risk score for users (30 points)
+                        risk_score = 30.0
+                        # Add points based on risk factors
+                        risk_score += len(risk_factors) * 15.0  # 15 points per risk factor
                     elif 'anomaly_type' in risk_data:
                         # Calculate risk score based on anomaly type
                         anomaly_type = risk_data.get('anomaly_type', '')
                         if 'HIGH_ACTIVITY' in anomaly_type:
-                            risk_score = 80.0
+                            risk_score = 75.0  # High
                         elif 'MEDIUM_ACTIVITY' in anomaly_type:
-                            risk_score = 60.0
+                            risk_score = 55.0  # Medium
                         else:
-                            risk_score = 40.0
+                            risk_score = 35.0  # Low
+                    else:
+                        # Default risk score for users
+                        risk_score = 30.0
                 
-                # Ensure risk level matches the score
-                if float(risk_score) > 80:
+                # Ensure risk level matches the score (following documented methodology)
+                if float(risk_score) >= 85:
                     risk_level = 'CRITICAL'
-                elif float(risk_score) > 60:
+                elif float(risk_score) >= 65:
                     risk_level = 'HIGH'
-                elif float(risk_score) > 40:
+                elif float(risk_score) >= 45:
                     risk_level = 'MEDIUM'
                 else:
                     risk_level = 'LOW'

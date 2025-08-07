@@ -20,7 +20,7 @@ class SAPGLAnalyzer:
             'duplicate_threshold': 2,  # Minimum count for duplicate detection
             'closing_days_before': 3,  # Days before month end for closing entries
             'closing_days_after': 2,   # Days after month end for closing entries
-            'unusual_days': ['Saturday', 'Sunday'],  # Days considered unusual
+            'unusual_days': ['Friday', 'Saturday'],  # Days considered unusual
             'holiday_dates': [],  # Predefined holiday dates
             'high_risk_users': [],  # Users of interest
             'high_risk_accounts': []  # Accounts of interest
