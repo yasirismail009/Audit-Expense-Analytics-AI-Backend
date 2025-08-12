@@ -528,6 +528,9 @@ def run_user_analysis_sync(job_id):
             user_account_distribution=user_results.get('user_account_distribution', []),
             user_anomalies=user_results.get('user_anomalies', []),
             user_risk_assessment=user_results.get('user_risk_assessment', []),
+            audit_recommendations=user_results.get('audit_recommendations', {}),
+            compliance_assessment=user_results.get('compliance_assessment', {}),
+            financial_statement_impact=user_results.get('financial_statement_impact', {}),
             chart_data=user_results.get('chart_data', {}),
             export_data=user_results.get('export_data', []),
             processing_duration=user_results.get('processing_duration', 0),
@@ -745,7 +748,15 @@ def run_risk_analysis_sync(job_id):
             # Check for user anomalies (medium risk)
             if user_analysis and user_analysis.user_anomalies:
                 for anomaly in user_analysis.user_anomalies:
-                    if transaction.user_name == anomaly.get('user_name'):
+                    if transaction.user_name == anomaly.get('user'):
+                        transaction.is_user_anomaly = True
+                        transaction.user_anomaly_type = anomaly.get('anomaly_type', 'HIGH_ACTIVITY')
+                        transaction.user_anomaly_risk_score = 60.0
+                        transaction.user_anomaly_analysis_details = {
+                            'anomaly_type': anomaly.get('anomaly_type'),
+                            'risk_level': anomaly.get('risk_level'),
+                            'details': anomaly.get('details')
+                        }
                         anomaly_types.append('user_anomaly')
                         break
             
@@ -753,6 +764,14 @@ def run_risk_analysis_sync(job_id):
             if unusual_days_analysis and unusual_days_analysis.weekend_postings:
                 for unusual in unusual_days_analysis.weekend_postings:
                     if str(transaction.id) == unusual.get('transaction_id'):
+                        transaction.is_unusual_days_posting = True
+                        transaction.unusual_days_type = unusual.get('day_of_week', 'Weekend')
+                        transaction.unusual_days_risk_score = 50.0
+                        transaction.unusual_days_analysis_details = {
+                            'day_of_week': unusual.get('day_of_week'),
+                            'risk_level': unusual.get('risk_level'),
+                            'posting_date': unusual.get('posting_date')
+                        }
                         anomaly_types.append('unusual_days')
                         break
             
@@ -760,6 +779,14 @@ def run_risk_analysis_sync(job_id):
             if closing_entries_analysis and closing_entries_analysis.closing_entries:
                 for closing in closing_entries_analysis.closing_entries:
                     if str(transaction.id) == closing.get('transaction_id'):
+                        transaction.is_closing_entry = True
+                        transaction.closing_entry_type = 'MONTH_END'
+                        transaction.closing_entry_risk_score = 40.0
+                        transaction.closing_entry_analysis_details = {
+                            'days_from_month_end': closing.get('days_from_month_end'),
+                            'risk_level': closing.get('risk_level'),
+                            'posting_date': closing.get('posting_date')
+                        }
                         anomaly_types.append('closing_entries')
                         break
             
@@ -769,6 +796,7 @@ def run_risk_analysis_sync(job_id):
                     if str(transaction.id) == holiday.get('transaction_id'):
                         transaction.is_holiday_posting = True
                         transaction.holiday_name = holiday.get('holiday_name', 'Unknown')
+                        transaction.holiday_risk_score = holiday.get('risk_score', 60.0)
                         anomaly_types.append('holiday')
                         break
             
@@ -782,8 +810,14 @@ def run_risk_analysis_sync(job_id):
                 'is_duplicate': transaction.is_duplicate,
                 'is_backdated': transaction.is_backdated,
                 'is_holiday_posting': transaction.is_holiday_posting,
+                'is_unusual_days_posting': transaction.is_unusual_days_posting,
+                'is_user_anomaly': transaction.is_user_anomaly,
+                'is_closing_entry': transaction.is_closing_entry,
                 'holiday_name': transaction.holiday_name,
-                'backdated_days': transaction.backdated_days
+                'backdated_days': transaction.backdated_days,
+                'unusual_days_type': transaction.unusual_days_type,
+                'user_anomaly_type': transaction.user_anomaly_type,
+                'closing_entry_type': transaction.closing_entry_type
             }
             
             transaction.save()
@@ -1112,6 +1146,9 @@ def run_unusual_days_analysis_sync(job_id):
             },
             weekend_postings=unusual_days_transactions,
             unusual_days=unusual_days_transactions,
+            audit_recommendations=unusual_days_results.get('audit_recommendations', {}),
+            compliance_assessment=unusual_days_results.get('compliance_assessment', {}),
+            financial_statement_impact=unusual_days_results.get('financial_statement_impact', {}),
             chart_data=unusual_days_results.get('chart_data', {}),
             export_data=unusual_days_results.get('export_data', []),
             processing_duration=unusual_days_results.get('processing_duration', 0),
@@ -1245,6 +1282,9 @@ def run_closing_entries_analysis_sync(job_id):
                 'closing_entries_count': len(closing_entries_transactions)
             },
             closing_entries=closing_entries_transactions,
+            audit_recommendations=closing_entries_results.get('audit_recommendations', {}),
+            compliance_assessment=closing_entries_results.get('compliance_assessment', {}),
+            financial_statement_impact=closing_entries_results.get('financial_statement_impact', {}),
             chart_data=closing_entries_results.get('chart_data', {}),
             export_data=closing_entries_results.get('export_data', []),
             processing_duration=closing_entries_results.get('processing_duration', 0),

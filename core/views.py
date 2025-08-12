@@ -27,6 +27,7 @@ from .serializers import (
     UnusualDaysListSerializer,HolidayListSerializer, DuplicateListSerializer, UserListSerializer
 )
 from .tasks import run_restructured_analysis
+from .excel_export import AuditExcelExporter
 
 logger = logging.getLogger(__name__)
 
@@ -6078,7 +6079,7 @@ class FileGLAccountsView(APIView):
         }
 
     def _get_account_details(self, gl_account):
-        """Get account details from GLAccount model"""
+        """Get account details from GLAccount model, create if doesn't exist"""
         try:
             from .models import GLAccount
             account = GLAccount.objects.get(account_id=gl_account)
@@ -6091,14 +6092,147 @@ class FileGLAccountsView(APIView):
                 'is_active': account.is_active
             }
         except GLAccount.DoesNotExist:
-            return {
-                'account_name': 'Unknown',
-                'account_type': 'Unknown',
-                'account_category': 'Unknown',
-                'account_subcategory': None,
-                'normal_balance': 'DEBIT',
-                'is_active': True
-            }
+            # Auto-create GL account with reasonable defaults based on account number patterns
+            account_name, account_type, account_category = self._infer_account_details(gl_account)
+            
+            try:
+                # Determine normal balance based on account type
+                normal_balance = self._get_normal_balance(account_type)
+                
+                # Create the GL account record
+                account = GLAccount.objects.create(
+                    account_id=gl_account,
+                    account_name=account_name,
+                    account_type=account_type,
+                    account_category=account_category,
+                    account_subcategory=None,
+                    normal_balance=normal_balance,
+                    is_active=True
+                )
+                
+                return {
+                    'account_name': account.account_name,
+                    'account_type': account.account_type,
+                    'account_category': account.account_category,
+                    'account_subcategory': account.account_subcategory,
+                    'normal_balance': account.normal_balance,
+                    'is_active': account.is_active
+                }
+            except Exception as e:
+                 # If creation fails, return defaults
+                 print(f"Failed to create GL account {gl_account}: {e}")
+                 normal_balance = self._get_normal_balance(account_type)
+                 return {
+                     'account_name': account_name,
+                     'account_type': account_type,
+                     'account_category': account_category,
+                     'account_subcategory': None,
+                     'normal_balance': normal_balance,
+                     'is_active': True
+                 }
+    
+    def _infer_account_details(self, gl_account):
+        """Infer account details based on account number patterns"""
+        try:
+            # Convert to string and get the first few digits
+            account_str = str(gl_account).strip()
+            
+            if not account_str:
+                return 'Unknown Account', 'Unknown', 'Unknown'
+            
+            # Get the first digit or first few digits for classification
+            first_digit = account_str[0] if len(account_str) > 0 else '0'
+            first_two = account_str[:2] if len(account_str) >= 2 else first_digit
+            
+            # Common SAP GL account classification patterns
+            if first_digit == '1':
+                if first_two in ['10', '11', '12', '13', '14', '15']:
+                    return f'Cash & Cash Equivalents {gl_account}', 'Asset', 'Cash & Cash Equivalents'
+                elif first_two in ['16', '17', '18', '19']:
+                    return f'Other Current Assets {gl_account}', 'Asset', 'Other Current Assets'
+                else:
+                    return f'Current Assets {gl_account}', 'Asset', 'Current Assets'
+            
+            elif first_digit == '2':
+                if first_two in ['20', '21', '22', '23', '24', '25']:
+                    return f'Accounts Payable {gl_account}', 'Liability', 'Accounts Payable'
+                elif first_two in ['26', '27', '28', '29']:
+                    return f'Other Current Liabilities {gl_account}', 'Liability', 'Other Current Liabilities'
+                else:
+                    return f'Current Liabilities {gl_account}', 'Liability', 'Current Liabilities'
+            
+            elif first_digit == '3':
+                if first_two in ['30', '31', '32', '33', '34', '35']:
+                    return f'Long-term Debt {gl_account}', 'Liability', 'Long-term Debt'
+                elif first_two in ['36', '37', '38', '39']:
+                    return f'Other Long-term Liabilities {gl_account}', 'Liability', 'Other Long-term Liabilities'
+                else:
+                    return f'Long-term Liabilities {gl_account}', 'Liability', 'Long-term Liabilities'
+            
+            elif first_digit == '4':
+                if first_two in ['40', '41', '42', '43', '44', '45']:
+                    return f'Shareholders Equity {gl_account}', 'Equity', 'Shareholders Equity'
+                elif first_two in ['46', '47', '48', '49']:
+                    return f'Retained Earnings {gl_account}', 'Equity', 'Retained Earnings'
+                else:
+                    return f'Equity {gl_account}', 'Equity', 'Equity'
+            
+            elif first_digit == '5':
+                if first_two in ['50', '51', '52', '53', '54', '55']:
+                    return f'Revenue {gl_account}', 'Revenue', 'Revenue'
+                elif first_two in ['56', '57', '58', '59']:
+                    return f'Other Revenue {gl_account}', 'Revenue', 'Other Revenue'
+                else:
+                    return f'Revenue {gl_account}', 'Revenue', 'Revenue'
+            
+            elif first_digit == '6':
+                if first_two in ['60', '61', '62', '63', '64', '65']:
+                    return f'Cost of Sales {gl_account}', 'Expense', 'Cost of Sales'
+                elif first_two in ['66', '67', '68', '69']:
+                    return f'Other Cost of Sales {gl_account}', 'Expense', 'Other Cost of Sales'
+                else:
+                    return f'Cost of Sales {gl_account}', 'Expense', 'Cost of Sales'
+            
+            elif first_digit == '7':
+                if first_two in ['70', '71', '72', '73', '74', '75']:
+                    return f'Selling & Marketing {gl_account}', 'Expense', 'Selling & Marketing'
+                elif first_two in ['76', '77', '78', '79']:
+                    return f'Other Selling Expenses {gl_account}', 'Expense', 'Other Selling Expenses'
+                else:
+                    return f'Selling Expenses {gl_account}', 'Expense', 'Selling Expenses'
+            
+            elif first_digit == '8':
+                if first_two in ['80', '81', '82', '83', '84', '85']:
+                    return f'General & Administrative {gl_account}', 'Expense', 'General & Administrative'
+                elif first_two in ['86', '87', '88', '89']:
+                    return f'Other Administrative {gl_account}', 'Expense', 'Other Administrative'
+                else:
+                    return f'Administrative Expenses {gl_account}', 'Expense', 'Administrative Expenses'
+            
+            elif first_digit == '9':
+                if first_two in ['90', '91', '92', '93', '94', '95']:
+                    return f'Other Income & Expenses {gl_account}', 'Expense', 'Other Income & Expenses'
+                elif first_two in ['96', '97', '98', '99']:
+                    return f'Extraordinary Items {gl_account}', 'Expense', 'Extraordinary Items'
+                else:
+                    return f'Other Items {gl_account}', 'Expense', 'Other Items'
+            
+            else:
+                # Default classification for unknown patterns
+                return f'Account {gl_account}', 'Unknown', 'Unknown'
+                
+        except Exception as e:
+            print(f"Error inferring account details for {gl_account}: {e}")
+            return f'Account {gl_account}', 'Unknown', 'Unknown'
+    
+    def _get_normal_balance(self, account_type):
+         """Determine normal balance based on account type"""
+         if account_type in ['Asset', 'Expense']:
+             return 'DEBIT'
+         elif account_type in ['Liability', 'Equity', 'Revenue']:
+             return 'CREDIT'
+         else:
+             return 'DEBIT'  # Default to debit
 
     def _get_risk_level(self, risk_score):
         """Determine risk level based on risk score"""
@@ -7745,3 +7879,408 @@ class HolidayListView(generics.ListAPIView):
         
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+
+
+class AnalysisExportView(generics.GenericAPIView):
+    """API view for exporting transactions from any specific analysis type as CSV or XLSX"""
+    
+    def get(self, request, file_id, analysis_type):
+        """
+        Export transactions from a specific analysis type
+        
+        Parameters:
+        - file_id: UUID of the data file
+        - analysis_type: Type of analysis (duplicate, backdated, holiday, closing_entries, unusual_days, user)
+        - format: Export format (csv or xlsx) - defaults to xlsx
+        - limit: Maximum number of records to export (default: 10000)
+        """
+        try:
+            # Get the data file
+            data_file = DataFile.objects.get(id=file_id)
+            
+            # Get export parameters
+            export_format = request.query_params.get('format', 'xlsx').lower()
+            limit_param = request.query_params.get('limit')
+            limit = int(limit_param) if limit_param else None
+            
+            # Validate format
+            if export_format not in ['csv', 'xlsx']:
+                return Response(
+                    {'error': 'Invalid format. Use "csv" or "xlsx"'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get analysis data based on type
+            analysis_data = self._get_analysis_data(data_file, analysis_type)
+            
+            if not analysis_data:
+                return Response(
+                    {'error': f'No data found for analysis type: {analysis_type}'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Limit the data only if limit parameter is provided
+            if limit is not None and limit > 0:
+                analysis_data = analysis_data[:limit]
+            
+            # Export the data
+            if export_format == 'csv':
+                return self._export_csv(analysis_data, data_file, analysis_type)
+            else:
+                return self._export_xlsx(analysis_data, data_file, analysis_type)
+                
+        except DataFile.DoesNotExist:
+            return Response(
+                {'error': 'Data file not found'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.error(f"Error exporting {analysis_type} data: {e}")
+            return Response(
+                {'error': f'Error exporting data: {str(e)}'}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    def _get_analysis_data(self, data_file, analysis_type):
+        """Get analysis data based on type"""
+        if analysis_type == 'duplicate':
+            analysis = DuplicateAnalysisResult.objects.filter(data_file=data_file).first()
+            return analysis.duplicate_list if analysis else []
+            
+        elif analysis_type == 'backdated':
+            analysis = BackdatedAnalysisResult.objects.filter(data_file=data_file).first()
+            return analysis.backdated_entries if analysis else []
+            
+        elif analysis_type == 'holiday':
+            analysis = HolidayAnalysisResult.objects.filter(data_file=data_file).first()
+            return analysis.holiday_postings if analysis else []
+            
+        elif analysis_type == 'closing_entries':
+            analysis = ClosingEntriesAnalysisResult.objects.filter(data_file=data_file).first()
+            return analysis.closing_entries if analysis else []
+            
+        elif analysis_type == 'unusual_days':
+            analysis = UnusualDaysAnalysisResult.objects.filter(data_file=data_file).first()
+            return analysis.unusual_days if analysis else []
+            
+        elif analysis_type == 'user':
+            analysis = UserAnalysisResult.objects.filter(data_file=data_file).first()
+            return analysis.user_anomalies if analysis else []
+            
+        else:
+            return None
+    
+    def _export_csv(self, data, data_file, analysis_type):
+        """Export data as CSV"""
+        import csv
+        from django.http import HttpResponse
+        
+        # Create response
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = f'attachment; filename="{data_file.client_name}_{analysis_type}_export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv"'
+        
+        if not data:
+            return response
+        
+        # Get headers from first record
+        headers = list(data[0].keys())
+        
+        # Write CSV
+        writer = csv.DictWriter(response, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(data)
+        
+        return response
+    
+    def _export_xlsx(self, data, data_file, analysis_type):
+        """Export data as XLSX"""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        from django.http import HttpResponse
+        import io
+        
+        # Create workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = f"{analysis_type.replace('_', ' ').title()}"
+        
+        if not data:
+            # Create empty file with headers
+            response = HttpResponse(
+                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+            response['Content-Disposition'] = f'attachment; filename="{data_file.client_name}_{analysis_type}_export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx"'
+            
+            # Save to response
+            output = io.BytesIO()
+            wb.save(output)
+            output.seek(0)
+            response.write(output.getvalue())
+            return response
+        
+        # Get headers from first record
+        headers = list(data[0].keys())
+        
+        # Write headers
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color="CCCCCC", end_color="CCCCCC", fill_type="solid")
+        
+        # Write data
+        for row, record in enumerate(data, 2):
+            for col, header in enumerate(headers, 1):
+                value = record.get(header, '')
+                ws.cell(row=row, column=col, value=value)
+        
+        # Auto-adjust column widths
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
+            ws.column_dimensions[column_letter].width = adjusted_width
+        
+        # Create response
+        response = HttpResponse(
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = f'attachment; filename="{data_file.client_name}_{analysis_type}_export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx"'
+        
+        # Save to response
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        response.write(output.getvalue())
+        
+        return response
+
+
+class ExcelExportView(generics.GenericAPIView):
+    """API view for exporting comprehensive audit reports to Excel"""
+    
+    def get(self, request, file_id):
+        """Generate and download comprehensive Excel audit report"""
+        try:
+            # Get data file
+            data_file = DataFile.objects.get(id=file_id)
+            
+            # DEBUG: Print basic file info
+            print("=" * 80)
+            print("DEBUG: EXCEL EXPORT DATA STRUCTURE")
+            print("=" * 80)
+            print(f"File ID: {file_id}")
+            print(f"Data File: {data_file.file_name}")
+            print(f"Client Name: {data_file.client_name}")
+            print(f"Company Name: {data_file.company_name}")
+            print(f"Fiscal Year: {data_file.fiscal_year}")
+            print()
+            
+            # Collect all analysis results
+            analysis_results = {}
+            
+            # Get duplicate analysis
+            duplicate_analysis = DuplicateAnalysisResult.objects.filter(data_file=data_file).first()
+            if duplicate_analysis:
+                analysis_results['duplicate_analysis'] = {
+                    'duplicate_list': duplicate_analysis.duplicate_list or [],
+                    'analysis_info': duplicate_analysis.analysis_info or {},
+                    'chart_data': duplicate_analysis.chart_data or {},
+                    'audit_recommendations': duplicate_analysis.audit_recommendations or {}
+                }
+                print(f"DUPLICATE ANALYSIS: {len(duplicate_analysis.duplicate_list or [])} items")
+            else:
+                print("DUPLICATE ANALYSIS: Not found")
+            
+            # Get backdated analysis
+            backdated_analysis = BackdatedAnalysisResult.objects.filter(data_file=data_file).first()
+            if backdated_analysis:
+                analysis_results['backdated_analysis'] = {
+                    'backdated_entries': backdated_analysis.backdated_entries or [],
+                    'analysis_info': backdated_analysis.analysis_info or {},
+                    'chart_data': backdated_analysis.chart_data or {},
+                    'audit_recommendations': backdated_analysis.audit_recommendations or {}
+                }
+                print(f"BACKDATED ANALYSIS: {len(backdated_analysis.backdated_entries or [])} items")
+            else:
+                print("BACKDATED ANALYSIS: Not found")
+            
+            # Get closing entries analysis
+            closing_analysis = ClosingEntriesAnalysisResult.objects.filter(data_file=data_file).first()
+            if closing_analysis:
+                analysis_results['closing_entries_analysis'] = {
+                    'closing_entries': closing_analysis.closing_entries or [],
+                    'analysis_info': closing_analysis.analysis_info or {},
+                    'chart_data': closing_analysis.chart_data or {},
+                    'audit_recommendations': getattr(closing_analysis, 'audit_recommendations', {})
+                }
+                print(f"CLOSING ENTRIES ANALYSIS: {len(closing_analysis.closing_entries or [])} items")
+            else:
+                print("CLOSING ENTRIES ANALYSIS: Not found")
+            
+            # Get holiday analysis
+            holiday_analysis = HolidayAnalysisResult.objects.filter(data_file=data_file).first()
+            if holiday_analysis:
+                analysis_results['holiday_analysis'] = {
+                    'holiday_postings': holiday_analysis.holiday_postings or [],
+                    'analysis_info': holiday_analysis.analysis_info or {},
+                    'chart_data': holiday_analysis.chart_data or {},
+                    'audit_recommendations': holiday_analysis.audit_recommendations or {}
+                }
+                print(f"HOLIDAY ANALYSIS: {len(holiday_analysis.holiday_postings or [])} items")
+            else:
+                print("HOLIDAY ANALYSIS: Not found")
+            
+            # Get user analysis
+            user_analysis = UserAnalysisResult.objects.filter(data_file=data_file).first()
+            if user_analysis:
+                analysis_results['user_analysis'] = {
+                    'user_transaction_summary': user_analysis.user_transaction_summary or [],
+                    'user_anomalies': user_analysis.user_anomalies or [],
+                    'user_risk_assessment': user_analysis.user_risk_assessment or {},
+                    'chart_data': user_analysis.chart_data or {},
+                    'audit_recommendations': getattr(user_analysis, 'audit_recommendations', {})
+                }
+                print(f"USER ANALYSIS: {len(user_analysis.user_transaction_summary or [])} users, {len(user_analysis.user_anomalies or [])} anomalies")
+            else:
+                print("USER ANALYSIS: Not found")
+            
+            # Get unusual days analysis
+            unusual_days_analysis = UnusualDaysAnalysisResult.objects.filter(data_file=data_file).first()
+            if unusual_days_analysis:
+                analysis_results['unusual_days_analysis'] = {
+                    'unusual_days': unusual_days_analysis.unusual_days or [],
+                    'analysis_info': unusual_days_analysis.analysis_info or {},
+                    'chart_data': unusual_days_analysis.chart_data or {},
+                    'audit_recommendations': getattr(unusual_days_analysis, 'audit_recommendations', {})
+                }
+                print(f"UNUSUAL DAYS ANALYSIS: {len(unusual_days_analysis.unusual_days or [])} items")
+            else:
+                print("UNUSUAL DAYS ANALYSIS: Not found")
+            
+            # Get overall analysis
+            overall_analysis = OverallAnalysisResult.objects.filter(data_file=data_file).first()
+            if overall_analysis:
+                analysis_results['overall_analysis'] = {
+                    'flagged_transactions': overall_analysis.flagged_transactions or [],
+                    'flag_summary': overall_analysis.flag_summary or {},
+                    'risk_assessment': overall_analysis.risk_assessment or {},
+                    'chart_data': overall_analysis.chart_data or {},
+                    'export_data': overall_analysis.export_data or {}
+                }
+                print(f"OVERALL ANALYSIS: {len(overall_analysis.flagged_transactions or [])} flagged items")
+            else:
+                print("OVERALL ANALYSIS: Not found")
+            
+            # Get risk analysis
+            risk_analysis = RiskScoringDocument.objects.filter(data_file=data_file).first()
+            if risk_analysis:
+                analysis_results['risk_analysis'] = {
+                    'overall_risk_score': risk_analysis.overall_risk_score,
+                    'risk_level': risk_analysis.get_risk_level(),
+                    'methodology_overview': risk_analysis.methodology_overview or {},
+                    'risk_factors': risk_analysis.risk_factors or {},
+                    'recommendations': risk_analysis.recommendations or {}
+                }
+                print(f"RISK ANALYSIS: Score {risk_analysis.overall_risk_score}, Level {risk_analysis.get_risk_level()}")
+            else:
+                print("RISK ANALYSIS: Not found")
+            
+            # Calculate total anomalies for debugging
+            total_anomalies = 0
+            anomaly_breakdown = {}
+            
+            if 'duplicate_analysis' in analysis_results:
+                count = len(analysis_results['duplicate_analysis']['duplicate_list'])
+                anomaly_breakdown['duplicates'] = count
+                total_anomalies += count
+            
+            if 'backdated_analysis' in analysis_results:
+                count = len(analysis_results['backdated_analysis']['backdated_entries'])
+                anomaly_breakdown['backdated'] = count
+                total_anomalies += count
+            
+            if 'closing_entries_analysis' in analysis_results:
+                count = len(analysis_results['closing_entries_analysis']['closing_entries'])
+                anomaly_breakdown['closing_entries'] = count
+                total_anomalies += count
+            
+            if 'holiday_analysis' in analysis_results:
+                count = len(analysis_results['holiday_analysis']['holiday_postings'])
+                anomaly_breakdown['holiday'] = count
+                total_anomalies += count
+            
+            if 'unusual_days_analysis' in analysis_results:
+                count = len(analysis_results['unusual_days_analysis']['unusual_days'])
+                anomaly_breakdown['unusual_days'] = count
+                total_anomalies += count
+            
+            if 'user_analysis' in analysis_results:
+                count = len(analysis_results['user_analysis']['user_anomalies'])
+                anomaly_breakdown['user_anomalies'] = count
+                total_anomalies += count
+            
+            print(f"\nTOTAL ANOMALIES CALCULATED: {total_anomalies}")
+            print(f"ANOMALY BREAKDOWN: {anomaly_breakdown}")
+            print("=" * 80)
+            print()
+            
+            # Generate Excel file
+            exporter = AuditExcelExporter()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"audit_report_{data_file.client_name}_{timestamp}.xlsx"
+            output_path = f"temp_uploads/{filename}"
+            
+            # Create Excel report
+            exporter.create_audit_report(data_file, analysis_results, output_path)
+            
+            # Return file download response with automatic cleanup
+            from django.http import StreamingHttpResponse
+            import os
+            
+            if os.path.exists(output_path):
+                def file_iterator():
+                    with open(output_path, 'rb') as f:
+                        while True:
+                            chunk = f.read(8192)  # 8KB chunks
+                            if not chunk:
+                                break
+                            yield chunk
+                    
+                    # Delete file after streaming is complete
+                    try:
+                        os.remove(output_path)
+                        logger.info(f"Temporary file deleted: {output_path}")
+                    except Exception as e:
+                        logger.error(f"Error deleting temporary file {output_path}: {e}")
+                
+                response = StreamingHttpResponse(
+                    file_iterator(),
+                    content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+                response['Content-Disposition'] = f'attachment; filename="{filename}"'
+                response['Content-Length'] = os.path.getsize(output_path)
+                
+                return response
+            else:
+                return Response(
+                    {'error': 'Failed to generate Excel file'}, 
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+                
+        except DataFile.DoesNotExist:
+            return Response(
+                {'error': 'Data file not found'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.error(f"Error generating Excel export: {e}")
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

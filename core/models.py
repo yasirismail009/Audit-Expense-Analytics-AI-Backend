@@ -143,6 +143,24 @@ class SAPGLPosting(models.Model):
     holiday_risk_score = models.FloatField(default=0.0, help_text='Risk score for holiday detection (0-100)')
     holiday_analysis_details = models.JSONField(default=dict, help_text='Detailed holiday analysis results')
     
+    # Unusual Days analysis tracking
+    is_unusual_days_posting = models.BooleanField(default=False, help_text='Flagged as unusual days posting')
+    unusual_days_type = models.CharField(max_length=50, blank=True, null=True, help_text='Type of unusual day (weekend, holiday, etc.)')
+    unusual_days_risk_score = models.FloatField(default=0.0, help_text='Risk score for unusual days detection (0-100)')
+    unusual_days_analysis_details = models.JSONField(default=dict, help_text='Detailed unusual days analysis results')
+    
+    # User analysis tracking
+    is_user_anomaly = models.BooleanField(default=False, help_text='Flagged as user anomaly')
+    user_anomaly_type = models.CharField(max_length=50, blank=True, null=True, help_text='Type of user anomaly')
+    user_anomaly_risk_score = models.FloatField(default=0.0, help_text='Risk score for user anomaly detection (0-100)')
+    user_anomaly_analysis_details = models.JSONField(default=dict, help_text='Detailed user anomaly analysis results')
+    
+    # Closing Entries analysis tracking
+    is_closing_entry = models.BooleanField(default=False, help_text='Flagged as closing entry')
+    closing_entry_type = models.CharField(max_length=50, blank=True, null=True, help_text='Type of closing entry')
+    closing_entry_risk_score = models.FloatField(default=0.0, help_text='Risk score for closing entry detection (0-100)')
+    closing_entry_analysis_details = models.JSONField(default=dict, help_text='Detailed closing entry analysis results')
+    
     # Metadata
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -879,6 +897,9 @@ class UserAnalysisResult(models.Model):
     user_anomalies = models.JSONField(default=list, help_text='List of user anomalies detected')
     user_risk_assessment = models.JSONField(default=dict, help_text='User risk assessment and scoring')
     user_patterns = models.JSONField(default=dict, help_text='User activity patterns and trends')
+    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
+    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
+    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
     chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
     export_data = models.JSONField(default=list, help_text='Export-ready data')
     
@@ -976,6 +997,9 @@ class UnusualDaysAnalysisResult(models.Model):
     fs_line_day_patterns = models.JSONField(default=list, help_text='FS line activity by day of week')
     unusual_days = models.JSONField(default=list, help_text='List of unusual day patterns detected')
     risk_assessment = models.JSONField(default=dict, help_text='Risk assessment for unusual days')
+    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
+    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
+    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
     chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
     export_data = models.JSONField(default=list, help_text='Export-ready data')
     
@@ -1141,6 +1165,9 @@ class ClosingEntriesAnalysisResult(models.Model):
     month_end_patterns = models.JSONField(default=dict, help_text='Month-end activity patterns')
     closing_window_analysis = models.JSONField(default=dict, help_text='Analysis of closing windows')
     risk_assessment = models.JSONField(default=dict, help_text='Risk assessment for closing entries')
+    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
+    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
+    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
     chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
     export_data = models.JSONField(default=list, help_text='Export-ready data')
     
@@ -1807,6 +1834,17 @@ class RiskScoringDocument(models.Model):
             'low_risk_percentage': (self.low_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
             'critical_risk_percentage': (self.critical_risk_transactions / self.total_transactions * 100) if self.total_transactions > 0 else 0,
         }
+    
+    def get_risk_level(self):
+        """Get overall risk level based on overall risk score"""
+        if self.overall_risk_score >= 80:
+            return 'CRITICAL'
+        elif self.overall_risk_score >= 60:
+            return 'HIGH'
+        elif self.overall_risk_score >= 30:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
 
 class HolidayAnalysisResult(models.Model):
     """Model to store Holiday Analysis results for identifying transactions posted on holidays"""

@@ -323,6 +323,35 @@ class OverallAnalyzer:
         except ClosingEntriesAnalysisResult.DoesNotExist:
             logger.warning(f"No closing entries analysis results found for file: {data_file.file_name}")
         
+        # ENHANCED: Get holiday analysis results
+        try:
+            holiday_results = HolidayAnalysisResult.objects.filter(
+                data_file=data_file,
+                status='COMPLETED'
+            ).latest('analysis_date')
+            
+            if holiday_results.holiday_postings:
+                # Add holiday postings to flagged transactions
+                seen_holiday_ids = set()
+                for holiday_posting in holiday_results.holiday_postings:
+                    holiday_id = holiday_posting.get('transaction_id')
+                    if holiday_id not in seen_holiday_ids:
+                        flagged_transactions.append({
+                            'transaction_id': holiday_id,
+                            'document_number': holiday_posting.get('document_number'),
+                            'gl_account': holiday_posting.get('gl_account'),
+                            'amount': holiday_posting.get('amount', 0),
+                            'user_name': holiday_posting.get('user_name'),
+                            'posting_date': holiday_posting.get('posting_date'),
+                            'flag_type': 'holiday_posting',
+                            'flag_details': f"Holiday: {holiday_posting.get('holiday_name', 'Unknown')}",
+                            'risk_score': holiday_posting.get('risk_score', 0),
+                            'source_analysis': 'holiday_analysis'
+                        })
+                        seen_holiday_ids.add(holiday_id)
+        except HolidayAnalysisResult.DoesNotExist:
+            logger.warning(f"No holiday analysis results found for file: {data_file.file_name}")
+        
         # Add fiscal year validation flags
         try:
             # Get all transactions for this file

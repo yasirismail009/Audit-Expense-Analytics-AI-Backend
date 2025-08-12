@@ -292,6 +292,10 @@ REST_FRAMEWORK = {
     ],
 }
 
+# Create logs directory if it doesn't exist
+LOGS_DIR = BASE_DIR / 'logs'
+LOGS_DIR.mkdir(exist_ok=True)
+
 # Logging Configuration
 LOGGING = {
     'version': 1,
@@ -310,7 +314,7 @@ LOGGING = {
         'file': {
             'level': 'INFO',
             'class': 'logging.FileHandler',
-            'filename': BASE_DIR / 'debug.log',
+            'filename': LOGS_DIR / 'debug.log',
             'formatter': 'verbose',
         },
         'console': {
