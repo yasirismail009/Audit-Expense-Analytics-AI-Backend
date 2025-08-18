@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 from pathlib import Path
 import os
+from datetime import timedelta
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -41,6 +42,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     'core',
+    'users',
 ]
 
 MIDDLEWARE = [
@@ -143,6 +145,15 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Custom User Model
+AUTH_USER_MODEL = 'users.User'
+
+# JWT Settings
+JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', SECRET_KEY)
+JWT_ALGORITHM = 'HS256'
+JWT_ACCESS_TOKEN_LIFETIME = timedelta(minutes=60)
+JWT_REFRESH_TOKEN_LIFETIME = timedelta(days=7)
 
 # CORS Settings
 # https://github.com/adamchainz/django-cors-headers
@@ -287,6 +298,7 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.AllowAny',  # Change to IsAuthenticated for production
     ],
     'DEFAULT_AUTHENTICATION_CLASSES': [
+        'users.authentication.JWTAuthentication',
         'rest_framework.authentication.SessionAuthentication',
         'rest_framework.authentication.BasicAuthentication',
     ],

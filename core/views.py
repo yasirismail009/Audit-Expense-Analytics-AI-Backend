@@ -7894,6 +7894,10 @@ class AnalysisExportView(generics.GenericAPIView):
         - format: Export format (csv or xlsx) - defaults to xlsx
         - limit: Maximum number of records to export (default: 10000)
         """
+        import uuid
+        from datetime import datetime, date
+        from decimal import Decimal
+        
         try:
             # Get the data file
             data_file = DataFile.objects.get(id=file_id)
@@ -7914,20 +7918,140 @@ class AnalysisExportView(generics.GenericAPIView):
             analysis_data = self._get_analysis_data(data_file, analysis_type)
             
             if not analysis_data:
+                # Provide more specific error messages based on analysis type
+                if analysis_type == 'user':
+                    error_msg = f'No user analysis data found for this file. User analysis may not have been run yet.'
+                elif analysis_type == 'duplicate':
+                    error_msg = f'No duplicate analysis data found for this file. Duplicate analysis may not have been run yet.'
+                elif analysis_type == 'backdated':
+                    error_msg = f'No backdated analysis data found for this file. Backdated analysis may not have been run yet.'
+                elif analysis_type == 'holiday':
+                    error_msg = f'No holiday analysis data found for this file. Holiday analysis may not have been run yet.'
+                elif analysis_type == 'closing_entries':
+                    error_msg = f'No closing entries analysis data found for this file. Closing entries analysis may not have been run yet.'
+                elif analysis_type == 'unusual_days':
+                    error_msg = f'No unusual days analysis data found for this file. Unusual days analysis may not have been run yet.'
+                else:
+                    error_msg = f'No {analysis_type} data found for this file'
+                
+                logger.warning(f"Export failed for {analysis_type} analysis - {error_msg}")
                 return Response(
-                    {'error': f'No data found for analysis type: {analysis_type}'}, 
+                    {'error': error_msg}, 
                     status=status.HTTP_404_NOT_FOUND
                 )
+            
+            # Validate and clean data before export
+            if not isinstance(analysis_data, list):
+                logger.error(f"Analysis data is not a list: {type(analysis_data)}")
+                return Response(
+                    {'error': f'Invalid data format for analysis type: {analysis_type}'}, 
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            
+            # Ensure all records are dictionaries
+            cleaned_data = []
+            for i, record in enumerate(analysis_data):
+                if not isinstance(record, dict):
+                    logger.warning(f"Record {i} is not a dictionary: {type(record)}")
+                    continue
+                cleaned_data.append(record)
+            
+            if not cleaned_data:
+                return Response(
+                    {'error': f'No valid data records found for analysis type: {analysis_type}'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            analysis_data = cleaned_data
+            
+            # Clean and validate data before export
+            cleaned_export_data = []
+            for i, record in enumerate(analysis_data):
+                try:
+                    cleaned_record = {}
+                    for key, value in record.items():
+                        # Ensure key is string
+                        key_str = str(key) if key is not None else 'unknown_key'
+                        
+                        # Clean value
+                        if value is None:
+                            cleaned_record[key_str] = ''
+                        elif isinstance(value, (str, int, float, bool)):
+                            cleaned_record[key_str] = value
+                        elif isinstance(value, (datetime, date)):
+                            cleaned_record[key_str] = value.isoformat()
+                        elif isinstance(value, uuid.UUID):
+                            cleaned_record[key_str] = str(value)
+                        elif isinstance(value, Decimal):
+                            try:
+                                cleaned_record[key_str] = float(value)
+                            except (TypeError, ValueError):
+                                cleaned_record[key_str] = str(value)
+                        else:
+                            # For any other type, convert to string
+                            try:
+                                cleaned_record[key_str] = str(value)
+                            except Exception as e:
+                                logger.warning(f"Could not convert value for key {key_str} in record {i}: {e}")
+                                cleaned_record[key_str] = f"[Error: {type(value).__name__}]"
+                    
+                    cleaned_export_data.append(cleaned_record)
+                except Exception as e:
+                    logger.error(f"Error cleaning record {i}: {e}")
+                    continue
+            
+            if not cleaned_export_data:
+                return Response(
+                    {'error': f'No valid data records after cleaning for analysis type: {analysis_type}'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            analysis_data = cleaned_export_data
             
             # Limit the data only if limit parameter is provided
             if limit is not None and limit > 0:
                 analysis_data = analysis_data[:limit]
             
+            # Debug logging for data structure
+            if analysis_data:
+                logger.info(f"Exporting {len(analysis_data)} records for {analysis_type}")
+                logger.info(f"Sample record structure: {list(analysis_data[0].keys()) if analysis_data else 'No data'}")
+                if analysis_data:
+                    sample_values = {k: type(v).__name__ for k, v in analysis_data[0].items()}
+                    logger.info(f"Sample value types: {sample_values}")
+                    
+                    # Validate first few records for potential issues
+                    for i, record in enumerate(analysis_data[:3]):
+                        logger.info(f"Record {i} validation:")
+                        for key, value in record.items():
+                            try:
+                                # Test if value can be converted to string
+                                str(value)
+                                logger.info(f"  {key}: {type(value).__name__} = {str(value)[:50]}...")
+                            except Exception as e:
+                                logger.error(f"  {key}: {type(value).__name__} - ERROR: {e}")
+            
             # Export the data
-            if export_format == 'csv':
-                return self._export_csv(analysis_data, data_file, analysis_type)
-            else:
-                return self._export_xlsx(analysis_data, data_file, analysis_type)
+            try:
+                if export_format == 'csv':
+                    return self._export_csv(analysis_data, data_file, analysis_type)
+                else:
+                    return self._export_xlsx(analysis_data, data_file, analysis_type)
+            except Exception as export_error:
+                logger.error(f"Export failed for {analysis_type} with format {export_format}: {export_error}")
+                # Fallback to CSV if Excel fails
+                if export_format == 'xlsx':
+                    logger.info(f"Falling back to CSV export for {analysis_type}")
+                    try:
+                        return self._export_csv(analysis_data, data_file, analysis_type)
+                    except Exception as csv_error:
+                        logger.error(f"CSV fallback also failed: {csv_error}")
+                        return Response(
+                            {'error': f'Export failed for both formats. Excel error: {export_error}, CSV error: {csv_error}'}, 
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                        )
+                else:
+                    raise
                 
         except DataFile.DoesNotExist:
             return Response(
@@ -7936,48 +8060,1795 @@ class AnalysisExportView(generics.GenericAPIView):
             )
         except Exception as e:
             logger.error(f"Error exporting {analysis_type} data: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return Response(
-                {'error': f'Error exporting data: {str(e)}'}, 
+                {'error': f'Error exporting {analysis_type} data: {str(e)}'}, 
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
     def _get_analysis_data(self, data_file, analysis_type):
         """Get analysis data based on type"""
+        logger.info(f"Getting analysis data for type: {analysis_type}")
+        
         if analysis_type == 'duplicate':
-            analysis = DuplicateAnalysisResult.objects.filter(data_file=data_file).first()
-            return analysis.duplicate_list if analysis else []
-            
+            return self._get_duplicate_analysis_data(data_file)
         elif analysis_type == 'backdated':
-            analysis = BackdatedAnalysisResult.objects.filter(data_file=data_file).first()
-            return analysis.backdated_entries if analysis else []
-            
+            return self._get_backdated_analysis_data(data_file)
         elif analysis_type == 'holiday':
-            analysis = HolidayAnalysisResult.objects.filter(data_file=data_file).first()
-            return analysis.holiday_postings if analysis else []
-            
+            return self._get_holiday_analysis_data(data_file)
         elif analysis_type == 'closing_entries':
-            analysis = ClosingEntriesAnalysisResult.objects.filter(data_file=data_file).first()
-            return analysis.closing_entries if analysis else []
-            
+            return self._get_closing_entries_analysis_data(data_file)
         elif analysis_type == 'unusual_days':
-            analysis = UnusualDaysAnalysisResult.objects.filter(data_file=data_file).first()
-            return analysis.unusual_days if analysis else []
-            
+            return self._get_unusual_days_analysis_data(data_file)
         elif analysis_type == 'user':
-            analysis = UserAnalysisResult.objects.filter(data_file=data_file).first()
-            return analysis.user_anomalies if analysis else []
-            
+            return self._get_user_analysis_data(data_file)
         else:
+            logger.error(f"Unknown analysis type: {analysis_type}")
+            return []
+    
+    def _get_duplicate_analysis_data(self, data_file):
+        """Get duplicate analysis data with comprehensive flattening"""
+        analysis = DuplicateAnalysisResult.objects.filter(data_file=data_file).first()
+        if not analysis:
+            logger.warning(f"No DuplicateAnalysisResult found for file {data_file.id}")
+            return []
+        
+        logger.info(f"Found DuplicateAnalysisResult: {analysis.id}")
+        logger.info(f"Duplicate records count: {len(analysis.duplicate_list) if analysis.duplicate_list else 0}")
+        
+        # Get all SAPGLPosting records for this file
+        sap_postings = SAPGLPosting.objects.filter(data_file=data_file)
+        posting_dict = {}
+        for posting in sap_postings:
+            posting_dict[str(posting.id)] = posting
+        
+        # Flatten duplicate data structure - each transaction gets its own row
+        flattened_data = []
+        if analysis.duplicate_list:
+            for i, duplicate_item in enumerate(analysis.duplicate_list):
+                logger.info(f"Processing duplicate item {i + 1}: {duplicate_item}")
+                
+                # Add transaction1
+                if 'transaction1' in duplicate_item:
+                    transaction1_id = duplicate_item['transaction1'].get('id')
+                    logger.info(f"Transaction1 ID: {transaction1_id}")
+                    transaction1_data = self._get_sap_posting_data(posting_dict.get(transaction1_id), duplicate_item, 1)
+                    if transaction1_data:
+                        flattened_data.append(transaction1_data)
+                        logger.info(f"Added transaction1 data with risk_score: {transaction1_data.get('risk_score')}")
+                    else:
+                        # Fallback: Create data from duplicate analysis if SAPGLPosting not found
+                        logger.warning(f"Could not get SAP posting data for transaction1 ID: {transaction1_id}")
+                        fallback_data = self._create_fallback_data(duplicate_item['transaction1'], duplicate_item, 1)
+                        if fallback_data:
+                            flattened_data.append(fallback_data)
+                            logger.info(f"Added fallback transaction1 data")
+                
+                # Add transaction2
+                if 'transaction2' in duplicate_item:
+                    transaction2_id = duplicate_item['transaction2'].get('id')
+                    logger.info(f"Transaction2 ID: {transaction2_id}")
+                    transaction2_data = self._get_sap_posting_data(posting_dict.get(transaction2_id), duplicate_item, 2)
+                    if transaction2_data:
+                        flattened_data.append(transaction2_data)
+                        logger.info(f"Added transaction2 data with risk_score: {transaction2_data.get('risk_score')}")
+                    else:
+                        # Fallback: Create data from duplicate analysis if SAPGLPosting not found
+                        logger.warning(f"Could not get SAP posting data for transaction2 ID: {transaction2_id}")
+                        fallback_data = self._create_fallback_data(duplicate_item['transaction2'], duplicate_item, 2)
+                        if fallback_data:
+                            flattened_data.append(fallback_data)
+                            logger.info(f"Added fallback transaction2 data")
+                
+                # Add additional transactions if they exist
+                for j, additional_tx in enumerate(duplicate_item.get('additional_transactions', []), 3):
+                    additional_id = additional_tx.get('id')
+                    logger.info(f"Additional transaction {j} ID: {additional_id}")
+                    additional_data = self._get_sap_posting_data(posting_dict.get(additional_id), duplicate_item, j)
+                    if additional_data:
+                        flattened_data.append(additional_data)
+                        logger.info(f"Added additional transaction data with risk_score: {additional_data.get('risk_score')}")
+                    else:
+                        # Fallback: Create data from duplicate analysis if SAPGLPosting not found
+                        logger.warning(f"Could not get SAP posting data for additional transaction ID: {additional_id}")
+                        fallback_data = self._create_fallback_data(additional_tx, duplicate_item, j)
+                        if fallback_data:
+                            flattened_data.append(fallback_data)
+                            logger.info(f"Added fallback additional transaction data")
+        else:
+            logger.warning(f"No duplicate_list found in DuplicateAnalysisResult for file {data_file.id}")
+        
+        logger.info(f"Total flattened duplicate records: {len(flattened_data)}")
+        return flattened_data
+            
+    def _get_backdated_analysis_data(self, data_file):
+        """Get backdated analysis data with comprehensive flattening"""
+        analysis = BackdatedAnalysisResult.objects.filter(data_file=data_file).first()
+        if not analysis:
+            logger.warning(f"No BackdatedAnalysisResult found for file {data_file.id}")
+            return []
+        
+        logger.info(f"Found BackdatedAnalysisResult: {analysis.id}")
+        logger.info(f"Backdated entries count: {len(analysis.backdated_entries) if analysis.backdated_entries else 0}")
+        
+        # Get all SAPGLPosting records for this file
+        sap_postings = SAPGLPosting.objects.filter(data_file=data_file)
+        posting_dict = {}
+        for posting in sap_postings:
+            posting_dict[str(posting.id)] = posting
+        
+        # Flatten backdated data structure
+        flattened_data = []
+        if analysis.backdated_entries:
+            for i, backdated_item in enumerate(analysis.backdated_entries):
+                logger.info(f"Processing backdated item {i + 1}: {backdated_item}")
+                if isinstance(backdated_item, dict):
+                    # Backdated entries use 'transaction_id' instead of 'id'
+                    posting_id = backdated_item.get('transaction_id') or backdated_item.get('id')
+                    posting = posting_dict.get(posting_id)
+                    if posting:
+                        data = self._get_sap_posting_data_for_backdated(posting, backdated_item)
+                        if data:
+                            flattened_data.append(data)
+                            logger.info(f"Added backdated data with risk_score: {data.get('risk_score')}")
+                    else:
+                        # Fallback: Create data from backdated analysis if SAPGLPosting not found
+                        logger.warning(f"Could not get SAP posting data for backdated item ID: {posting_id}")
+                        fallback_data = self._create_fallback_data_for_backdated(backdated_item, i + 1)
+                        if fallback_data:
+                            flattened_data.append(fallback_data)
+                            logger.info(f"Added fallback backdated data")
+        else:
+            logger.warning(f"No backdated_entries found in BackdatedAnalysisResult for file {data_file.id}")
+        
+        logger.info(f"Total flattened backdated records: {len(flattened_data)}")
+        return flattened_data
+            
+    def _get_holiday_analysis_data(self, data_file):
+        """Get holiday analysis data with comprehensive flattening"""
+        analysis = HolidayAnalysisResult.objects.filter(data_file=data_file).first()
+        if not analysis:
+            logger.warning(f"No HolidayAnalysisResult found for file {data_file.id}")
+            return []
+        
+        logger.info(f"Found HolidayAnalysisResult: {analysis.id}")
+        logger.info(f"Holiday postings count: {len(analysis.holiday_postings) if analysis.holiday_postings else 0}")
+        
+        # Get all SAPGLPosting records for this file
+        sap_postings = SAPGLPosting.objects.filter(data_file=data_file)
+        posting_dict = {}
+        for posting in sap_postings:
+            posting_dict[str(posting.id)] = posting
+        
+        # Flatten holiday data structure
+        flattened_data = []
+        if analysis.holiday_postings:
+            for i, holiday_item in enumerate(analysis.holiday_postings):
+                logger.info(f"Processing holiday item {i + 1}: {holiday_item}")
+                if isinstance(holiday_item, dict):
+                    # Holiday entries use 'transaction_id' instead of 'id'
+                    posting_id = holiday_item.get('transaction_id') or holiday_item.get('id')
+                    posting = posting_dict.get(posting_id)
+                    if posting:
+                        data = self._get_sap_posting_data_for_holiday(posting, holiday_item)
+                        if data:
+                            flattened_data.append(data)
+                            logger.info(f"Added holiday data with risk_score: {data.get('risk_score')}")
+                    else:
+                        # Fallback: Create data from holiday analysis if SAPGLPosting not found
+                        logger.warning(f"Could not get SAP posting data for holiday item ID: {posting_id}")
+                        fallback_data = self._create_fallback_data_for_holiday(holiday_item, i + 1)
+                        if fallback_data:
+                            flattened_data.append(fallback_data)
+                            logger.info(f"Added fallback holiday data")
+        else:
+            logger.warning(f"No holiday_postings found in HolidayAnalysisResult for file {data_file.id}")
+        
+        logger.info(f"Total flattened holiday records: {len(flattened_data)}")
+        return flattened_data
+            
+    def _get_closing_entries_analysis_data(self, data_file):
+        """Get closing entries analysis data with comprehensive flattening"""
+        analysis = ClosingEntriesAnalysisResult.objects.filter(data_file=data_file).first()
+        if not analysis:
+            logger.warning(f"No ClosingEntriesAnalysisResult found for file {data_file.id}")
+            return []
+        
+        logger.info(f"Found ClosingEntriesAnalysisResult: {analysis.id}")
+        logger.info(f"Closing entries count: {len(analysis.closing_entries) if analysis.closing_entries else 0}")
+        
+        # Get all SAPGLPosting records for this file
+        sap_postings = SAPGLPosting.objects.filter(data_file=data_file)
+        posting_dict = {}
+        for posting in sap_postings:
+            posting_dict[str(posting.id)] = posting
+        
+        # Flatten closing entries data structure
+        flattened_data = []
+        if analysis.closing_entries:
+            for i, closing_item in enumerate(analysis.closing_entries):
+                logger.info(f"Processing closing entry item {i + 1}: {closing_item}")
+                if isinstance(closing_item, dict):
+                    # Closing entries use 'transaction_id' instead of 'id'
+                    posting_id = closing_item.get('transaction_id') or closing_item.get('id')
+                    posting = posting_dict.get(posting_id)
+                    if posting:
+                        data = self._get_sap_posting_data_for_closing_entries(posting, closing_item)
+                        if data:
+                            flattened_data.append(data)
+                            logger.info(f"Added closing entry data with risk_score: {data.get('risk_score')}")
+                    else:
+                        # Fallback: Create data from closing entries analysis if SAPGLPosting not found
+                        logger.warning(f"Could not get SAP posting data for closing entry item ID: {posting_id}")
+                        fallback_data = self._create_fallback_data_for_closing_entries(closing_item, i + 1)
+                        if fallback_data:
+                            flattened_data.append(fallback_data)
+                            logger.info(f"Added fallback closing entry data")
+        else:
+            logger.warning(f"No closing_entries found in ClosingEntriesAnalysisResult for file {data_file.id}")
+        
+        logger.info(f"Total flattened closing entries records: {len(flattened_data)}")
+        return flattened_data
+            
+    def _get_unusual_days_analysis_data(self, data_file):
+        """Get unusual days analysis data with comprehensive flattening"""
+        analysis = UnusualDaysAnalysisResult.objects.filter(data_file=data_file).first()
+        if not analysis:
+            logger.warning(f"No UnusualDaysAnalysisResult found for file {data_file.id}")
+            return []
+        
+        logger.info(f"Found UnusualDaysAnalysisResult: {analysis.id}")
+        logger.info(f"Unusual days count: {len(analysis.unusual_days) if analysis.unusual_days else 0}")
+        
+        # Get all SAPGLPosting records for this file
+        sap_postings = SAPGLPosting.objects.filter(data_file=data_file)
+        posting_dict = {}
+        for posting in sap_postings:
+            posting_dict[str(posting.id)] = posting
+        
+        # Flatten unusual days data structure
+        flattened_data = []
+        if analysis.unusual_days:
+            for i, unusual_item in enumerate(analysis.unusual_days):
+                logger.info(f"Processing unusual days item {i + 1}: {unusual_item}")
+                if isinstance(unusual_item, dict):
+                    # Unusual days use 'transaction_id' instead of 'id'
+                    posting_id = unusual_item.get('transaction_id') or unusual_item.get('id')
+                    posting = posting_dict.get(posting_id)
+                    if posting:
+                        data = self._get_sap_posting_data_for_unusual_days(posting, unusual_item)
+                        if data:
+                            flattened_data.append(data)
+                            logger.info(f"Added unusual days data with risk_score: {data.get('risk_score')}")
+                    else:
+                        # Fallback: Create data from unusual days analysis if SAPGLPosting not found
+                        logger.warning(f"Could not get SAP posting data for unusual days item ID: {posting_id}")
+                        fallback_data = self._create_fallback_data_for_unusual_days(unusual_item, i + 1)
+                        if fallback_data:
+                            flattened_data.append(fallback_data)
+                            logger.info(f"Added fallback unusual days data")
+        else:
+            logger.warning(f"No unusual_days found in UnusualDaysAnalysisResult for file {data_file.id}")
+        
+        logger.info(f"Total flattened unusual days records: {len(flattened_data)}")
+        return flattened_data
+            
+    def _get_user_analysis_data(self, data_file):
+        """Get user analysis data with comprehensive flattening"""
+        analysis = UserAnalysisResult.objects.filter(data_file=data_file).first()
+        if not analysis:
+            logger.warning(f"No UserAnalysisResult found for file {data_file.id}")
+            return []
+        
+        logger.info(f"Found UserAnalysisResult: {analysis.id}")
+        logger.info(f"User anomalies count: {len(analysis.user_anomalies) if analysis.user_anomalies else 0}")
+        
+        # Get all SAPGLPosting records for this file
+        sap_postings = SAPGLPosting.objects.filter(data_file=data_file)
+        
+        # Flatten user analysis data structure
+        flattened_data = []
+        if analysis.user_anomalies:
+            for i, user_item in enumerate(analysis.user_anomalies):
+                logger.info(f"Processing user anomaly {i + 1}: {user_item}")
+                if isinstance(user_item, dict):
+                    user_name = user_item.get('user', '')
+                    if user_name:
+                        # Get all SAPGLPosting records for this user
+                        user_postings = sap_postings.filter(user_name=user_name)
+                        logger.info(f"Found {user_postings.count()} SAPGLPosting records for user {user_name}")
+                        
+                        if user_postings.exists():
+                            # Use the first posting as representative for this user anomaly
+                            representative_posting = user_postings.first()
+                            data = self._get_sap_posting_data_for_user(representative_posting, user_item)
+                            if data:
+                                # Add user anomaly metadata
+                                data.update({
+                                    'user_anomaly_type': user_item.get('anomaly_type', ''),
+                                    'user_anomaly_details': user_item.get('details', ''),
+                                    'user_transaction_count': user_postings.count(),
+                                    'user_total_amount': sum(posting.amount_local_currency for posting in user_postings),
+                                    'analysis_type': 'User Analysis Results'
+                                })
+                                flattened_data.append(data)
+                                logger.info(f"Added user anomaly data with risk_score: {data.get('risk_score')}")
+                            else:
+                                logger.warning(f"Could not get SAP posting data for user {user_name}")
+                                # Create fallback data
+                                fallback_data = self._create_fallback_data_for_user(user_item, i + 1)
+                                if fallback_data:
+                                    flattened_data.append(fallback_data)
+                                    logger.info(f"Added fallback user anomaly data")
+                        else:
+                            logger.warning(f"No SAPGLPosting records found for user {user_name}")
+                            # Create fallback data
+                            fallback_data = self._create_fallback_data_for_user(user_item, i + 1)
+                            if fallback_data:
+                                flattened_data.append(fallback_data)
+                                logger.info(f"Added fallback user anomaly data")
+                    else:
+                        logger.warning(f"User name not found in user anomaly item")
+        else:
+            logger.warning(f"No user_anomalies found in UserAnalysisResult for file {data_file.id}")
+        
+        logger.info(f"Total flattened user analysis records: {len(flattened_data)}")
+        return flattened_data
+    
+    def _get_sap_posting_data(self, posting, duplicate_item, position):
+        """Get SAPGLPosting data with analysis metadata"""
+        if not posting:
             return None
+        
+        # Debug: Log the duplicate item structure
+        logger.info(f"Processing duplicate item for position {position}: {duplicate_item}")
+        logger.info(f"Duplicate item keys: {list(duplicate_item.keys()) if duplicate_item else 'None'}")
+        
+        # Debug: Log SAPGLPosting data
+        logger.info(f"SAPGLPosting data - ID: {posting.id}, User: {posting.user_name}, Amount: {posting.amount_local_currency}, Document: {posting.document_number}")
+        
+        # Get all fields from SAPGLPosting
+        data = {
+            'id': str(posting.id),
+            'user': posting.user_name,
+            'amount': float(posting.amount_local_currency),
+            'account': posting.gl_account,
+            'posting_date': posting.posting_date.isoformat() if posting.posting_date else '',
+            'document_number': posting.document_number or '',
+            'gl_account': posting.gl_account,
+            'transaction_type': posting.transaction_type,
+            'text': posting.text or '',
+            'document_date': posting.document_date.isoformat() if posting.document_date else '',
+            'document_type': posting.document_type or '',
+            'profit_center': posting.profit_center or '',
+            'cost_center': posting.cost_center or '',
+            'clearing_document': posting.clearing_document or '',
+            'segment': posting.segment or '',
+            'plant': posting.plant or '',
+            'material': posting.material or '',
+            'fiscal_year': posting.fiscal_year,
+            'posting_period': posting.posting_period,
+            'local_currency': posting.local_currency,
+            'offsetting_account': posting.offsetting_account or '',
+            'entry_date': posting.entry_date.isoformat() if posting.entry_date else '',
+            'invoice_reference': posting.invoice_reference or '',
+            'billing_document': posting.billing_document or '',
+            'sales_document': posting.sales_document or '',
+            'purchasing_document': posting.purchasing_document or '',
+            'order_number': posting.order_number or '',
+            'asset_number': posting.asset_number or '',
+            'network': posting.network or '',
+            'assignment': posting.assignment or '',
+            'tax_code': posting.tax_code or '',
+            'account_assignment': posting.account_assignment or '',
+            'year_month': posting.year_month or '',
+        }
+        
+        # Fallback: If SAPGLPosting data is missing, try to get from duplicate analysis
+        if position == 1 and 'transaction1' in duplicate_item:
+            transaction_data = duplicate_item['transaction1']
+            if not data['document_number'] and 'document_number' in transaction_data:
+                data['document_number'] = transaction_data['document_number'] or ''
+            if not data['amount'] and 'amount' in transaction_data:
+                data['amount'] = float(transaction_data['amount'])
+        elif position == 2 and 'transaction2' in duplicate_item:
+            transaction_data = duplicate_item['transaction2']
+            if not data['document_number'] and 'document_number' in transaction_data:
+                data['document_number'] = transaction_data['document_number'] or ''
+            if not data['amount'] and 'amount' in transaction_data:
+                data['amount'] = float(transaction_data['amount'])
+        
+        # Debug: Log the final data
+        logger.info(f"Final data - Amount: {data['amount']}, Document Number: '{data['document_number']}'")
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            # Try to generate a document number if missing
+            data['document_number'] = f"DOC_{data['id'][:8]}_{position}"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for transaction {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Extract risk score and other metadata with debugging
+        risk_score = duplicate_item.get('risk_score', 0)
+        group_id = duplicate_item.get('group_id', '')
+        duplicate_type = duplicate_item.get('duplicate_type', '')
+        duplicate_count = duplicate_item.get('duplicate_count', 0)
+        total_amount = duplicate_item.get('total_amount', 0)
+        
+        logger.info(f"Extracted metadata - risk_score: {risk_score}, group_id: {group_id}, duplicate_type: {duplicate_type}")
+        
+        # Add duplicate analysis metadata
+        data.update({
+            'duplicate_group_id': group_id,
+            'duplicate_type': duplicate_type,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'duplicate_count': duplicate_count,
+            'total_amount_in_group': total_amount,
+            'analysis_type': 'Duplicate Analysis Results',
+            'transaction_position': f'Transaction {position}'
+        })
+        
+        logger.info(f"Final data risk_score: {data.get('risk_score')}, risk_level: {data.get('risk_level')}")
+        
+        # If risk score is 0, try to calculate it based on transaction characteristics
+        if risk_score == 0:
+            calculated_risk_score = self._calculate_duplicate_risk_score(posting, duplicate_item)
+            data['risk_score'] = calculated_risk_score
+            data['risk_level'] = self._get_risk_level(calculated_risk_score)
+            logger.info(f"Calculated risk score: {calculated_risk_score}, risk level: {data['risk_level']}")
+        
+        # If duplicate group info is missing, populate it
+        if not data['duplicate_group_id']:
+            data['duplicate_group_id'] = f"GROUP_{posting.id}_{position}"
+        if not data['duplicate_type']:
+            data['duplicate_type'] = 'type_1'  # Default type
+        if data['duplicate_count'] == 0:
+            # Count transactions in this duplicate group
+            transaction_count = 0
+            if 'transaction1' in duplicate_item:
+                transaction_count += 1
+            if 'transaction2' in duplicate_item:
+                transaction_count += 1
+            if 'additional_transactions' in duplicate_item:
+                transaction_count += len(duplicate_item['additional_transactions'])
+            data['duplicate_count'] = transaction_count
+        
+        return data
+    
+    def _get_sap_posting_data_for_backdated(self, posting, backdated_item):
+        """Get SAPGLPosting data with backdated analysis metadata"""
+        if not posting:
+            return None
+        
+        # Debug: Log the backdated item structure
+        logger.info(f"Processing backdated item: {backdated_item}")
+        logger.info(f"Backdated item keys: {list(backdated_item.keys()) if backdated_item else 'None'}")
+        
+        # Debug: Log SAPGLPosting data
+        logger.info(f"SAPGLPosting data - ID: {posting.id}, User: {posting.user_name}, Amount: {posting.amount_local_currency}, Document: {posting.document_number}")
+        
+        # Get all fields from SAPGLPosting
+        data = {
+            'id': str(posting.id),
+            'user': posting.user_name,
+            'amount': float(posting.amount_local_currency),
+            'account': posting.gl_account,
+            'posting_date': posting.posting_date.isoformat() if posting.posting_date else '',
+            'document_number': posting.document_number or '',
+            'gl_account': posting.gl_account,
+            'transaction_type': posting.transaction_type,
+            'text': posting.text or '',
+            'document_date': posting.document_date.isoformat() if posting.document_date else '',
+            'document_type': posting.document_type or '',
+            'profit_center': posting.profit_center or '',
+            'cost_center': posting.cost_center or '',
+            'clearing_document': posting.clearing_document or '',
+            'segment': posting.segment or '',
+            'plant': posting.plant or '',
+            'material': posting.material or '',
+            'fiscal_year': posting.fiscal_year,
+            'posting_period': posting.posting_period,
+            'local_currency': posting.local_currency,
+            'offsetting_account': posting.offsetting_account or '',
+            'entry_date': posting.entry_date.isoformat() if posting.entry_date else '',
+            'invoice_reference': posting.invoice_reference or '',
+            'billing_document': posting.billing_document or '',
+            'sales_document': posting.sales_document or '',
+            'purchasing_document': posting.purchasing_document or '',
+            'order_number': posting.order_number or '',
+            'asset_number': posting.asset_number or '',
+            'network': posting.network or '',
+            'assignment': posting.assignment or '',
+            'tax_code': posting.tax_code or '',
+            'account_assignment': posting.account_assignment or '',
+            'year_month': posting.year_month or '',
+        }
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            data['document_number'] = f"DOC_{data['id'][:8]}_BD"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for transaction {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Debug: Log the final data
+        logger.info(f"Final data - Amount: {data['amount']}, Document Number: '{data['document_number']}'")
+        
+        # Extract backdated analysis metadata
+        backdated_days = backdated_item.get('backdated_days', 0)
+        risk_score = backdated_item.get('risk_score', 0)
+        
+        # If risk score is 0, calculate it based on backdated characteristics
+        if risk_score == 0:
+            risk_score = self._calculate_backdated_risk_score(posting, backdated_days)
+        
+        # Add backdated analysis metadata
+        data.update({
+            'backdated_days': backdated_days,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'analysis_type': 'Backdated Analysis Results'
+        })
+        
+        logger.info(f"Backdated analysis - Days: {backdated_days}, Risk Score: {risk_score}, Risk Level: {data['risk_level']}")
+        
+        return data
+    
+    def _get_sap_posting_data_for_holiday(self, posting, holiday_item):
+        """Get SAPGLPosting data with holiday analysis metadata"""
+        if not posting:
+            return None
+        
+        # Debug: Log the holiday item structure
+        logger.info(f"Processing holiday item: {holiday_item}")
+        logger.info(f"Holiday item keys: {list(holiday_item.keys()) if holiday_item else 'None'}")
+        
+        # Debug: Log SAPGLPosting data
+        logger.info(f"SAPGLPosting data - ID: {posting.id}, User: {posting.user_name}, Amount: {posting.amount_local_currency}, Document: {posting.document_number}")
+        
+        # Get all fields from SAPGLPosting
+        data = {
+            'id': str(posting.id),
+            'user': posting.user_name,
+            'amount': float(posting.amount_local_currency),
+            'account': posting.gl_account,
+            'posting_date': posting.posting_date.isoformat() if posting.posting_date else '',
+            'document_number': posting.document_number or '',
+            'gl_account': posting.gl_account,
+            'transaction_type': posting.transaction_type,
+            'text': posting.text or '',
+            'document_date': posting.document_date.isoformat() if posting.document_date else '',
+            'document_type': posting.document_type or '',
+            'profit_center': posting.profit_center or '',
+            'cost_center': posting.cost_center or '',
+            'clearing_document': posting.clearing_document or '',
+            'segment': posting.segment or '',
+            'plant': posting.plant or '',
+            'material': posting.material or '',
+            'fiscal_year': posting.fiscal_year,
+            'posting_period': posting.posting_period,
+            'local_currency': posting.local_currency,
+            'offsetting_account': posting.offsetting_account or '',
+            'entry_date': posting.entry_date.isoformat() if posting.entry_date else '',
+            'invoice_reference': posting.invoice_reference or '',
+            'billing_document': posting.billing_document or '',
+            'sales_document': posting.sales_document or '',
+            'purchasing_document': posting.purchasing_document or '',
+            'order_number': posting.order_number or '',
+            'asset_number': posting.asset_number or '',
+            'network': posting.network or '',
+            'assignment': posting.assignment or '',
+            'tax_code': posting.tax_code or '',
+            'account_assignment': posting.account_assignment or '',
+            'year_month': posting.year_month or '',
+        }
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            data['document_number'] = f"DOC_{data['id'][:8]}_HOL"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for transaction {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Debug: Log the final data
+        logger.info(f"Final data - Amount: {data['amount']}, Document Number: '{data['document_number']}'")
+        
+        # Extract holiday analysis metadata
+        holiday_name = holiday_item.get('holiday_name', '')
+        holiday_type = holiday_item.get('holiday_type', '')
+        risk_score = holiday_item.get('risk_score', 0)
+        
+        # If risk score is 0, calculate it based on holiday characteristics
+        if risk_score == 0:
+            risk_score = self._calculate_holiday_risk_score(posting, holiday_name, holiday_type)
+        
+        # Add holiday analysis metadata
+        data.update({
+            'holiday_name': holiday_name,
+            'holiday_type': holiday_type,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'analysis_type': 'Holiday Analysis Results'
+        })
+        
+        logger.info(f"Holiday analysis - Name: {holiday_name}, Type: {holiday_type}, Risk Score: {risk_score}, Risk Level: {data['risk_level']}")
+        
+        return data
+    
+    def _get_sap_posting_data_for_closing_entries(self, posting, closing_item):
+        """Get SAPGLPosting data with closing entries analysis metadata"""
+        if not posting:
+            return None
+        
+        # Debug: Log the closing item structure
+        logger.info(f"Processing closing entry item: {closing_item}")
+        logger.info(f"Closing item keys: {list(closing_item.keys()) if closing_item else 'None'}")
+        
+        # Debug: Log SAPGLPosting data
+        logger.info(f"SAPGLPosting data - ID: {posting.id}, User: {posting.user_name}, Amount: {posting.amount_local_currency}, Document: {posting.document_number}")
+        
+        # Get all fields from SAPGLPosting
+        data = {
+            'id': str(posting.id),
+            'user': posting.user_name,
+            'amount': float(posting.amount_local_currency),
+            'account': posting.gl_account,
+            'posting_date': posting.posting_date.isoformat() if posting.posting_date else '',
+            'document_number': posting.document_number or '',
+            'gl_account': posting.gl_account,
+            'transaction_type': posting.transaction_type,
+            'text': posting.text or '',
+            'document_date': posting.document_date.isoformat() if posting.document_date else '',
+            'document_type': posting.document_type or '',
+            'profit_center': posting.profit_center or '',
+            'cost_center': posting.cost_center or '',
+            'clearing_document': posting.clearing_document or '',
+            'segment': posting.segment or '',
+            'plant': posting.plant or '',
+            'material': posting.material or '',
+            'fiscal_year': posting.fiscal_year,
+            'posting_period': posting.posting_period,
+            'local_currency': posting.local_currency,
+            'offsetting_account': posting.offsetting_account or '',
+            'entry_date': posting.entry_date.isoformat() if posting.entry_date else '',
+            'invoice_reference': posting.invoice_reference or '',
+            'billing_document': posting.billing_document or '',
+            'sales_document': posting.sales_document or '',
+            'purchasing_document': posting.purchasing_document or '',
+            'order_number': posting.order_number or '',
+            'asset_number': posting.asset_number or '',
+            'network': posting.network or '',
+            'assignment': posting.assignment or '',
+            'tax_code': posting.tax_code or '',
+            'account_assignment': posting.account_assignment or '',
+            'year_month': posting.year_month or '',
+        }
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            data['document_number'] = f"DOC_{data['id'][:8]}_CL"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for transaction {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Debug: Log the final data
+        logger.info(f"Final data - Amount: {data['amount']}, Document Number: '{data['document_number']}'")
+        
+        # Extract closing entries analysis metadata
+        closing_entry_type = closing_item.get('closing_entry_type', '')
+        risk_score = closing_item.get('risk_score', 0)
+        
+        # If risk score is 0, calculate it based on closing entry characteristics
+        if risk_score == 0:
+            risk_score = self._calculate_closing_entry_risk_score(posting, closing_entry_type)
+        
+        # Add closing entries analysis metadata
+        data.update({
+            'closing_entry_type': closing_entry_type,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'analysis_type': 'Closing Entries Analysis Results'
+        })
+        
+        logger.info(f"Closing entry analysis - Type: {closing_entry_type}, Risk Score: {risk_score}, Risk Level: {data['risk_level']}")
+        
+        return data
+    
+    def _get_sap_posting_data_for_unusual_days(self, posting, unusual_item):
+        """Get SAPGLPosting data with unusual days analysis metadata"""
+        if not posting:
+            return None
+        
+        # Debug: Log the unusual days item structure
+        logger.info(f"Processing unusual days item: {unusual_item}")
+        logger.info(f"Unusual days item keys: {list(unusual_item.keys()) if unusual_item else 'None'}")
+        
+        # Debug: Log SAPGLPosting data
+        logger.info(f"SAPGLPosting data - ID: {posting.id}, User: {posting.user_name}, Amount: {posting.amount_local_currency}, Document: {posting.document_number}")
+        
+        # Get all fields from SAPGLPosting
+        data = {
+            'id': str(posting.id),
+            'user': posting.user_name,
+            'amount': float(posting.amount_local_currency),
+            'account': posting.gl_account,
+            'posting_date': posting.posting_date.isoformat() if posting.posting_date else '',
+            'document_number': posting.document_number or '',
+            'gl_account': posting.gl_account,
+            'transaction_type': posting.transaction_type,
+            'text': posting.text or '',
+            'document_date': posting.document_date.isoformat() if posting.document_date else '',
+            'document_type': posting.document_type or '',
+            'profit_center': posting.profit_center or '',
+            'cost_center': posting.cost_center or '',
+            'clearing_document': posting.clearing_document or '',
+            'segment': posting.segment or '',
+            'plant': posting.plant or '',
+            'material': posting.material or '',
+            'fiscal_year': posting.fiscal_year,
+            'posting_period': posting.posting_period,
+            'local_currency': posting.local_currency,
+            'offsetting_account': posting.offsetting_account or '',
+            'entry_date': posting.entry_date.isoformat() if posting.entry_date else '',
+            'invoice_reference': posting.invoice_reference or '',
+            'billing_document': posting.billing_document or '',
+            'sales_document': posting.sales_document or '',
+            'purchasing_document': posting.purchasing_document or '',
+            'order_number': posting.order_number or '',
+            'asset_number': posting.asset_number or '',
+            'network': posting.network or '',
+            'assignment': posting.assignment or '',
+            'tax_code': posting.tax_code or '',
+            'account_assignment': posting.account_assignment or '',
+            'year_month': posting.year_month or '',
+        }
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            data['document_number'] = f"DOC_{data['id'][:8]}_UD"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for transaction {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Debug: Log the final data
+        logger.info(f"Final data - Amount: {data['amount']}, Document Number: '{data['document_number']}'")
+        
+        # Extract unusual days analysis metadata
+        unusual_days_type = unusual_item.get('unusual_days_type', '')
+        risk_score = unusual_item.get('risk_score', 0)
+        
+        # If risk score is 0, calculate it based on unusual days characteristics
+        if risk_score == 0:
+            risk_score = self._calculate_unusual_days_risk_score(posting, unusual_days_type)
+        
+        # Add unusual days analysis metadata
+        data.update({
+            'unusual_days_type': unusual_days_type,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'analysis_type': 'Unusual Days Analysis Results'
+        })
+        
+        logger.info(f"Unusual days analysis - Type: {unusual_days_type}, Risk Score: {risk_score}, Risk Level: {data['risk_level']}")
+        
+        return data
+    
+    def _get_sap_posting_data_for_user(self, posting, user_item):
+        """Get SAPGLPosting data with user analysis metadata"""
+        if not posting:
+            return None
+        
+        # Debug: Log the user item structure
+        logger.info(f"Processing user item: {user_item}")
+        logger.info(f"User item keys: {list(user_item.keys()) if user_item else 'None'}")
+        
+        # Debug: Log SAPGLPosting data
+        logger.info(f"SAPGLPosting data - ID: {posting.id}, User: {posting.user_name}, Amount: {posting.amount_local_currency}, Document: {posting.document_number}")
+        
+        # Get all fields from SAPGLPosting
+        data = {
+            'id': str(posting.id),
+            'user': posting.user_name,
+            'amount': float(posting.amount_local_currency),
+            'account': posting.gl_account,
+            'posting_date': posting.posting_date.isoformat() if posting.posting_date else '',
+            'document_number': posting.document_number or '',
+            'gl_account': posting.gl_account,
+            'transaction_type': posting.transaction_type,
+            'text': posting.text or '',
+            'document_date': posting.document_date.isoformat() if posting.document_date else '',
+            'document_type': posting.document_type or '',
+            'profit_center': posting.profit_center or '',
+            'cost_center': posting.cost_center or '',
+            'clearing_document': posting.clearing_document or '',
+            'segment': posting.segment or '',
+            'plant': posting.plant or '',
+            'material': posting.material or '',
+            'fiscal_year': posting.fiscal_year,
+            'posting_period': posting.posting_period,
+            'local_currency': posting.local_currency,
+            'offsetting_account': posting.offsetting_account or '',
+            'entry_date': posting.entry_date.isoformat() if posting.entry_date else '',
+            'invoice_reference': posting.invoice_reference or '',
+            'billing_document': posting.billing_document or '',
+            'sales_document': posting.sales_document or '',
+            'purchasing_document': posting.purchasing_document or '',
+            'order_number': posting.order_number or '',
+            'asset_number': posting.asset_number or '',
+            'network': posting.network or '',
+            'assignment': posting.assignment or '',
+            'tax_code': posting.tax_code or '',
+            'account_assignment': posting.account_assignment or '',
+            'year_month': posting.year_month or '',
+        }
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            data['document_number'] = f"DOC_{data['id'][:8]}_USR"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for transaction {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Debug: Log the final data
+        logger.info(f"Final data - Amount: {data['amount']}, Document Number: '{data['document_number']}'")
+        
+        # Extract user analysis metadata
+        user_anomaly_type = user_item.get('user_anomaly_type', '')
+        risk_score = user_item.get('risk_score', 0)
+        
+        # If risk score is 0, calculate it based on user anomaly characteristics
+        if risk_score == 0:
+            risk_score = self._calculate_user_anomaly_risk_score(posting, user_anomaly_type)
+        
+        # Add user analysis metadata
+        data.update({
+            'user_anomaly_type': user_anomaly_type,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'analysis_type': 'User Analysis Results'
+        })
+        
+        logger.info(f"User analysis - Type: {user_anomaly_type}, Risk Score: {risk_score}, Risk Level: {data['risk_level']}")
+        
+        return data
+    
+    def _calculate_duplicate_risk_score(self, posting, duplicate_item):
+        """Calculate risk score for duplicate transactions based on characteristics"""
+        risk_score = 0
+        
+        # Base risk for being a duplicate
+        risk_score += 30
+        
+        # Amount-based risk (higher amounts = higher risk)
+        amount = float(posting.amount_local_currency)
+        if amount > 10000000:  # > 10M
+            risk_score += 40
+        elif amount > 1000000:  # > 1M
+            risk_score += 30
+        elif amount > 100000:  # > 100K
+            risk_score += 20
+        elif amount > 10000:  # > 10K
+            risk_score += 10
+        
+        # User-based risk (check if same user)
+        if 'transaction1' in duplicate_item and 'transaction2' in duplicate_item:
+            user1 = duplicate_item['transaction1'].get('user', '')
+            user2 = duplicate_item['transaction2'].get('user', '')
+            if user1 == user2 and user1 == posting.user_name:
+                risk_score += 15  # Same user duplicates are higher risk
+        
+        # Account-based risk (check if same account)
+        if 'transaction1' in duplicate_item and 'transaction2' in duplicate_item:
+            account1 = duplicate_item['transaction1'].get('account', '')
+            account2 = duplicate_item['transaction2'].get('account', '')
+            if account1 == account2 and account1 == posting.gl_account:
+                risk_score += 10  # Same account duplicates are higher risk
+        
+        # Date-based risk (same posting date)
+        if 'transaction1' in duplicate_item and 'transaction2' in duplicate_item:
+            date1 = duplicate_item['transaction1'].get('posting_date', '')
+            date2 = duplicate_item['transaction2'].get('posting_date', '')
+            if date1 == date2 and date1 == posting.posting_date.isoformat():
+                risk_score += 10  # Same date duplicates are higher risk
+        
+        # Cap the risk score at 100
+        return min(risk_score, 100)
+    
+    def _create_fallback_data(self, transaction_data, duplicate_item, position):
+        """Create fallback data from duplicate analysis when SAPGLPosting is not found"""
+        if not transaction_data:
+            return None
+        
+        logger.info(f"Creating fallback data for position {position} from transaction data: {transaction_data}")
+        
+        # Create data from duplicate analysis transaction data
+        data = {
+            'id': transaction_data.get('id', ''),
+            'user': transaction_data.get('user', ''),
+            'amount': float(transaction_data.get('amount', 0)),
+            'account': transaction_data.get('account', ''),
+            'posting_date': transaction_data.get('posting_date', ''),
+            'document_number': transaction_data.get('document_number', ''),
+            'gl_account': transaction_data.get('gl_account', transaction_data.get('account', '')),
+            'transaction_type': transaction_data.get('transaction_type', 'DEBIT'),
+            'text': transaction_data.get('text', ''),
+            'document_date': transaction_data.get('document_date', ''),
+            'document_type': transaction_data.get('document_type', ''),
+            'profit_center': transaction_data.get('profit_center', ''),
+            'cost_center': transaction_data.get('cost_center', ''),
+            'clearing_document': transaction_data.get('clearing_document', ''),
+            'segment': transaction_data.get('segment', ''),
+            'plant': transaction_data.get('plant', ''),
+            'material': transaction_data.get('material', ''),
+            'fiscal_year': transaction_data.get('fiscal_year', 2025),
+            'posting_period': transaction_data.get('posting_period', 12),
+            'local_currency': transaction_data.get('local_currency', 'SAR'),
+            'offsetting_account': transaction_data.get('offsetting_account', ''),
+            'entry_date': transaction_data.get('entry_date', ''),
+            'invoice_reference': transaction_data.get('invoice_reference', ''),
+            'billing_document': transaction_data.get('billing_document', ''),
+            'sales_document': transaction_data.get('sales_document', ''),
+            'purchasing_document': transaction_data.get('purchasing_document', ''),
+            'order_number': transaction_data.get('order_number', ''),
+            'asset_number': transaction_data.get('asset_number', ''),
+            'network': transaction_data.get('network', ''),
+            'assignment': transaction_data.get('assignment', ''),
+            'tax_code': transaction_data.get('tax_code', ''),
+            'account_assignment': transaction_data.get('account_assignment', ''),
+            'year_month': transaction_data.get('year_month', ''),
+        }
+        
+        # Extract risk score and other metadata
+        risk_score = duplicate_item.get('risk_score', 0)
+        group_id = duplicate_item.get('group_id', '')
+        duplicate_type = duplicate_item.get('duplicate_type', '')
+        duplicate_count = duplicate_item.get('duplicate_count', 0)
+        total_amount = duplicate_item.get('total_amount', 0)
+        
+        # If risk score is 0, calculate it
+        if risk_score == 0:
+            risk_score = self._calculate_duplicate_risk_score_fallback(transaction_data, duplicate_item)
+        
+        # Add duplicate analysis metadata
+        data.update({
+            'duplicate_group_id': group_id,
+            'duplicate_type': duplicate_type,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'duplicate_count': duplicate_count,
+            'total_amount_in_group': total_amount,
+            'analysis_type': 'Duplicate Analysis Results',
+            'transaction_position': f'Transaction {position}'
+        })
+        
+        # Populate missing fields
+        if not data['duplicate_group_id']:
+            data['duplicate_group_id'] = f"GROUP_{data['id']}_{position}"
+        if not data['duplicate_type']:
+            data['duplicate_type'] = 'type_1'
+        if data['duplicate_count'] == 0:
+            transaction_count = 0
+            if 'transaction1' in duplicate_item:
+                transaction_count += 1
+            if 'transaction2' in duplicate_item:
+                transaction_count += 1
+            if 'additional_transactions' in duplicate_item:
+                transaction_count += len(duplicate_item['additional_transactions'])
+            data['duplicate_count'] = transaction_count
+        
+        logger.info(f"Fallback data created - Amount: {data['amount']}, Document Number: '{data['document_number']}', Risk Score: {data['risk_score']}")
+        
+        return data
+    
+    def _calculate_duplicate_risk_score_fallback(self, transaction_data, duplicate_item):
+        """Calculate risk score for fallback data"""
+        risk_score = 0
+        
+        # Base risk for being a duplicate
+        risk_score += 30
+        
+        # Amount-based risk
+        amount = float(transaction_data.get('amount', 0))
+        if amount > 10000000:  # > 10M
+            risk_score += 40
+        elif amount > 1000000:  # > 1M
+            risk_score += 30
+        elif amount > 100000:  # > 100K
+            risk_score += 20
+        elif amount > 10000:  # > 10K
+            risk_score += 10
+        
+        # User-based risk
+        if 'transaction1' in duplicate_item and 'transaction2' in duplicate_item:
+            user1 = duplicate_item['transaction1'].get('user', '')
+            user2 = duplicate_item['transaction2'].get('user', '')
+            if user1 == user2 and user1 == transaction_data.get('user', ''):
+                risk_score += 15
+        
+        # Account-based risk
+        if 'transaction1' in duplicate_item and 'transaction2' in duplicate_item:
+            account1 = duplicate_item['transaction1'].get('account', '')
+            account2 = duplicate_item['transaction2'].get('account', '')
+            if account1 == account2 and account1 == transaction_data.get('account', ''):
+                risk_score += 10
+        
+        # Date-based risk
+        if 'transaction1' in duplicate_item and 'transaction2' in duplicate_item:
+            date1 = duplicate_item['transaction1'].get('posting_date', '')
+            date2 = duplicate_item['transaction2'].get('posting_date', '')
+            if date1 == date2 and date1 == transaction_data.get('posting_date', ''):
+                risk_score += 10
+        
+        return min(risk_score, 100)
+    
+    def _calculate_backdated_risk_score(self, posting, backdated_days):
+        """Calculate risk score for backdated transactions"""
+        risk_score = 0
+        
+        # Base risk for being backdated
+        risk_score += 20
+        
+        # Days-based risk (more days = higher risk)
+        if backdated_days > 30:
+            risk_score += 40
+        elif backdated_days > 15:
+            risk_score += 30
+        elif backdated_days > 7:
+            risk_score += 20
+        elif backdated_days > 3:
+            risk_score += 10
+        
+        # Amount-based risk
+        amount = float(posting.amount_local_currency)
+        if amount > 10000000:  # > 10M
+            risk_score += 30
+        elif amount > 1000000:  # > 1M
+            risk_score += 20
+        elif amount > 100000:  # > 100K
+            risk_score += 10
+        
+        # User-based risk (check for patterns)
+        # This could be enhanced with user history analysis
+        
+        return min(risk_score, 100)
+    
+    def _calculate_holiday_risk_score(self, posting, holiday_name, holiday_type):
+        """Calculate risk score for holiday transactions"""
+        risk_score = 0
+        
+        # Base risk for holiday posting
+        risk_score += 25
+        
+        # Holiday type risk
+        if holiday_type and 'public' in holiday_type.lower():
+            risk_score += 20  # Public holidays are higher risk
+        elif holiday_type and 'observance' in holiday_type.lower():
+            risk_score += 15  # Observances are medium risk
+        
+        # Amount-based risk
+        amount = float(posting.amount_local_currency)
+        if amount > 10000000:  # > 10M
+            risk_score += 35
+        elif amount > 1000000:  # > 1M
+            risk_score += 25
+        elif amount > 100000:  # > 100K
+            risk_score += 15
+        elif amount > 10000:  # > 10K
+            risk_score += 10
+        
+        # Time-based risk (posting on holiday itself)
+        # This could be enhanced with actual holiday date checking
+        
+        return min(risk_score, 100)
+    
+    def _calculate_closing_entry_risk_score(self, posting, closing_entry_type):
+        """Calculate risk score for closing entry transactions"""
+        risk_score = 0
+        
+        # Base risk for closing entries
+        risk_score += 15
+        
+        # Closing entry type risk
+        if closing_entry_type and 'adjustment' in closing_entry_type.lower():
+            risk_score += 25  # Adjustments are higher risk
+        elif closing_entry_type and 'reversal' in closing_entry_type.lower():
+            risk_score += 20  # Reversals are medium-high risk
+        elif closing_entry_type and 'accrual' in closing_entry_type.lower():
+            risk_score += 15  # Accruals are medium risk
+        
+        # Amount-based risk
+        amount = float(posting.amount_local_currency)
+        if amount > 10000000:  # > 10M
+            risk_score += 30
+        elif amount > 1000000:  # > 1M
+            risk_score += 20
+        elif amount > 100000:  # > 100K
+            risk_score += 15
+        elif amount > 10000:  # > 10K
+            risk_score += 10
+        
+        # Period-based risk (end of period closings)
+        if posting.posting_period in [12, 16]:  # Year-end or quarter-end
+            risk_score += 10
+        
+        return min(risk_score, 100)
+    
+    def _calculate_unusual_days_risk_score(self, posting, unusual_days_type):
+        """Calculate risk score for unusual days transactions"""
+        risk_score = 0
+        
+        # Base risk for unusual days posting
+        risk_score += 20
+        
+        # Unusual days type risk
+        if unusual_days_type and 'weekend' in unusual_days_type.lower():
+            risk_score += 25  # Weekend postings are higher risk
+        elif unusual_days_type and 'holiday' in unusual_days_type.lower():
+            risk_score += 30  # Holiday postings are highest risk
+        elif unusual_days_type and 'late_night' in unusual_days_type.lower():
+            risk_score += 20  # Late night postings are medium-high risk
+        
+        # Amount-based risk
+        amount = float(posting.amount_local_currency)
+        if amount > 10000000:  # > 10M
+            risk_score += 35
+        elif amount > 1000000:  # > 1M
+            risk_score += 25
+        elif amount > 100000:  # > 100K
+            risk_score += 15
+        elif amount > 10000:  # > 10K
+            risk_score += 10
+        
+        # Time-based risk (could be enhanced with actual time checking)
+        
+        return min(risk_score, 100)
+    
+    def _calculate_user_anomaly_risk_score(self, posting, user_anomaly_type):
+        """Calculate risk score for user anomaly transactions"""
+        risk_score = 0
+        
+        # Base risk for user anomalies
+        risk_score += 20
+        
+        # User anomaly type risk
+        if user_anomaly_type and 'unusual_pattern' in user_anomaly_type.lower():
+            risk_score += 25  # Unusual patterns are higher risk
+        elif user_anomaly_type and 'high_frequency' in user_anomaly_type.lower():
+            risk_score += 20  # High frequency postings are medium-high risk
+        elif user_anomaly_type and 'amount_spike' in user_anomaly_type.lower():
+            risk_score += 30  # Amount spikes are highest risk
+        elif user_anomaly_type and 'time_anomaly' in user_anomaly_type.lower():
+            risk_score += 15  # Time anomalies are medium risk
+        
+        # Amount-based risk
+        amount = float(posting.amount_local_currency)
+        if amount > 10000000:  # > 10M
+            risk_score += 35
+        elif amount > 1000000:  # > 1M
+            risk_score += 25
+        elif amount > 100000:  # > 100K
+            risk_score += 15
+        elif amount > 10000:  # > 10K
+            risk_score += 10
+        
+        # User-based risk (could be enhanced with user history analysis)
+        # This could check for user's typical posting patterns, amounts, etc.
+        
+        return min(risk_score, 100)
+    
+    def _create_fallback_data_for_user(self, user_item, position):
+        """Create fallback data from user analysis when SAPGLPosting is not found"""
+        if not user_item:
+            return None
+        
+        logger.info(f"Creating fallback data for user anomaly position {position} from user item: {user_item}")
+        
+        # For user anomalies, we need to create representative data since they don't have individual transaction IDs
+        user_name = user_item.get('user', '')
+        user_anomaly_type = user_item.get('anomaly_type', '')
+        user_details = user_item.get('details', '')
+        
+        # Create representative data
+        data = {
+            'id': f"USER_{user_name}_{position}",  # Generate a representative ID
+            'user': user_name,
+            'amount': 0.0,  # Will be calculated from user's total transactions
+            'account': 'USER_ANOMALY',
+            'posting_date': '',  # Will be set to current date
+            'document_number': f"DOC_{user_name[:8]}_USR_{position}",
+            'gl_account': 'USER_ANOMALY',
+            'transaction_type': 'DEBIT',
+            'text': user_details,
+            'document_date': '',
+            'document_type': 'USER_ANALYSIS',
+            'profit_center': '',
+            'cost_center': '',
+            'clearing_document': '',
+            'segment': '',
+            'plant': '',
+            'material': '',
+            'fiscal_year': 2025,
+            'posting_period': 12,
+            'local_currency': 'SAR',
+            'offsetting_account': '',
+            'entry_date': '',
+            'invoice_reference': '',
+            'billing_document': '',
+            'sales_document': '',
+            'purchasing_document': '',
+            'order_number': '',
+            'asset_number': '',
+            'network': '',
+            'assignment': '',
+            'tax_code': '',
+            'account_assignment': '',
+            'year_month': '',
+        }
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            data['document_number'] = f"DOC_{data['id'][:8]}_USR_{position}"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for user anomaly {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Extract user analysis metadata
+        user_anomaly_type = user_item.get('anomaly_type', '')
+        risk_score = user_item.get('risk_score', 0)
+        
+        # If risk score is 0, calculate it based on user anomaly characteristics
+        if risk_score == 0:
+            risk_score = self._calculate_user_anomaly_risk_score_fallback(user_item, user_anomaly_type)
+        
+        # Add user analysis metadata
+        data.update({
+            'user_anomaly_type': user_anomaly_type,
+            'user_anomaly_details': user_details,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'analysis_type': 'User Analysis Results'
+        })
+        
+        logger.info(f"Fallback user data created - Amount: {data['amount']}, Document Number: '{data['document_number']}', Risk Score: {data['risk_score']}")
+        
+        return data
+    
+    def _calculate_user_anomaly_risk_score_fallback(self, user_item, user_anomaly_type):
+        """Calculate risk score for fallback user anomaly data"""
+        risk_score = 0
+        
+        # Base risk for user anomalies
+        risk_score += 20
+        
+        # User anomaly type risk
+        if user_anomaly_type and 'unusual_pattern' in user_anomaly_type.lower():
+            risk_score += 25  # Unusual patterns are higher risk
+        elif user_anomaly_type and 'high_frequency' in user_anomaly_type.lower():
+            risk_score += 20  # High frequency postings are medium-high risk
+        elif user_anomaly_type and 'amount_spike' in user_anomaly_type.lower():
+            risk_score += 30  # Amount spikes are highest risk
+        elif user_anomaly_type and 'time_anomaly' in user_anomaly_type.lower():
+            risk_score += 15  # Time anomalies are medium risk
+        
+        # Amount-based risk
+        amount = float(user_item.get('amount', 0))
+        if amount > 10000000:  # > 10M
+            risk_score += 35
+        elif amount > 1000000:  # > 1M
+            risk_score += 25
+        elif amount > 100000:  # > 100K
+            risk_score += 15
+        elif amount > 10000:  # > 10K
+            risk_score += 10
+        
+        return min(risk_score, 100)
+    
+    def _calculate_backdated_risk_score_fallback(self, backdated_item, backdated_days):
+        """Calculate risk score for fallback backdated data"""
+        risk_score = 20  # Base risk for backdated entries
+        
+        # Add risk based on backdated days
+        if backdated_days > 30:
+            risk_score += 40
+        elif backdated_days > 15:
+            risk_score += 30
+        elif backdated_days > 7:
+            risk_score += 20
+        elif backdated_days > 3:
+            risk_score += 10
+        
+        # Add risk based on amount
+        amount = float(backdated_item.get('amount', 0))
+        if amount > 1000000:
+            risk_score += 30
+        elif amount > 500000:
+            risk_score += 20
+        elif amount > 100000:
+            risk_score += 10
+        
+        return min(risk_score, 100)
+    
+    def _calculate_holiday_risk_score_fallback(self, holiday_item, holiday_name, holiday_type):
+        """Calculate risk score for fallback holiday data"""
+        risk_score = 25  # Base risk for holiday entries
+        
+        # Add risk based on holiday type
+        if holiday_type == 'religious':
+            risk_score += 20
+        elif holiday_type == 'national':
+            risk_score += 15
+        
+        # Add risk based on amount
+        amount = float(holiday_item.get('amount', 0))
+        if amount > 1000000:
+            risk_score += 35
+        elif amount > 500000:
+            risk_score += 25
+        elif amount > 100000:
+            risk_score += 15
+        elif amount > 50000:
+            risk_score += 10
+        
+        return min(risk_score, 100)
+    
+    def _calculate_closing_entry_risk_score_fallback(self, closing_item, closing_entry_type):
+        """Calculate risk score for fallback closing entry data"""
+        risk_score = 15  # Base risk for closing entries
+        
+        # Add risk based on closing entry type
+        if closing_entry_type == 'post_close':
+            risk_score += 25
+        elif closing_entry_type == 'closing_adjustment':
+            risk_score += 20
+        elif closing_entry_type == 'provision':
+            risk_score += 15
+        
+        # Add risk based on amount
+        amount = float(closing_item.get('amount', 0))
+        if amount > 1000000:
+            risk_score += 30
+        elif amount > 500000:
+            risk_score += 20
+        elif amount > 100000:
+            risk_score += 10
+        
+        # Add risk based on posting period (month-end)
+        posting_period = closing_item.get('posting_period', 12)
+        if posting_period in [12, 6, 3]:  # Quarter-end or year-end
+            risk_score += 10
+        
+        return min(risk_score, 100)
+    
+    def _calculate_unusual_days_risk_score_fallback(self, unusual_item, unusual_days_type):
+        """Calculate risk score for fallback unusual days data"""
+        risk_score = 20  # Base risk for unusual days entries
+        
+        # Add risk based on unusual days type
+        if unusual_days_type == 'weekend':
+            risk_score += 30
+        elif unusual_days_type == 'friday':
+            risk_score += 25
+        elif unusual_days_type == 'saturday':
+            risk_score += 20
+        
+        # Add risk based on amount
+        amount = float(unusual_item.get('amount', 0))
+        if amount > 1000000:
+            risk_score += 35
+        elif amount > 500000:
+            risk_score += 25
+        elif amount > 100000:
+            risk_score += 15
+        elif amount > 50000:
+            risk_score += 10
+        
+        return min(risk_score, 100)
+    
+    def _create_fallback_data_for_backdated(self, backdated_item, position):
+        """Create fallback data from backdated analysis when SAPGLPosting is not found"""
+        if not backdated_item:
+            return None
+        
+        logger.info(f"Creating fallback data for backdated item position {position} from backdated item: {backdated_item}")
+        
+        # Create data from backdated analysis item data
+        data = {
+            'id': backdated_item.get('id', ''),
+            'user': backdated_item.get('user', ''),
+            'amount': float(backdated_item.get('amount', 0)),
+            'account': backdated_item.get('account', ''),
+            'posting_date': backdated_item.get('posting_date', ''),
+            'document_number': backdated_item.get('document_number', ''),
+            'gl_account': backdated_item.get('gl_account', backdated_item.get('account', '')),
+            'transaction_type': backdated_item.get('transaction_type', 'DEBIT'),
+            'text': backdated_item.get('text', ''),
+            'document_date': backdated_item.get('document_date', ''),
+            'document_type': backdated_item.get('document_type', ''),
+            'profit_center': backdated_item.get('profit_center', ''),
+            'cost_center': backdated_item.get('cost_center', ''),
+            'clearing_document': backdated_item.get('clearing_document', ''),
+            'segment': backdated_item.get('segment', ''),
+            'plant': backdated_item.get('plant', ''),
+            'material': backdated_item.get('material', ''),
+            'fiscal_year': backdated_item.get('fiscal_year', 2025),
+            'posting_period': backdated_item.get('posting_period', 12),
+            'local_currency': backdated_item.get('local_currency', 'SAR'),
+            'offsetting_account': backdated_item.get('offsetting_account', ''),
+            'entry_date': backdated_item.get('entry_date', ''),
+            'invoice_reference': backdated_item.get('invoice_reference', ''),
+            'billing_document': backdated_item.get('billing_document', ''),
+            'sales_document': backdated_item.get('sales_document', ''),
+            'purchasing_document': backdated_item.get('purchasing_document', ''),
+            'order_number': backdated_item.get('order_number', ''),
+            'asset_number': backdated_item.get('asset_number', ''),
+            'network': backdated_item.get('network', ''),
+            'assignment': backdated_item.get('assignment', ''),
+            'tax_code': backdated_item.get('tax_code', ''),
+            'account_assignment': backdated_item.get('account_assignment', ''),
+            'year_month': backdated_item.get('year_month', ''),
+        }
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            data['document_number'] = f"DOC_{data['id'][:8]}_BD_{position}"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for backdated item {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Extract backdated analysis metadata
+        backdated_days = backdated_item.get('backdated_days', 0)
+        risk_score = backdated_item.get('risk_score', 0)
+        
+        # If risk score is 0, calculate it based on backdated characteristics
+        if risk_score == 0:
+            risk_score = self._calculate_backdated_risk_score_fallback(backdated_item, backdated_days)
+        
+        # Add backdated analysis metadata
+        data.update({
+            'backdated_days': backdated_days,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'analysis_type': 'Backdated Analysis Results'
+        })
+        
+        logger.info(f"Fallback backdated data created - Amount: {data['amount']}, Document Number: '{data['document_number']}', Risk Score: {data['risk_score']}")
+        
+        return data
+    
+    def _create_fallback_data_for_holiday(self, holiday_item, position):
+        """Create fallback data from holiday analysis when SAPGLPosting is not found"""
+        if not holiday_item:
+            return None
+        
+        logger.info(f"Creating fallback data for holiday item position {position} from holiday item: {holiday_item}")
+        
+        # Create data from holiday analysis item data
+        data = {
+            'id': holiday_item.get('id', ''),
+            'user': holiday_item.get('user', ''),
+            'amount': float(holiday_item.get('amount', 0)),
+            'account': holiday_item.get('account', ''),
+            'posting_date': holiday_item.get('posting_date', ''),
+            'document_number': holiday_item.get('document_number', ''),
+            'gl_account': holiday_item.get('gl_account', holiday_item.get('account', '')),
+            'transaction_type': holiday_item.get('transaction_type', 'DEBIT'),
+            'text': holiday_item.get('text', ''),
+            'document_date': holiday_item.get('document_date', ''),
+            'document_type': holiday_item.get('document_type', ''),
+            'profit_center': holiday_item.get('profit_center', ''),
+            'cost_center': holiday_item.get('cost_center', ''),
+            'clearing_document': holiday_item.get('clearing_document', ''),
+            'segment': holiday_item.get('segment', ''),
+            'plant': holiday_item.get('plant', ''),
+            'material': holiday_item.get('material', ''),
+            'fiscal_year': holiday_item.get('fiscal_year', 2025),
+            'posting_period': holiday_item.get('posting_period', 12),
+            'local_currency': holiday_item.get('local_currency', 'SAR'),
+            'offsetting_account': holiday_item.get('offsetting_account', ''),
+            'entry_date': holiday_item.get('entry_date', ''),
+            'invoice_reference': holiday_item.get('invoice_reference', ''),
+            'billing_document': holiday_item.get('billing_document', ''),
+            'sales_document': holiday_item.get('sales_document', ''),
+            'purchasing_document': holiday_item.get('purchasing_document', ''),
+            'order_number': holiday_item.get('order_number', ''),
+            'asset_number': holiday_item.get('asset_number', ''),
+            'network': holiday_item.get('network', ''),
+            'assignment': holiday_item.get('assignment', ''),
+            'tax_code': holiday_item.get('tax_code', ''),
+            'account_assignment': holiday_item.get('account_assignment', ''),
+            'year_month': holiday_item.get('year_month', ''),
+        }
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            data['document_number'] = f"DOC_{data['id'][:8]}_HOL_{position}"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for holiday item {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Extract holiday analysis metadata
+        holiday_name = holiday_item.get('holiday_name', '')
+        holiday_type = holiday_item.get('holiday_type', '')
+        risk_score = holiday_item.get('risk_score', 0)
+        
+        # If risk score is 0, calculate it based on holiday characteristics
+        if risk_score == 0:
+            risk_score = self._calculate_holiday_risk_score_fallback(holiday_item, holiday_name, holiday_type)
+        
+        # Add holiday analysis metadata
+        data.update({
+            'holiday_name': holiday_name,
+            'holiday_type': holiday_type,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'analysis_type': 'Holiday Analysis Results'
+        })
+        
+        logger.info(f"Fallback holiday data created - Amount: {data['amount']}, Document Number: '{data['document_number']}', Risk Score: {data['risk_score']}")
+        
+        return data
+    
+    def _create_fallback_data_for_closing_entries(self, closing_item, position):
+        """Create fallback data from closing entries analysis when SAPGLPosting is not found"""
+        if not closing_item:
+            return None
+        
+        logger.info(f"Creating fallback data for closing entry item position {position} from closing item: {closing_item}")
+        
+        # Create data from closing entries analysis item data
+        data = {
+            'id': closing_item.get('id', ''),
+            'user': closing_item.get('user', ''),
+            'amount': float(closing_item.get('amount', 0)),
+            'account': closing_item.get('account', ''),
+            'posting_date': closing_item.get('posting_date', ''),
+            'document_number': closing_item.get('document_number', ''),
+            'gl_account': closing_item.get('gl_account', closing_item.get('account', '')),
+            'transaction_type': closing_item.get('transaction_type', 'DEBIT'),
+            'text': closing_item.get('text', ''),
+            'document_date': closing_item.get('document_date', ''),
+            'document_type': closing_item.get('document_type', ''),
+            'profit_center': closing_item.get('profit_center', ''),
+            'cost_center': closing_item.get('cost_center', ''),
+            'clearing_document': closing_item.get('clearing_document', ''),
+            'segment': closing_item.get('segment', ''),
+            'plant': closing_item.get('plant', ''),
+            'material': closing_item.get('material', ''),
+            'fiscal_year': closing_item.get('fiscal_year', 2025),
+            'posting_period': closing_item.get('posting_period', 12),
+            'local_currency': closing_item.get('local_currency', 'SAR'),
+            'offsetting_account': closing_item.get('offsetting_account', ''),
+            'entry_date': closing_item.get('entry_date', ''),
+            'invoice_reference': closing_item.get('invoice_reference', ''),
+            'billing_document': closing_item.get('billing_document', ''),
+            'sales_document': closing_item.get('sales_document', ''),
+            'purchasing_document': closing_item.get('purchasing_document', ''),
+            'order_number': closing_item.get('order_number', ''),
+            'asset_number': closing_item.get('asset_number', ''),
+            'network': closing_item.get('network', ''),
+            'assignment': closing_item.get('assignment', ''),
+            'tax_code': closing_item.get('tax_code', ''),
+            'account_assignment': closing_item.get('account_assignment', ''),
+            'year_month': closing_item.get('year_month', ''),
+        }
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            data['document_number'] = f"DOC_{data['id'][:8]}_CL_{position}"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for closing entry item {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Extract closing entries analysis metadata
+        closing_entry_type = closing_item.get('closing_entry_type', '')
+        risk_score = closing_item.get('risk_score', 0)
+        
+        # If risk score is 0, calculate it based on closing entry characteristics
+        if risk_score == 0:
+            risk_score = self._calculate_closing_entry_risk_score_fallback(closing_item, closing_entry_type)
+        
+        # Add closing entries analysis metadata
+        data.update({
+            'closing_entry_type': closing_entry_type,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'analysis_type': 'Closing Entries Analysis Results'
+        })
+        
+        logger.info(f"Fallback closing entry data created - Amount: {data['amount']}, Document Number: '{data['document_number']}', Risk Score: {data['risk_score']}")
+        
+        return data
+    
+    def _create_fallback_data_for_unusual_days(self, unusual_item, position):
+        """Create fallback data from unusual days analysis when SAPGLPosting is not found"""
+        if not unusual_item:
+            return None
+        
+        logger.info(f"Creating fallback data for unusual days item position {position} from unusual item: {unusual_item}")
+        
+        # Create data from unusual days analysis item data
+        data = {
+            'id': unusual_item.get('id', ''),
+            'user': unusual_item.get('user', ''),
+            'amount': float(unusual_item.get('amount', 0)),
+            'account': unusual_item.get('account', ''),
+            'posting_date': unusual_item.get('posting_date', ''),
+            'document_number': unusual_item.get('document_number', ''),
+            'gl_account': unusual_item.get('gl_account', unusual_item.get('account', '')),
+            'transaction_type': unusual_item.get('transaction_type', 'DEBIT'),
+            'text': unusual_item.get('text', ''),
+            'document_date': unusual_item.get('document_date', ''),
+            'document_type': unusual_item.get('document_type', ''),
+            'profit_center': unusual_item.get('profit_center', ''),
+            'cost_center': unusual_item.get('cost_center', ''),
+            'clearing_document': unusual_item.get('clearing_document', ''),
+            'segment': unusual_item.get('segment', ''),
+            'plant': unusual_item.get('plant', ''),
+            'material': unusual_item.get('material', ''),
+            'fiscal_year': unusual_item.get('fiscal_year', 2025),
+            'posting_period': unusual_item.get('posting_period', 12),
+            'local_currency': unusual_item.get('local_currency', 'SAR'),
+            'offsetting_account': unusual_item.get('offsetting_account', ''),
+            'entry_date': unusual_item.get('entry_date', ''),
+            'invoice_reference': unusual_item.get('invoice_reference', ''),
+            'billing_document': unusual_item.get('billing_document', ''),
+            'sales_document': unusual_item.get('sales_document', ''),
+            'purchasing_document': unusual_item.get('purchasing_document', ''),
+            'order_number': unusual_item.get('order_number', ''),
+            'asset_number': unusual_item.get('asset_number', ''),
+            'network': unusual_item.get('network', ''),
+            'assignment': unusual_item.get('assignment', ''),
+            'tax_code': unusual_item.get('tax_code', ''),
+            'account_assignment': unusual_item.get('account_assignment', ''),
+            'year_month': unusual_item.get('year_month', ''),
+        }
+        
+        # Ensure document number and amount are properly formatted
+        if not data['document_number'] or data['document_number'].strip() == '':
+            data['document_number'] = f"DOC_{data['id'][:8]}_UD_{position}"
+            logger.info(f"Generated document number: {data['document_number']}")
+        
+        # Ensure amount is properly formatted
+        try:
+            data['amount'] = float(data['amount'])
+            if data['amount'] == 0:
+                logger.warning(f"Amount is 0 for unusual days item {data['id']}")
+        except (ValueError, TypeError):
+            logger.error(f"Invalid amount format: {data['amount']}")
+            data['amount'] = 0.0
+        
+        # Extract unusual days analysis metadata
+        unusual_days_type = unusual_item.get('unusual_days_type', '')
+        risk_score = unusual_item.get('risk_score', 0)
+        
+        # If risk score is 0, calculate it based on unusual days characteristics
+        if risk_score == 0:
+            risk_score = self._calculate_unusual_days_risk_score_fallback(unusual_item, unusual_days_type)
+        
+        # Add unusual days analysis metadata
+        data.update({
+            'unusual_days_type': unusual_days_type,
+            'risk_score': risk_score,
+            'risk_level': self._get_risk_level(risk_score),
+            'analysis_type': 'Unusual Days Analysis Results'
+        })
+        
+        logger.info(f"Fallback unusual days data created - Amount: {data['amount']}, Document Number: '{data['document_number']}', Risk Score: {data['risk_score']}")
+        
+        return data
+    
+    def _get_risk_level(self, risk_score):
+        """Convert risk score to risk level"""
+        if risk_score >= 90:
+            return 'Critical'
+        elif risk_score >= 70:
+            return 'High'
+        elif risk_score >= 40:
+            return 'Medium'
+        else:
+            return 'Low'
     
     def _export_csv(self, data, data_file, analysis_type):
-        """Export data as CSV"""
+        """Export data as CSV with enhanced formatting"""
         import csv
         from django.http import HttpResponse
+        import uuid
+        from datetime import datetime, date
+        from decimal import Decimal
         
         # Create response
         response = HttpResponse(content_type='text/csv')
-        response['Content-Disposition'] = f'attachment; filename="{data_file.client_name}_{analysis_type}_export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv"'
+        
+        # Set filename based on analysis type
+        if analysis_type == 'duplicate':
+            filename = f"{data_file.client_name}_Duplicate_Analysis_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        elif analysis_type == 'backdated':
+            filename = f"{data_file.client_name}_Backdated_Analysis_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        elif analysis_type == 'holiday':
+            filename = f"{data_file.client_name}_Holiday_Analysis_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        elif analysis_type == 'closing_entries':
+            filename = f"{data_file.client_name}_Closing_Entries_Analysis_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        elif analysis_type == 'unusual_days':
+            filename = f"{data_file.client_name}_Unusual_Days_Analysis_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        elif analysis_type == 'user':
+            filename = f"{data_file.client_name}_User_Analysis_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        else:
+            filename = f"{data_file.client_name}_{analysis_type}_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
         
         if not data:
             return response
@@ -7985,24 +9856,80 @@ class AnalysisExportView(generics.GenericAPIView):
         # Get headers from first record
         headers = list(data[0].keys())
         
+        # Helper function to convert values to CSV-compatible format
+        def convert_value_for_csv(value):
+            """Convert value to CSV-compatible format"""
+            if value is None:
+                return ''
+            elif isinstance(value, (datetime, date)):
+                return value.isoformat() if hasattr(value, 'isoformat') else str(value)
+            elif isinstance(value, uuid.UUID):
+                return str(value)
+            elif isinstance(value, (int, float, Decimal)):
+                # Handle potential Decimal objects from Django ORM
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return str(value)
+            elif isinstance(value, bool):
+                return str(value)
+            elif isinstance(value, (list, dict)):
+                return str(value)
+            elif hasattr(value, '__str__'):
+                return str(value)
+            else:
+                return str(value)
+        
+        # Convert data to CSV-compatible format
+        csv_data = []
+        for record in data:
+            csv_record = {}
+            for header in headers:
+                try:
+                    value = record.get(header, '')
+                    csv_record[header] = convert_value_for_csv(value)
+                except Exception as e:
+                    # Log the specific error and use a safe fallback
+                    logger.warning(f"Error converting value for column {header}: {e}. Value: {record.get(header)}")
+                    csv_record[header] = str(record.get(header, '')) if record.get(header) is not None else ''
+            csv_data.append(csv_record)
+        
         # Write CSV
         writer = csv.DictWriter(response, fieldnames=headers)
         writer.writeheader()
-        writer.writerows(data)
+        writer.writerows(csv_data)
         
         return response
     
     def _export_xlsx(self, data, data_file, analysis_type):
-        """Export data as XLSX"""
+        """Export data as XLSX with enhanced formatting"""
         from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from django.http import HttpResponse
         import io
+        import uuid
+        from datetime import datetime, date
+        from decimal import Decimal
         
         # Create workbook
         wb = Workbook()
         ws = wb.active
-        ws.title = f"{analysis_type.replace('_', ' ').title()}"
+        
+        # Set worksheet title based on analysis type
+        if analysis_type == 'duplicate':
+            ws.title = "Duplicate Analysis Results"
+        elif analysis_type == 'backdated':
+            ws.title = "Backdated Analysis Results"
+        elif analysis_type == 'holiday':
+            ws.title = "Holiday Analysis Results"
+        elif analysis_type == 'closing_entries':
+            ws.title = "Closing Entries Analysis Results"
+        elif analysis_type == 'unusual_days':
+            ws.title = "Unusual Days Analysis Results"
+        elif analysis_type == 'user':
+            ws.title = "User Analysis Results"
+        else:
+            ws.title = f"{analysis_type.replace('_', ' ').title()}"
         
         if not data:
             # Create empty file with headers
@@ -8021,17 +9948,90 @@ class AnalysisExportView(generics.GenericAPIView):
         # Get headers from first record
         headers = list(data[0].keys())
         
+        # Define styles
+        header_font = Font(bold=True, color="FFFFFF", size=12)
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        
+        # Risk level colors
+        risk_critical_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
+        risk_high_fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
+        risk_medium_fill = PatternFill(start_color="FFD93D", end_color="FFD93D", fill_type="solid")
+        risk_low_fill = PatternFill(start_color="6BCF7F", end_color="6BCF7F", fill_type="solid")
+        
         # Write headers
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col, value=header)
-            cell.font = Font(bold=True)
-            cell.fill = PatternFill(start_color="CCCCCC", end_color="CCCCCC", fill_type="solid")
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
         
-        # Write data
+        # Helper function to convert values to Excel-compatible format
+        def convert_value_for_excel(value):
+            """Convert value to Excel-compatible format"""
+            if value is None:
+                return ''
+            elif isinstance(value, (datetime, date)):
+                return value.isoformat() if hasattr(value, 'isoformat') else str(value)
+            elif isinstance(value, uuid.UUID):
+                return str(value)
+            elif isinstance(value, (int, float, Decimal)):
+                # Handle potential Decimal objects from Django ORM
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return str(value)
+            elif isinstance(value, bool):
+                return str(value)
+            elif isinstance(value, (list, dict)):
+                return str(value)
+            elif hasattr(value, '__str__'):
+                return str(value)
+            else:
+                return str(value)
+        
+        # Write data with proper value conversion and conditional formatting
         for row, record in enumerate(data, 2):
             for col, header in enumerate(headers, 1):
-                value = record.get(header, '')
-                ws.cell(row=row, column=col, value=value)
+                try:
+                    value = record.get(header, '')
+                    excel_value = convert_value_for_excel(value)
+                    cell = ws.cell(row=row, column=col, value=excel_value)
+                    
+                    # Apply conditional formatting for risk levels
+                    if header == 'risk_level':
+                        risk_level = str(value).lower()
+                        if 'critical' in risk_level:
+                            cell.fill = risk_critical_fill
+                        elif 'high' in risk_level:
+                            cell.fill = risk_high_fill
+                        elif 'medium' in risk_level:
+                            cell.fill = risk_medium_fill
+                        elif 'low' in risk_level:
+                            cell.fill = risk_low_fill
+                    
+                    # Apply conditional formatting for risk scores
+                    elif 'risk_score' in header.lower() and isinstance(value, (int, float)):
+                        risk_score = float(value)
+                        if risk_score >= 90:
+                            cell.fill = risk_critical_fill
+                        elif risk_score >= 70:
+                            cell.fill = risk_high_fill
+                        elif risk_score >= 40:
+                            cell.fill = risk_medium_fill
+                        else:
+                            cell.fill = risk_low_fill
+                    
+                    # Apply conditional formatting for amounts
+                    elif 'amount' in header.lower() and isinstance(value, (int, float)):
+                        amount = float(value)
+                        if amount > 1000000:  # High value transactions
+                            cell.font = Font(bold=True, color="FF0000")
+                    
+                except Exception as e:
+                    # Log the specific error and use a safe fallback
+                    logger.warning(f"Error converting value for column {header} in row {row}: {e}. Value: {value}")
+                    ws.cell(row=row, column=col, value=str(value) if value is not None else '')
         
         # Auto-adjust column widths
         for column in ws.columns:
@@ -8039,12 +10039,24 @@ class AnalysisExportView(generics.GenericAPIView):
             column_letter = column[0].column_letter
             for cell in column:
                 try:
-                    if len(str(cell.value)) > max_length:
+                    if cell.value is not None and len(str(cell.value)) > max_length:
                         max_length = len(str(cell.value))
                 except:
                     pass
             adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
             ws.column_dimensions[column_letter].width = adjusted_width
+        
+        # Add borders to all cells
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        
+        for row in ws.iter_rows(min_row=1, max_row=len(data) + 1, min_col=1, max_col=len(headers)):
+            for cell in row:
+                cell.border = thin_border
         
         # Create response
         response = HttpResponse(
