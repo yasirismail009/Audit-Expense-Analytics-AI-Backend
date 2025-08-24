@@ -1294,7 +1294,7 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'statistical_calculations': general_analysis.statistical_calculations or {}
                 }
             
-            # Anomaly Statistics - Combine all anomaly types
+            # Anomaly Statistics - Combine all anomaly types using unified structure
             anomaly_stats = {
                 'duplicate_analysis': {},
                 'backdated_analysis': {},
@@ -1303,20 +1303,34 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                 'closing_entries_analysis': {},
                 'holiday_analysis': {},
                 'total_anomalies': 0,
-                'anomaly_types_detected': []
+                'anomaly_types_detected': [],
+                'unified_anomaly_list': []
             }
             
-            # Duplicate Analysis
+            # Duplicate Analysis - Using unified structure
             if duplicate_analysis:
                 try:
-                    duplicate_count = duplicate_analysis.get_duplicate_count()
-                    total_amount = duplicate_analysis.get_total_amount()
-                    risk_distribution = duplicate_analysis.get_risk_distribution()
+                    # Use new unified structure if available
+                    if hasattr(duplicate_analysis, 'anomaly_list') and duplicate_analysis.anomaly_list:
+                        anomaly_list = duplicate_analysis.anomaly_list
+                        duplicate_count = len(anomaly_list)
+                        total_amount = sum(anomaly.get('amount', 0) for anomaly in anomaly_list)
+                        risk_distribution = duplicate_analysis.risk_assessment.get('risk_distribution', {}) if duplicate_analysis.risk_assessment else {}
+                        
+                        # Add to unified anomaly list
+                        anomaly_stats['unified_anomaly_list'].extend(anomaly_list)
+                    else:
+                        # Fallback to legacy structure
+                        duplicate_count = duplicate_analysis.get_duplicate_count()
+                        total_amount = duplicate_analysis.get_total_amount()
+                        risk_distribution = duplicate_analysis.get_risk_distribution()
+                        anomaly_list = []
                 except Exception as e:
                     logger.warning(f"Error getting duplicate analysis data: {e}")
                     duplicate_count = 0
                     total_amount = 0
                     risk_distribution = {}
+                    anomaly_list = []
                 
                 anomaly_stats['duplicate_analysis'] = {
                     'analysis_id': str(duplicate_analysis.id),
@@ -1324,7 +1338,11 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'duplicate_count': duplicate_count,
                     'total_amount': total_amount,
                     'risk_distribution': risk_distribution,
-                    'analysis_info': duplicate_analysis.analysis_info or {}
+                    'analysis_summary': duplicate_analysis.analysis_summary or {},
+                    'anomaly_list': anomaly_list,
+                    'chart_data': duplicate_analysis.chart_data or {},
+                    'audit_recommendations': duplicate_analysis.audit_recommendations or {},
+                    'compliance_assessment': duplicate_analysis.compliance_assessment or {}
                 }
                 anomaly_stats['total_anomalies'] += duplicate_count
                 anomaly_stats['anomaly_types_detected'].append('duplicate')
@@ -1469,14 +1487,20 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
             
             response_data['anomaly_statistics'] = anomaly_stats
             
-            # Chart Data - Combine chart data from all analyses
+            # Chart Data - Combine chart data from all analyses using unified structure
             chart_data = {
                 'overall_charts': {},
                 'risk_charts': {},
                 'anomaly_charts': {},
                 'temporal_charts': {},
                 'user_charts': {},
-                'account_charts': {}
+                'account_charts': {},
+                'unified_charts': {
+                    'amount_charts': {},
+                    'account_charts': {},
+                    'user_charts': {},
+                    'date_charts': {}
+                }
             }
             
             # Overall Analysis Chart Data
@@ -1491,15 +1515,30 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'risk_trends': risk_document.risk_distributions.get('risk_trends_chart', {})
                 }
             
-            # Anomaly Chart Data
-            if duplicate_analysis and duplicate_analysis.chart_data:
-                chart_data['anomaly_charts']['duplicate_charts'] = duplicate_analysis.chart_data
+            # Unified Chart Data from all analyses
+            all_analyses = [
+                ('duplicate', duplicate_analysis),
+                ('backdated', backdated_analysis),
+                ('user', user_analysis),
+                ('unusual_days', unusual_days_analysis),
+                ('closing_entries', closing_entries_analysis),
+                ('holiday', holiday_analysis)
+            ]
             
-            if backdated_analysis and backdated_analysis.chart_data:
-                chart_data['anomaly_charts']['backdated_charts'] = backdated_analysis.chart_data
-            
-            if holiday_analysis and holiday_analysis.chart_data:
-                chart_data['anomaly_charts']['holiday_charts'] = holiday_analysis.chart_data
+            for analysis_name, analysis in all_analyses:
+                if analysis and hasattr(analysis, 'chart_data') and analysis.chart_data:
+                    # Extract unified chart data
+                    if 'amount_charts' in analysis.chart_data:
+                        chart_data['unified_charts']['amount_charts'][f'{analysis_name}_amount'] = analysis.chart_data['amount_charts']
+                    if 'account_charts' in analysis.chart_data:
+                        chart_data['unified_charts']['account_charts'][f'{analysis_name}_account'] = analysis.chart_data['account_charts']
+                    if 'user_charts' in analysis.chart_data:
+                        chart_data['unified_charts']['user_charts'][f'{analysis_name}_user'] = analysis.chart_data['user_charts']
+                    if 'date_charts' in analysis.chart_data:
+                        chart_data['unified_charts']['date_charts'][f'{analysis_name}_date'] = analysis.chart_data['date_charts']
+                    
+                    # Legacy chart data for backward compatibility
+                    chart_data['anomaly_charts'][f'{analysis_name}_charts'] = analysis.chart_data
             
             # User Analysis Chart Data
             if user_analysis and user_analysis.chart_data:

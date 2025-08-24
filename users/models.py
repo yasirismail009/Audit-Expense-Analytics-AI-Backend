@@ -1,6 +1,8 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.utils import timezone
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 import uuid
 
 
@@ -10,6 +12,10 @@ class User(AbstractUser):
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.EmailField(unique=True, help_text='User email address')
+    
+    # Use email as the username field
+    USERNAME_FIELD = 'email'
+    REQUIRED_FIELDS = ['username']  # username is still required but not used for login
     phone_number = models.CharField(max_length=15, blank=True, null=True, help_text='User phone number')
     date_of_birth = models.DateField(blank=True, null=True, help_text='User date of birth')
     profile_picture = models.ImageField(upload_to='profile_pictures/', blank=True, null=True, help_text='User profile picture')
@@ -197,3 +203,18 @@ class PasswordResetRequest(models.Model):
     def is_valid(self):
         """Check if reset request is valid"""
         return not self.is_used and not self.is_expired and timezone.now() < self.expires_at
+
+
+# Signal to automatically create UserProfile when User is created
+@receiver(post_save, sender=User)
+def create_user_profile(sender, instance, created, **kwargs):
+    """Create UserProfile when User is created"""
+    if created:
+        UserProfile.objects.create(user=instance)
+
+
+@receiver(post_save, sender=User)
+def save_user_profile(sender, instance, **kwargs):
+    """Save UserProfile when User is saved"""
+    if hasattr(instance, 'profile'):
+        instance.profile.save()

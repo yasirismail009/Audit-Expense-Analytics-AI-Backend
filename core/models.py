@@ -3,6 +3,204 @@ from django.core.validators import MinValueValidator, MaxValueValidator
 from decimal import Decimal
 import uuid
 from django.utils import timezone
+from django.core.cache import cache
+from django.db.models import JSONField
+import json
+
+# ============================================================================
+# BASE CLASSES FOR INHERITANCE
+# ============================================================================
+
+class BaseAnalysisResult(models.Model):
+    """Base model for all analysis results with unified structure"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File reference
+    data_file = models.ForeignKey('DataFile', on_delete=models.CASCADE, related_name='%(class)s_analyses', help_text='Reference to the data file')
+    
+    # Analysis metadata
+    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
+    analysis_type = models.CharField(max_length=50, help_text='Type of analysis performed')
+    analysis_version = models.CharField(max_length=20, default='2.0.0', help_text='Version of analysis algorithm')
+    
+    # Unified analysis results structure
+    analysis_summary = models.JSONField(default=dict, help_text='Summary statistics and key metrics')
+    anomaly_list = models.JSONField(default=list, help_text='Standardized list of anomalies detected')
+    chart_data = models.JSONField(default=dict, help_text='Unified chart data for visualizations')
+    risk_assessment = models.JSONField(default=dict, help_text='Risk assessment and scoring')
+    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
+    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
+    export_data = models.JSONField(default=list, help_text='Export-ready data')
+    
+    # Processing metadata
+    processing_job = models.ForeignKey('FileProcessingJob', on_delete=models.SET_NULL, null=True, blank=True, related_name='%(class)s_results', help_text='Reference to the processing job')
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    
+    # Analysis status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        abstract = True
+        ordering = ['-analysis_date']
+        indexes = [
+            models.Index(fields=['data_file', 'analysis_date']),
+            models.Index(fields=['analysis_type', 'status']),
+            models.Index(fields=['processing_job', 'status']),
+        ]
+    
+    def __str__(self):
+        return f"{self.analysis_type} for {self.data_file.file_name} - {self.analysis_date}"
+    
+    def get_anomaly_count(self):
+        """Get count of anomalies detected"""
+        return len(self.anomaly_list) if self.anomaly_list else 0
+    
+    def get_total_amount(self):
+        """Get total amount involved in anomalies"""
+        if not self.anomaly_list:
+            return Decimal('0.00')
+        return sum(Decimal(str(anomaly.get('amount', 0))) for anomaly in self.anomaly_list)
+    
+    def get_risk_distribution(self):
+        """Get risk level distribution"""
+        if not self.anomaly_list:
+            return {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+        
+        risk_counts = {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+        for anomaly in self.anomaly_list:
+            risk_level = anomaly.get('risk_level', 'low').lower()
+            if risk_level in risk_counts:
+                risk_counts[risk_level] += 1
+        
+        return risk_counts
+    
+    def get_chart_data(self):
+        """Get standardized chart data"""
+        return self.chart_data or {}
+    
+    def get_analysis_summary(self):
+        """Get analysis summary"""
+        return self.analysis_summary or {}
+    
+    def get_audit_recommendations(self):
+        """Get audit recommendations"""
+        return self.audit_recommendations or {}
+    
+    def get_compliance_issues(self):
+        """Get compliance issues"""
+        return self.compliance_assessment.get('compliance_issues', [])
+    
+    def get_high_priority_recommendations(self):
+        """Get high priority recommendations"""
+        return self.audit_recommendations.get('high_priority', [])
+
+class BaseModelTraining(models.Model):
+    """Base model for all ML model training sessions"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Name of the training session')
+    description = models.TextField(blank=True, help_text='Description of the training session')
+    model_type = models.CharField(max_length=50, help_text='Type of model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(default=0, help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    
+    # Training results
+    training_results = models.JSONField(default=dict, help_text='Detailed training results')
+    performance_metrics = models.JSONField(default=dict, help_text='Performance metrics from training')
+    
+    # Training metadata
+    started_at = models.DateTimeField(auto_now_add=True, help_text='When training started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When training completed')
+    training_duration = models.FloatField(default=0.0, help_text='Training duration in seconds')
+    
+    # Status
+    status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed')
+    ], default='PENDING', help_text='Training status')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, help_text='Error message if training failed')
+    
+    class Meta:
+        abstract = True
+        ordering = ['-started_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.status}"
+    
+    def get_training_summary(self):
+        """Get a summary of the training results"""
+        return {
+            'session_name': self.session_name,
+            'model_type': self.model_type,
+            'training_data_size': self.training_data_size,
+            'training_duration': self.training_duration,
+            'status': self.status,
+            'performance_metrics': self.performance_metrics
+        }
+
+class BaseProcessingResult(models.Model):
+    """Base model for processing results with common fields"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File and job references
+    data_file = models.ForeignKey('DataFile', on_delete=models.CASCADE, related_name='%(class)s_results', help_text='Reference to the data file')
+    processing_job = models.ForeignKey('FileProcessingJob', on_delete=models.SET_NULL, null=True, blank=True, related_name='%(class)s_results', help_text='Reference to the processing job')
+    
+    # Processing status
+    processing_status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ], default='PENDING')
+    
+    # Processing metadata
+    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
+    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Analysis algorithm version')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if processing failed')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    processed_at = models.DateTimeField(null=True, blank=True, help_text='When processing was completed')
+    
+    class Meta:
+        abstract = True
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['data_file', 'created_at']),
+            models.Index(fields=['processing_status', 'created_at']),
+        ]
+    
+    def __str__(self):
+        return f"{self.__class__.__name__} for {self.data_file.file_name} ({self.processing_status})"
+
+# ============================================================================
+# EXISTING MODELS
+# ============================================================================
 
 class GLAccount(models.Model):
     """Model to track GL Account details and categorization"""
@@ -475,79 +673,17 @@ class FileProcessingJob(models.Model):
             'completed_at': self.completed_at,
         }
 
-class DuplicateAnalysisResult(models.Model):
-    """Model to store enhanced duplicate analysis results for files"""
+class DuplicateAnalysisResult(BaseAnalysisResult):
+    """Enhanced duplicate analysis results with unified structure"""
     
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File reference
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='duplicate_analyses', help_text='Reference to the data file')
-    
-    # Analysis metadata
-    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
-    analysis_type = models.CharField(max_length=50, default='enhanced_duplicate', help_text='Type of analysis performed')
-    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
-    
-    # Analysis results - stored as JSON for flexibility
-    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total transactions, duplicates, etc.)')
+    # Additional duplicate-specific fields
     duplicate_list = models.JSONField(default=list, help_text='List of duplicate transactions found')
-    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
     breakdowns = models.JSONField(default=dict, help_text='Various breakdowns (by type, user, account, etc.)')
-    slicer_filters = models.JSONField(default=dict, help_text='Slicer filters for dynamic filtering')
-    summary_table = models.JSONField(default=list, help_text='Summary table data')
-    export_data = models.JSONField(default=list, help_text='Export-ready data')
     detailed_insights = models.JSONField(default=dict, help_text='Detailed insights and recommendations')
-    
-    # Additional analysis fields for comprehensive reporting
-    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
-    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
-    
-    # Processing metadata
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='duplicate_results', help_text='Reference to the processing job that generated this analysis')
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    
-    # Analysis status
-    STATUS_CHOICES = [
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
         db_table = 'duplicate_analysis_results'
-        ordering = ['-analysis_date']
-        indexes = [
-            models.Index(fields=['data_file', 'analysis_date']),
-            models.Index(fields=['status', 'analysis_date']),
-            models.Index(fields=['analysis_type']),
-        ]
-    
-    def __str__(self):
-        return f"Duplicate Analysis for {self.data_file.file_name} ({self.analysis_date.strftime('%Y-%m-%d %H:%M')})"
-    
-    def get_analysis_summary(self):
-        """Get a summary of the analysis results"""
-        return {
-            'analysis_id': str(self.id),
-            'file_name': self.data_file.file_name,
-            'file_id': str(self.data_file.id),
-            'analysis_date': self.analysis_date.isoformat(),
-            'analysis_type': self.analysis_type,
-            'status': self.status,
-            'total_duplicates': len(self.duplicate_list),
-            'total_amount': sum(item.get('amount', 0) for item in self.duplicate_list),
-            'processing_duration': self.processing_duration,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat(),
-        }
     
     def get_duplicate_count(self):
         """Get the total number of duplicates found"""
@@ -557,339 +693,33 @@ class DuplicateAnalysisResult(models.Model):
         """Get the total amount involved in duplicates"""
         total = 0
         for item in self.duplicate_list:
-            # Handle the new structure where amounts are in transaction1 and transaction2
             if 'transaction1' in item and 'amount' in item['transaction1']:
                 total += item['transaction1']['amount']
             elif 'amount' in item:
-                # Fallback for old structure
                 total += item['amount']
         return total
-    
-    def get_risk_distribution(self):
-        """Get risk level distribution"""
-        risk_counts = {}
-        for item in self.duplicate_list:
-            risk_score = item.get('risk_score', 0)
-            if risk_score >= 90:
-                risk_level = 'Critical'
-            elif risk_score >= 70:
-                risk_level = 'High'
-            elif risk_score >= 40:
-                risk_level = 'Medium'
-            else:
-                risk_level = 'Low'
-            
-            risk_counts[risk_level] = risk_counts.get(risk_level, 0) + 1
-        
-        return risk_counts
-    
-    def get_compliance_issues(self):
-        """Get compliance issues based on duplicate analysis results"""
-        compliance_issues = []
-        
-        # Check for high-risk duplicates
-        high_risk_duplicates = [item for item in self.duplicate_list if item.get('risk_score', 0) >= 80]
-        if high_risk_duplicates:
-            # Calculate total amount for high-risk duplicates
-            high_risk_amount = 0
-            for item in high_risk_duplicates:
-                if 'transaction1' in item and 'amount' in item['transaction1']:
-                    high_risk_amount += item['transaction1']['amount']
-                elif 'amount' in item:
-                    high_risk_amount += item['amount']
-            
-            compliance_issues.append({
-                'type': 'high_risk_duplicates',
-                'severity': 'HIGH',
-                'description': f'Found {len(high_risk_duplicates)} high-risk duplicate transactions',
-                'count': len(high_risk_duplicates),
-                'total_amount': high_risk_amount
-            })
-        
-        # Check for duplicate percentage
-        total_duplicates = len(self.duplicate_list)
-        if total_duplicates > 0:
-            duplicate_percentage = self.analysis_info.get('duplicate_percentage', 0)
-            if duplicate_percentage > 10:  # More than 10% duplicates
-                compliance_issues.append({
-                    'type': 'high_duplicate_percentage',
-                    'severity': 'MEDIUM',
-                    'description': f'High duplicate percentage: {duplicate_percentage:.2f}%',
-                    'percentage': duplicate_percentage
-                })
-        
-        # Check for large amount duplicates
-        large_amount_duplicates = []
-        large_amount_total = 0
-        for item in self.duplicate_list:
-            amount = 0
-            if 'transaction1' in item and 'amount' in item['transaction1']:
-                amount = item['transaction1']['amount']
-            elif 'amount' in item:
-                amount = item['amount']
-            
-            if amount > 1000000:  # Over 1M SAR
-                large_amount_duplicates.append(item)
-                large_amount_total += amount
-        
-        if large_amount_duplicates:
-            compliance_issues.append({
-                'type': 'large_amount_duplicates',
-                'severity': 'HIGH',
-                'description': f'Found {len(large_amount_duplicates)} duplicate transactions with amounts over 1M SAR',
-                'count': len(large_amount_duplicates),
-                'total_amount': large_amount_total
-            })
-        
-        # Check for user concentration in duplicates
-        user_duplicate_counts = {}
-        for item in self.duplicate_list:
-            # Handle new structure where user is in transaction1
-            if 'transaction1' in item and 'user' in item['transaction1']:
-                user = item['transaction1']['user']
-            elif 'user' in item:
-                user = item['user']
-            else:
-                user = 'Unknown'
-            user_duplicate_counts[user] = user_duplicate_counts.get(user, 0) + 1
-        
-        high_duplicate_users = [user for user, count in user_duplicate_counts.items() if count > 5]
-        if high_duplicate_users:
-            compliance_issues.append({
-                'type': 'user_duplicate_concentration',
-                'severity': 'MEDIUM',
-                'description': f'Users with high duplicate counts: {", ".join(high_duplicate_users)}',
-                'users': high_duplicate_users,
-                'counts': {user: user_duplicate_counts[user] for user in high_duplicate_users}
-            })
-        
-        return compliance_issues
-    
-    def get_high_priority_recommendations(self):
-        """Get high priority recommendations based on duplicate analysis results"""
-        recommendations = []
-        
-        # Check for critical risk duplicates
-        critical_duplicates = [item for item in self.duplicate_list if item.get('risk_score', 0) >= 90]
-        if critical_duplicates:
-            # Calculate total amount for critical duplicates
-            critical_amount = 0
-            for item in critical_duplicates:
-                if 'transaction1' in item and 'amount' in item['transaction1']:
-                    critical_amount += item['transaction1']['amount']
-                elif 'amount' in item:
-                    critical_amount += item['amount']
-            
-            recommendations.append({
-                'priority': 'CRITICAL',
-                'action': 'Immediate investigation required',
-                'description': f'Found {len(critical_duplicates)} critical-risk duplicate transactions',
-                'count': len(critical_duplicates),
-                'total_amount': critical_amount,
-                'recommendation': 'Review and investigate these transactions immediately for potential fraud or errors'
-            })
-        
-        # Check for high-risk duplicates
-        high_risk_duplicates = [item for item in self.duplicate_list if 80 <= item.get('risk_score', 0) < 90]
-        if high_risk_duplicates:
-            # Calculate total amount for high-risk duplicates
-            high_risk_amount = 0
-            for item in high_risk_duplicates:
-                if 'transaction1' in item and 'amount' in item['transaction1']:
-                    high_risk_amount += item['transaction1']['amount']
-                elif 'amount' in item:
-                    high_risk_amount += item['amount']
-            
-            recommendations.append({
-                'priority': 'HIGH',
-                'action': 'Priority investigation',
-                'description': f'Found {len(high_risk_duplicates)} high-risk duplicate transactions',
-                'count': len(high_risk_duplicates),
-                'total_amount': high_risk_amount,
-                'recommendation': 'Investigate these transactions within 48 hours'
-            })
-        
-        # Check for large amount duplicates
-        large_amount_duplicates = []
-        large_amount_total = 0
-        for item in self.duplicate_list:
-            amount = 0
-            if 'transaction1' in item and 'amount' in item['transaction1']:
-                amount = item['transaction1']['amount']
-            elif 'amount' in item:
-                amount = item['amount']
-            
-            if amount > 1000000:  # Over 1M SAR
-                large_amount_duplicates.append(item)
-                large_amount_total += amount
-        
-        if large_amount_duplicates:
-            recommendations.append({
-                'priority': 'HIGH',
-                'action': 'Large amount duplicate review',
-                'description': f'Found {len(large_amount_duplicates)} duplicate transactions with amounts over 1M SAR',
-                'count': len(large_amount_duplicates),
-                'total_amount': large_amount_total,
-                'recommendation': 'Review these large amount duplicates for potential financial statement impact'
-            })
-        
-        # Check for user concentration
-        user_duplicate_counts = {}
-        for item in self.duplicate_list:
-            # Handle new structure where user is in transaction1
-            if 'transaction1' in item and 'user' in item['transaction1']:
-                user = item['transaction1']['user']
-            elif 'user' in item:
-                user = item['user']
-            else:
-                user = 'Unknown'
-            user_duplicate_counts[user] = user_duplicate_counts.get(user, 0) + 1
-        
-        high_duplicate_users = [user for user, count in user_duplicate_counts.items() if count > 10]
-        if high_duplicate_users:
-            recommendations.append({
-                'priority': 'MEDIUM',
-                'action': 'User behavior review',
-                'description': f'Users with excessive duplicates: {", ".join(high_duplicate_users)}',
-                'users': high_duplicate_users,
-                'counts': {user: user_duplicate_counts[user] for user in high_duplicate_users},
-                'recommendation': 'Review user training and system controls for these users'
-            })
-        
-        # Check for duplicate percentage
-        total_duplicates = len(self.duplicate_list)
-        if total_duplicates > 0:
-            duplicate_percentage = self.analysis_info.get('duplicate_percentage', 0)
-            if duplicate_percentage > 15:  # More than 15% duplicates
-                recommendations.append({
-                    'priority': 'HIGH',
-                    'action': 'System control review',
-                    'description': f'Very high duplicate percentage: {duplicate_percentage:.2f}%',
-                    'percentage': duplicate_percentage,
-                    'recommendation': 'Review and strengthen system controls to prevent duplicate entries'
-                })
-            elif duplicate_percentage > 5:  # More than 5% duplicates
-                recommendations.append({
-                    'priority': 'MEDIUM',
-                    'action': 'Process improvement',
-                    'description': f'High duplicate percentage: {duplicate_percentage:.2f}%',
-                    'percentage': duplicate_percentage,
-                    'recommendation': 'Consider process improvements to reduce duplicate entries'
-                })
-        
-        return recommendations
 
-class BackdatedAnalysisResult(models.Model):
-    """Model to store enhanced backdated analysis results for files"""
+class BackdatedAnalysisResult(BaseAnalysisResult):
+    """Enhanced backdated analysis results with unified structure"""
     
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File reference
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='backdated_analyses', help_text='Reference to the data file')
-    
-    # Analysis metadata
-    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
-    analysis_type = models.CharField(max_length=50, default='enhanced_backdated', help_text='Type of analysis performed')
-    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
-    
-    # Analysis results - stored as JSON for flexibility
-    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total backdated entries, amounts, etc.)')
+    # Additional backdated-specific fields
     backdated_entries = models.JSONField(default=list, help_text='List of backdated transactions found')
     backdated_by_document = models.JSONField(default=list, help_text='Backdated entries grouped by document number')
     backdated_by_account = models.JSONField(default=list, help_text='Backdated entries grouped by account')
     backdated_by_user = models.JSONField(default=list, help_text='Backdated entries grouped by user')
-    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
-    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
-    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
-    export_data = models.JSONField(default=list, help_text='Export-ready data')
-    
-    # Processing metadata
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='backdated_results', help_text='Reference to the processing job that generated this analysis')
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    
-    # Analysis status
-    STATUS_CHOICES = [
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
         db_table = 'backdated_analysis_results'
-        ordering = ['-analysis_date']
-        indexes = [
-            models.Index(fields=['data_file', 'analysis_date']),
-            models.Index(fields=['analysis_type', 'status']),
-            models.Index(fields=['processing_job', 'status']),
-        ]
-    
-    def __str__(self):
-        return f"Backdated Analysis for {self.data_file.file_name} - {self.analysis_date}"
-    
-    def get_analysis_summary(self):
-        """Get summary of backdated analysis results"""
-        return {
-            'total_backdated': self.get_backdated_count(),
-            'total_amount': self.get_total_amount(),
-            'risk_distribution': self.get_risk_distribution(),
-            'processing_duration': self.processing_duration,
-            'analysis_date': self.analysis_date.isoformat()
-        }
     
     def get_backdated_count(self):
         """Get count of backdated entries"""
         return len(self.backdated_entries) if self.backdated_entries else 0
-    
-    def get_total_amount(self):
-        """Get total amount of backdated entries"""
-        if not self.backdated_entries:
-            return Decimal('0.00')
-        return sum(Decimal(str(entry.get('amount_local_currency', 0))) for entry in self.backdated_entries)
-    
-    def get_risk_distribution(self):
-        """Get risk distribution of backdated entries"""
-        if not self.backdated_entries:
-            return {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
-        
-        risk_counts = {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
-        for entry in self.backdated_entries:
-            risk_level = entry.get('risk_level', 'low').lower()
-            if risk_level in risk_counts:
-                risk_counts[risk_level] += 1
-        
-        return risk_counts
-    
-    def get_high_priority_recommendations(self):
-        """Get high priority audit recommendations"""
-        return self.audit_recommendations.get('high_priority', [])
-    
-    def get_compliance_issues(self):
-        """Get compliance issues identified"""
-        return self.compliance_assessment.get('compliance_issues', [])
 
-class UserAnalysisResult(models.Model):
-    """Model to store user analysis results for identifying user activity patterns and anomalies"""
+class UserAnalysisResult(BaseAnalysisResult):
+    """Enhanced user analysis results with unified structure"""
     
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File reference
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='user_analyses', help_text='Reference to the data file')
-    
-    # Analysis metadata
-    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
-    analysis_type = models.CharField(max_length=50, default='user_analysis', help_text='Type of analysis performed')
-    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
-    
-    # Analysis results - stored as JSON for flexibility
-    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total users, transactions per user, etc.)')
+    # Additional user-specific fields
     user_transaction_summary = models.JSONField(default=list, help_text='Summary of transactions per user')
     user_debit_analysis = models.JSONField(default=list, help_text='Debit value analysis per user')
     user_account_distribution = models.JSONField(default=list, help_text='Number of unique users per account')
@@ -897,52 +727,10 @@ class UserAnalysisResult(models.Model):
     user_anomalies = models.JSONField(default=list, help_text='List of user anomalies detected')
     user_risk_assessment = models.JSONField(default=dict, help_text='User risk assessment and scoring')
     user_patterns = models.JSONField(default=dict, help_text='User activity patterns and trends')
-    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
-    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
-    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
-    export_data = models.JSONField(default=list, help_text='Export-ready data')
-    
-    # Processing metadata
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='user_results', help_text='Reference to the processing job that generated this analysis')
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    
-    # Analysis status
-    STATUS_CHOICES = [
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
         db_table = 'user_analysis_results'
-        ordering = ['-analysis_date']
-        indexes = [
-            models.Index(fields=['data_file', 'analysis_date']),
-            models.Index(fields=['analysis_type', 'status']),
-            models.Index(fields=['processing_job', 'status']),
-        ]
-    
-    def __str__(self):
-        return f"User Analysis for {self.data_file.file_name} - {self.analysis_date}"
-    
-    def get_analysis_summary(self):
-        """Get summary of user analysis results"""
-        return {
-            'total_users': self.get_total_users(),
-            'total_transactions': self.get_total_transactions(),
-            'anomalies_detected': self.get_anomalies_count(),
-            'high_risk_users': self.get_high_risk_users_count(),
-            'processing_duration': self.processing_duration,
-            'analysis_date': self.analysis_date.isoformat()
-        }
     
     def get_total_users(self):
         """Get total number of unique users"""
@@ -963,258 +751,49 @@ class UserAnalysisResult(models.Model):
         if not self.user_risk_assessment:
             return 0
         
-        # Handle list-based user risk assessment
         if isinstance(self.user_risk_assessment, list):
             return len([user for user in self.user_risk_assessment 
                        if isinstance(user, dict) and user.get('risk_level', 'low') in ['high', 'critical']])
         
-        # Handle dictionary-based user risk assessment (legacy)
         if isinstance(self.user_risk_assessment, dict):
             return len([user for user in self.user_risk_assessment.get('user_risk_scores', []) 
                        if isinstance(user, dict) and user.get('risk_level', 'low') in ['high', 'critical']])
         
         return 0
 
-
-class UnusualDaysAnalysisResult(models.Model):
-    """Model to store Unusual Days Analysis results for identifying weekend and unusual day postings"""
+class UnusualDaysAnalysisResult(BaseAnalysisResult):
+    """Enhanced unusual days analysis results with unified structure"""
     
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File reference
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='unusual_days_analyses', help_text='Reference to the data file')
-    
-    # Analysis metadata
-    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
-    analysis_type = models.CharField(max_length=50, default='unusual_days_analysis', help_text='Type of analysis performed')
-    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
-    
-    # Analysis results - stored as JSON for flexibility
-    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total transactions, weekend postings, etc.)')
+    # Additional unusual days-specific fields
     weekend_postings = models.JSONField(default=list, help_text='List of weekend postings (Friday/Saturday)')
     day_of_week_activity = models.JSONField(default=dict, help_text='Activity patterns by day of week')
     user_day_patterns = models.JSONField(default=list, help_text='User posting patterns by day of week')
     fs_line_day_patterns = models.JSONField(default=list, help_text='FS line activity by day of week')
     unusual_days = models.JSONField(default=list, help_text='List of unusual day patterns detected')
-    risk_assessment = models.JSONField(default=dict, help_text='Risk assessment for unusual days')
-    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
-    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
-    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
-    export_data = models.JSONField(default=list, help_text='Export-ready data')
-    
-    # Processing metadata
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='unusual_days_results', help_text='Reference to the processing job that generated this analysis')
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    
-    # Analysis status
-    STATUS_CHOICES = [
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
         db_table = 'unusual_days_analysis_results'
-        ordering = ['-analysis_date']
-        indexes = [
-            models.Index(fields=['data_file', 'analysis_date']),
-            models.Index(fields=['analysis_type', 'status']),
-            models.Index(fields=['processing_job', 'status']),
-        ]
-    
-    def __str__(self):
-        return f"Unusual Days Analysis for {self.data_file.file_name} - {self.analysis_date}"
-    
-    def get_analysis_summary(self):
-        """Get summary of unusual days analysis results"""
-        return {
-            'total_transactions': self.get_total_transactions(),
-            'weekend_transactions': self.get_weekend_transactions_count(),
-            'unusual_days_detected': self.get_unusual_days_count(),
-            'risk_level': self.get_risk_level(),
-            'processing_duration': self.processing_duration,
-            'analysis_date': self.analysis_date.isoformat()
-        }
-    
-    def get_total_transactions(self):
-        """Get total number of transactions"""
-        return self.analysis_info.get('total_transactions', 0)
     
     def get_weekend_transactions_count(self):
         """Get count of weekend transactions"""
         return len(self.weekend_postings) if self.weekend_postings else 0
     
     def get_unusual_days_count(self):
-        """Get count of unusual days detected"""
+        """Get count of unusual days"""
         return len(self.unusual_days) if self.unusual_days else 0
-    
-    def get_risk_level(self):
-        """Get overall risk level"""
-        if not self.risk_assessment:
-            return 'LOW'
-        return self.risk_assessment.get('risk_level', 'LOW')
-    
-    def get_weekend_risk_score(self):
-        """Get weekend risk score"""
-        if not self.risk_assessment:
-            return 0.0
-        return self.risk_assessment.get('weekend_risk_score', 0.0)
-    
-    def get_unusual_pattern_risk_score(self):
-        """Get unusual pattern risk score"""
-        if not self.risk_assessment:
-            return 0.0
-        return self.risk_assessment.get('unusual_pattern_risk_score', 0.0)
-    
-    def get_high_value_weekend_risk_score(self):
-        """Get high value weekend risk score"""
-        if not self.risk_assessment:
-            return 0.0
-        return self.risk_assessment.get('high_value_weekend_risk_score', 0.0)
-    
-    def get_overall_risk_score(self):
-        """Get overall risk score"""
-        if not self.risk_assessment:
-            return 0.0
-        return self.risk_assessment.get('overall_risk_score', 0.0)
-    
-    def get_recommendations(self):
-        """Get risk-based recommendations"""
-        if not self.risk_assessment:
-            return []
-        return self.risk_assessment.get('recommendations', [])
-    
-    def get_weekend_postings_by_day(self):
-        """Get weekend postings grouped by day"""
-        if not self.weekend_postings:
-            return {}
-        
-        by_day = {}
-        for posting in self.weekend_postings:
-            day_name = posting.get('day_name', 'Unknown')
-            if day_name not in by_day:
-                by_day[day_name] = []
-            by_day[day_name].append(posting)
-        
-        return by_day
-    
-    def get_weekend_postings_by_user(self):
-        """Get weekend postings grouped by user"""
-        if not self.weekend_postings:
-            return {}
-        
-        by_user = {}
-        for posting in self.weekend_postings:
-            user_name = posting.get('user_name', 'Unknown')
-            if user_name not in by_user:
-                by_user[user_name] = []
-            by_user[user_name].append(posting)
-        
-        return by_user
-    
-    def get_high_value_weekend_postings(self, threshold=1000000):
-        """Get high value weekend postings"""
-        if not self.weekend_postings:
-            return []
-        
-        return [posting for posting in self.weekend_postings 
-                if posting.get('amount', 0) > threshold]
-    
-    def get_day_of_week_activity_summary(self):
-        """Get summary of day of week activity"""
-        if not self.day_of_week_activity:
-            return {}
-        
-        summary = {}
-        for day_num, day_data in self.day_of_week_activity.items():
-            summary[day_data.get('day_name', f'Day {day_num}')] = {
-                'total_transactions': day_data.get('total_transactions', 0),
-                'total_amount': day_data.get('total_amount', 0),
-                'is_weekend': day_data.get('is_weekend', False)
-            }
-        
-        return summary
 
-class ClosingEntriesAnalysisResult(models.Model):
-    """Model to store Closing Entries Analysis results for identifying month-end closing transactions"""
+class ClosingEntriesAnalysisResult(BaseAnalysisResult):
+    """Enhanced closing entries analysis results with unified structure"""
     
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File reference
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='closing_entries_analyses', help_text='Reference to the data file')
-    
-    # Analysis metadata
-    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
-    analysis_type = models.CharField(max_length=50, default='closing_entries_analysis', help_text='Type of analysis performed')
-    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
-    
-    # Analysis results - stored as JSON for flexibility
-    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total transactions, closing entries, etc.)')
+    # Additional closing entries-specific fields
     closing_entries = models.JSONField(default=list, help_text='List of closing entries detected')
-    post_close_analysis = models.JSONField(default=dict, help_text='Post-close flag analysis')
-    fs_line_closing = models.JSONField(default=dict, help_text='Closing entries by financial statement line')
-    user_closing = models.JSONField(default=dict, help_text='Closing entries by user')
-    month_end_patterns = models.JSONField(default=dict, help_text='Month-end activity patterns')
-    closing_window_analysis = models.JSONField(default=dict, help_text='Analysis of closing windows')
-    risk_assessment = models.JSONField(default=dict, help_text='Risk assessment for closing entries')
-    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
-    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
+    post_close_entries = models.JSONField(default=list, help_text='List of post-close entries detected')
+    closing_patterns = models.JSONField(default=dict, help_text='Closing entry patterns and trends')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
-    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
-    export_data = models.JSONField(default=list, help_text='Export-ready data')
-    
-    # Processing metadata
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='closing_entries_results', help_text='Reference to the processing job that generated this analysis')
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    
-    # Analysis status
-    STATUS_CHOICES = [
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
         db_table = 'closing_entries_analysis_results'
-        ordering = ['-analysis_date']
-        indexes = [
-            models.Index(fields=['data_file', 'analysis_date']),
-            models.Index(fields=['analysis_type', 'status']),
-            models.Index(fields=['processing_job', 'status']),
-        ]
-    
-    def __str__(self):
-        return f"Closing Entries Analysis for {self.data_file.file_name} - {self.analysis_date}"
-    
-    def get_analysis_summary(self):
-        """Get summary of closing entries analysis results"""
-        return {
-            'total_transactions': self.get_total_transactions(),
-            'closing_entries_count': self.get_closing_entries_count(),
-            'post_close_entries_count': self.get_post_close_entries_count(),
-            'risk_level': self.get_risk_level(),
-            'processing_duration': self.processing_duration,
-            'analysis_date': self.analysis_date.isoformat()
-        }
-    
-    def get_total_transactions(self):
-        """Get total number of transactions"""
-        return self.analysis_info.get('total_transactions', 0)
     
     def get_closing_entries_count(self):
         """Get count of closing entries"""
@@ -1222,70 +801,65 @@ class ClosingEntriesAnalysisResult(models.Model):
     
     def get_post_close_entries_count(self):
         """Get count of post-close entries"""
-        if not self.post_close_analysis:
+        return len(self.post_close_entries) if self.post_close_entries else 0
+
+class HolidayAnalysisResult(BaseAnalysisResult):
+    """Enhanced holiday analysis results with unified structure"""
+    
+    # Additional holiday-specific fields
+    holiday_postings = models.JSONField(default=list, help_text='List of holiday postings detected')
+    holiday_breakdown = models.JSONField(default=list, help_text='Breakdown by holiday type')
+    holiday_patterns = models.JSONField(default=dict, help_text='Holiday posting patterns and trends')
+    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
+    
+    class Meta:
+        db_table = 'holiday_analysis_results'
+    
+    def get_holiday_postings_count(self):
+        """Get count of holiday postings"""
+        return len(self.holiday_postings) if self.holiday_postings else 0
+    
+    def get_holiday_percentage(self):
+        """Get percentage of holiday postings"""
+        if not self.analysis_summary:
             return 0
-        return self.post_close_analysis.get('total_post_close_entries', 0)
+        return self.analysis_summary.get('holiday_percentage', 0)
     
-    def get_risk_level(self):
-        """Get overall risk level"""
-        if not self.risk_assessment:
-            return 'LOW'
-        return self.risk_assessment.get('risk_level', 'LOW')
-    
-    def get_closing_entries_risk_score(self):
-        """Get closing entries risk score"""
-        if not self.risk_assessment:
-            return 0.0
-        return self.risk_assessment.get('closing_entries_risk_score', 0.0)
-    
-    def get_post_close_risk_score(self):
-        """Get post-close risk score"""
-        if not self.risk_assessment:
-            return 0.0
-        return self.risk_assessment.get('post_close_risk_score', 0.0)
-    
-    def get_high_value_post_close_risk_score(self):
-        """Get high value post-close risk score"""
-        if not self.risk_assessment:
-            return 0.0
-        return self.risk_assessment.get('high_value_post_close_risk_score', 0.0)
+    def get_unique_holidays(self):
+        """Get count of unique holidays"""
+        if not self.holiday_breakdown:
+            return 0
+        return len([h for h in self.holiday_breakdown if h and len(h) > 1 and h[1] > 0])
     
     def get_overall_risk_score(self):
         """Get overall risk score"""
         if not self.risk_assessment:
-            return 0.0
-        return self.risk_assessment.get('overall_risk_score', 0.0)
-    
-    def get_recommendations(self):
-        """Get risk-based recommendations"""
-        if not self.risk_assessment:
-            return []
-        return self.risk_assessment.get('recommendations', [])
-    
+            return 0
+        return self.risk_assessment.get('overall_risk_score', 0)
 
+class GeneralAnalysisResult(BaseAnalysisResult):
+    """Enhanced general analysis results with unified structure"""
     
-    def get_post_close_entries_by_fs_line(self):
-        """Get post-close entries grouped by FS line"""
-        if not self.post_close_analysis:
-            return {}
-        return self.post_close_analysis.get('post_close_by_fs_line', {})
+    # Additional general-specific fields
+    trial_balance_summary = models.JSONField(default=dict, help_text='Trial balance summary')
+    gl_account_summaries = models.JSONField(default=list, help_text='GL account summaries')
+    user_summaries = models.JSONField(default=list, help_text='User summaries')
+    statistical_calculations = models.JSONField(default=dict, help_text='Statistical calculations')
+    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
     
-    def get_post_close_entries_by_user(self):
-        """Get post-close entries grouped by user"""
-        if not self.post_close_analysis:
-            return {}
-        return self.post_close_analysis.get('post_close_by_user', {})
+    class Meta:
+        db_table = 'general_analysis_results'
     
-    def get_high_value_post_close_entries(self):
-        """Get high value post-close entries"""
-        if not self.post_close_analysis:
-            return []
-        return self.post_close_analysis.get('high_value_post_close', [])
+    def get_gl_account_summaries_count(self):
+        """Get count of GL account summaries"""
+        return len(self.gl_account_summaries) if self.gl_account_summaries else 0
+    
+    def get_user_summaries_count(self):
+        """Get count of user summaries"""
+        return len(self.user_summaries) if self.user_summaries else 0
 
-class MLModelTraining(models.Model):
+class MLModelTraining(BaseModelTraining):
     """Model to track ML model training sessions and performance"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
     # Training session information
     session_name = models.CharField(max_length=255, help_text='Training session name')
@@ -1370,14 +944,8 @@ class MLModelTraining(models.Model):
 
 
 
-class AnalyticsProcessingResult(models.Model):
+class AnalyticsProcessingResult(BaseProcessingResult):
     """Model to store comprehensive analytics processing results"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File and job references
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='analytics_processing_results', help_text='Reference to the data file')
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='analytics_processing_results', help_text='Reference to the processing job')
     
     # Analytics type
     analytics_type = models.CharField(max_length=50, choices=[
@@ -1464,14 +1032,11 @@ class AnalyticsProcessingResult(models.Model):
             'processed_at': self.processed_at.isoformat() if self.processed_at else None,
         }
 
-class ProcessingJobTracker(models.Model):
+class ProcessingJobTracker(BaseProcessingResult):
     """Model to track overall processing job progress and status"""
     
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # Job references
-    processing_job = models.OneToOneField(FileProcessingJob, on_delete=models.CASCADE, related_name='job_tracker', help_text='Reference to the processing job')
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='job_trackers', help_text='Reference to the data file')
+    # Job references (override the base field to make it OneToOne)
+    processing_job = models.OneToOneField('FileProcessingJob', on_delete=models.CASCADE, related_name='job_tracker', help_text='Reference to the processing job')
     
     # Overall progress tracking
     total_steps = models.IntegerField(default=0, help_text='Total number of processing steps')
@@ -1523,9 +1088,7 @@ class ProcessingJobTracker(models.Model):
     memory_usage_mb = models.FloatField(null=True, blank=True, help_text='Peak memory usage in MB')
     cpu_usage_percent = models.FloatField(null=True, blank=True, help_text='Peak CPU usage percentage')
     
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    # Additional timestamps
     started_at = models.DateTimeField(null=True, blank=True, help_text='When processing started')
     completed_at = models.DateTimeField(null=True, blank=True, help_text='When processing completed')
     
@@ -1605,44 +1168,15 @@ class ProcessingJobTracker(models.Model):
         
         self.save()
 
-class GeneralAnalysisResult(models.Model):
+class GeneralAnalysisResult(BaseAnalysisResult):
     """Model to store general analysis results including trial balance, GL account summaries, and statistical calculations"""
     
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File reference
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='general_analyses', help_text='Reference to the data file')
-    
-    # Analysis metadata
-    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
-    analysis_type = models.CharField(max_length=50, default='general_analysis', help_text='Type of analysis performed')
-    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
-    
-    # General Analysis Results - stored as JSON for flexibility
+    # Additional general-specific fields
     trial_balance_summary = models.JSONField(default=dict, help_text='Trial balance summary (total debits, credits, net)')
     gl_account_summaries = models.JSONField(default=list, help_text='Detailed GL account summaries with debits, credits, balances')
     user_summaries = models.JSONField(default=list, help_text='User activity summaries per GL account')
     statistical_calculations = models.JSONField(default=dict, help_text='Mean, standard deviation, and other statistical measures')
-    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
-    export_data = models.JSONField(default=list, help_text='Export-ready data')
-    
-    # Processing metadata
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='general_results', help_text='Reference to the processing job that generated this analysis')
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    
-    # Analysis status
-    STATUS_CHOICES = [
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
     
     class Meta:
         db_table = 'general_analysis_results'
@@ -1672,45 +1206,15 @@ class GeneralAnalysisResult(models.Model):
             'updated_at': self.updated_at.isoformat(),
         }
 
-class OverallAnalysisResult(models.Model):
+class OverallAnalysisResult(BaseAnalysisResult):
     """Model to store overall analysis results combining all analysis types with risk calculations"""
     
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File reference
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='overall_analyses', help_text='Reference to the data file')
-    
-    # Analysis metadata
-    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
-    analysis_type = models.CharField(max_length=50, default='overall_analysis', help_text='Type of analysis performed')
-    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
-    
-    # Overall Analysis Results - stored as JSON for flexibility
+    # Additional overall-specific fields
     transaction_summary = models.JSONField(default=dict, help_text='Overall transaction summary statistics')
     flagged_transactions = models.JSONField(default=list, help_text='List of all flagged transactions with their flag types')
     flag_summary = models.JSONField(default=dict, help_text='Summary of flags by type (duplicate, backdated, etc.)')
     expense_analysis = models.JSONField(default=dict, help_text='Expense data analysis and categorization')
-    risk_assessment = models.JSONField(default=dict, help_text='Overall risk assessment and scoring')
-    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
-    export_data = models.JSONField(default=list, help_text='Export-ready data')
-    
-    # Processing metadata
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='overall_results', help_text='Reference to the processing job that generated this analysis')
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    
-    # Analysis status
-    STATUS_CHOICES = [
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
     
     class Meta:
         db_table = 'overall_analysis_results'
@@ -1741,13 +1245,8 @@ class OverallAnalysisResult(models.Model):
             'updated_at': self.updated_at.isoformat(),
         }
 
-class RiskScoringDocument(models.Model):
+class RiskScoringDocument(BaseAnalysisResult):
     """Model to store comprehensive risk scoring documentation and methodology"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File reference
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='risk_scoring_documents', help_text='Reference to the data file')
     
     # Document metadata
     document_date = models.DateTimeField(auto_now_add=True, help_text='When the risk scoring document was generated')
@@ -1770,24 +1269,6 @@ class RiskScoringDocument(models.Model):
     low_risk_transactions = models.IntegerField(default=0, help_text='Number of low-risk transactions')
     critical_risk_transactions = models.IntegerField(default=0, help_text='Number of critical-risk transactions')
     overall_risk_score = models.FloatField(default=0.0, help_text='Overall risk score for the dataset')
-    
-    # Processing metadata
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='risk_scoring_documents', help_text='Reference to the processing job that generated this document')
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    
-    # Document status
-    STATUS_CHOICES = [
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if document generation failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
         db_table = 'risk_scoring_documents'
@@ -1846,50 +1327,19 @@ class RiskScoringDocument(models.Model):
         else:
             return 'LOW'
 
-class HolidayAnalysisResult(models.Model):
+class HolidayAnalysisResult(BaseAnalysisResult):
     """Model to store Holiday Analysis results for identifying transactions posted on holidays"""
     
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
-    # File reference
-    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='holiday_analyses', help_text='Reference to the data file')
-    
-    # Analysis metadata
-    analysis_date = models.DateTimeField(auto_now_add=True, help_text='When the analysis was performed')
-    analysis_type = models.CharField(max_length=50, default='holiday_analysis', help_text='Type of analysis performed')
-    analysis_version = models.CharField(max_length=20, default='1.0.0', help_text='Version of analysis algorithm')
-    
-    # Analysis results - stored as JSON for flexibility
-    analysis_info = models.JSONField(default=dict, help_text='General analysis information (total transactions, holiday postings, etc.)')
+    # Additional holiday-specific fields
     holiday_postings = models.JSONField(default=list, help_text='List of transactions posted on holidays')
     holiday_by_fs_line = models.JSONField(default=list, help_text='Holiday postings grouped by financial statement line')
     holiday_by_account = models.JSONField(default=list, help_text='Holiday postings grouped by GL account')
     holiday_by_user = models.JSONField(default=list, help_text='Holiday postings grouped by user')
     holiday_by_holiday_type = models.JSONField(default=dict, help_text='Holiday postings grouped by holiday type')
     gl_activity_by_holiday = models.JSONField(default=dict, help_text='GL activity patterns by holiday')
-    audit_recommendations = models.JSONField(default=dict, help_text='Audit recommendations and priorities')
-    compliance_assessment = models.JSONField(default=dict, help_text='Compliance risk assessment')
+    holiday_breakdown = models.JSONField(default=list, help_text='Breakdown by holiday type')
+    holiday_patterns = models.JSONField(default=dict, help_text='Holiday posting patterns and trends')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
-    chart_data = models.JSONField(default=dict, help_text='Chart data for visualizations')
-    export_data = models.JSONField(default=list, help_text='Export-ready data')
-    
-    # Processing metadata
-    processing_job = models.ForeignKey(FileProcessingJob, on_delete=models.SET_NULL, null=True, blank=True, related_name='holiday_results', help_text='Reference to the processing job that generated this analysis')
-    processing_duration = models.FloatField(null=True, blank=True, help_text='Processing duration in seconds')
-    
-    # Analysis status
-    STATUS_CHOICES = [
-        ('PENDING', 'Pending'),
-        ('PROCESSING', 'Processing'),
-        ('COMPLETED', 'Completed'),
-        ('FAILED', 'Failed'),
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED')
-    error_message = models.TextField(blank=True, null=True, help_text='Error message if analysis failed')
-    
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
         db_table = 'holiday_analysis_results'
@@ -2054,10 +1504,8 @@ class HolidayAnalysisResult(models.Model):
         
         return summary
 
-class RuleBasedModelTraining(models.Model):
+class RuleBasedModelTraining(BaseModelTraining):
     """Model to store Rule-based Model Training results"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
     # Training session information
     session_name = models.CharField(max_length=255, help_text='Name of the training session')
@@ -2125,10 +1573,8 @@ class RuleBasedModelTraining(models.Model):
             return self.performance_metrics['training_accuracy']
         return 0.0
 
-class DuplicateAnalysisModelTraining(models.Model):
+class DuplicateAnalysisModelTraining(BaseModelTraining):
     """Model to store Duplicate Analysis Model Training results"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
     # Training session information
     session_name = models.CharField(max_length=255, help_text='Name of the training session')
@@ -2177,10 +1623,8 @@ class DuplicateAnalysisModelTraining(models.Model):
             'performance_metrics': self.performance_metrics
         }
 
-class BackdatedAnalysisModelTraining(models.Model):
+class BackdatedAnalysisModelTraining(BaseModelTraining):
     """Model to store Backdated Analysis Model Training results"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
     # Training session information
     session_name = models.CharField(max_length=255, help_text='Name of the training session')
@@ -2218,10 +1662,8 @@ class BackdatedAnalysisModelTraining(models.Model):
     def __str__(self):
         return f"{self.session_name} - {self.status}"
 
-class UserAnalysisModelTraining(models.Model):
+class UserAnalysisModelTraining(BaseModelTraining):
     """Model to store User Analysis Model Training results"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
     # Training session information
     session_name = models.CharField(max_length=255, help_text='Name of the training session')
@@ -2259,10 +1701,8 @@ class UserAnalysisModelTraining(models.Model):
     def __str__(self):
         return f"{self.session_name} - {self.status}"
 
-class UnusualDaysAnalysisModelTraining(models.Model):
+class UnusualDaysAnalysisModelTraining(BaseModelTraining):
     """Model to store Unusual Days Analysis Model Training results"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
     # Training session information
     session_name = models.CharField(max_length=255, help_text='Name of the training session')
@@ -2300,10 +1740,8 @@ class UnusualDaysAnalysisModelTraining(models.Model):
     def __str__(self):
         return f"{self.session_name} - {self.status}"
 
-class ClosingEntriesAnalysisModelTraining(models.Model):
+class ClosingEntriesAnalysisModelTraining(BaseModelTraining):
     """Model to store Closing Entries Analysis Model Training results"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
     # Training session information
     session_name = models.CharField(max_length=255, help_text='Name of the training session')
@@ -2341,10 +1779,8 @@ class ClosingEntriesAnalysisModelTraining(models.Model):
     def __str__(self):
         return f"{self.session_name} - {self.status}"
 
-class HolidayAnalysisModelTraining(models.Model):
+class HolidayAnalysisModelTraining(BaseModelTraining):
     """Model to store Holiday Analysis Model Training results"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
     # Training session information
     session_name = models.CharField(max_length=255, help_text='Name of the training session')
@@ -2382,10 +1818,8 @@ class HolidayAnalysisModelTraining(models.Model):
     def __str__(self):
         return f"{self.session_name} - {self.status}"
 
-class OverallRiskAnalysisModelTraining(models.Model):
+class OverallRiskAnalysisModelTraining(BaseModelTraining):
     """Model to store Overall Risk Analysis Model Training results"""
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
     # Training session information
     session_name = models.CharField(max_length=255, help_text='Name of the training session')

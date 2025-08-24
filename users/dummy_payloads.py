@@ -83,29 +83,29 @@ INVALID_EMAIL_FORMAT = {
 # ============================================================================
 
 # Valid login payloads
-VALID_LOGIN_USERNAME = {
-    "username": "john_doe",
+VALID_LOGIN_EMAIL = {
+    "email": "john.doe@example.com",
     "password": "SecurePass123!"
 }
 
-VALID_LOGIN_EMAIL = {
-    "username": "john.doe@example.com",
-    "password": "SecurePass123!"
+VALID_LOGIN_EMAIL_2 = {
+    "email": "jane.smith@company.com",
+    "password": "MySecurePassword456!"
 }
 
 # Invalid login payloads
 INVALID_LOGIN_WRONG_PASSWORD = {
-    "username": "john_doe",
+    "email": "john.doe@example.com",
     "password": "WrongPassword123!"
 }
 
 INVALID_LOGIN_NON_EXISTENT = {
-    "username": "nonexistent_user",
+    "email": "nonexistent@example.com",
     "password": "SecurePass123!"
 }
 
 INVALID_LOGIN_MISSING_CREDENTIALS = {
-    "username": "john_doe"
+    "email": "john.doe@example.com"
     # Missing password
 }
 
@@ -274,9 +274,9 @@ API_TEST_SCENARIOS = {
         "description": "Registration with mismatched passwords"
     },
     "login_success": {
-        "payload": VALID_LOGIN_USERNAME,
+        "payload": VALID_LOGIN_EMAIL,
         "expected_status": 200,
-        "description": "Successful login with username"
+        "description": "Successful login with email"
     },
     "login_failure": {
         "payload": INVALID_LOGIN_WRONG_PASSWORD,
@@ -312,7 +312,7 @@ def get_test_payload(serializer_type, scenario="valid"):
             "edge_case": LONG_USERNAME_PAYLOAD
         },
         "login": {
-            "valid": VALID_LOGIN_USERNAME,
+            "valid": VALID_LOGIN_EMAIL,
             "invalid": INVALID_LOGIN_WRONG_PASSWORD,
             "edge_case": INVALID_LOGIN_NON_EXISTENT
         },

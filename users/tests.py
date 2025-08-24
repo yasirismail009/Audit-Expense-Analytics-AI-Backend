@@ -67,7 +67,7 @@ class UserAPITest(APITestCase):
         )
         
         login_data = {
-            'username': 'testuser',
+            'email': 'test@example.com',
             'password': 'testpass123'
         }
         
@@ -87,7 +87,7 @@ class UserAPITest(APITestCase):
         )
         
         login_data = {
-            'username': 'test@example.com',
+            'email': 'test@example.com',
             'password': 'testpass123'
         }
         
@@ -97,7 +97,7 @@ class UserAPITest(APITestCase):
     def test_invalid_login(self):
         """Test invalid login credentials"""
         login_data = {
-            'username': 'nonexistent',
+            'email': 'nonexistent@example.com',
             'password': 'wrongpass'
         }
         
@@ -111,4 +111,4 @@ class UserAPITest(APITestCase):
         
         response = self.client.post(self.register_url, user_data)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('password', response.data)
+        self.assertIn('non_field_errors', response.data)

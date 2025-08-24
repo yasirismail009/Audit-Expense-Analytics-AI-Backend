@@ -22,6 +22,8 @@ from .models import (
     UserAnalysisModelTraining, UnusualDaysAnalysisModelTraining, ClosingEntriesAnalysisModelTraining,
     HolidayAnalysisModelTraining, OverallRiskAnalysisModelTraining
 )
+from .specialized_analysis_models import AnalysisModelManager
+from .ml_models import MLModelTrainer
 from .analytics import SAPGLAnalyzer
 from .analytics_db_saver import AnalyticsDBSaver, save_analytics_to_db
 from .general_analysis import GeneralAnalyzer
@@ -317,7 +319,15 @@ def run_restructured_analysis(self, job_id):
 @shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
 def run_general_analysis(self, job_id):
     """
-    Run General Analysis and save results to GeneralAnalysisResult table
+    Enhanced General Analysis Task with Comprehensive Statistics and Completeness Tests
+    
+    Provides comprehensive statistical information and completeness tests including:
+    - Total amount, accounts, user, days of transaction statistics
+    - Mean, deviation, and all audit-related statistics
+    - Open and closing balance of each GL account
+    - First transaction of each GL account
+    - Credit and debit transaction counts
+    - Trial balance after last transaction till fiscal year close
     
     Args:
         job_id (str): UUID of the FileProcessingJob to process
@@ -332,47 +342,69 @@ def run_general_analysis(self, job_id):
         job = FileProcessingJob.objects.get(id=job_id)
         data_file = job.data_file
         
-        # Get transactions for this file
-        transactions = SAPGLPosting.objects.filter(
-            document_number__in=data_file.get_transaction_document_numbers()
-        )
+        debug_task_state(task_name, job_id, "JOB_RETRIEVED", f"Processing file: {data_file.file_name}")
+        
+        # Get transactions for this file with optimized query
+        transactions = list(SAPGLPosting.objects.filter(data_file=data_file).select_related().order_by('posting_date'))
         
         debug_task_data(task_name, job_id, "TRANSACTIONS", f"Found {len(transactions)} transactions")
         
-        # Run General Analysis
-        general_analyzer = GeneralAnalyzer()
-        general_results = general_analyzer.run_general_analysis(transactions, data_file, job)
+        if not transactions:
+            debug_task_state(task_name, job_id, "NO_TRANSACTIONS", "No transactions found for analysis")
+            return {'error': 'No transactions found for analysis'}
         
-        # Save to GeneralAnalysisResult table
+        # Enhanced General Analysis with comprehensive statistics and completeness tests
+        analysis_summary = _create_general_analysis_summary(transactions, data_file)
+        completeness_tests = _perform_completeness_tests(transactions, data_file)
+        statistical_analysis = _calculate_comprehensive_statistics(transactions)
+        audit_statistics = _calculate_audit_statistics(transactions)
+        chart_data = _create_general_chart_data(transactions, analysis_summary, completeness_tests)
+        risk_assessment = _create_general_risk_assessment(transactions, completeness_tests)
+        audit_recommendations = _create_general_audit_recommendations(completeness_tests, statistical_analysis)
+        compliance_assessment = _create_general_compliance_assessment(completeness_tests, audit_statistics)
+        export_data = _create_general_export_data(transactions, analysis_summary, completeness_tests, statistical_analysis)
+        
+        # Create standardized anomaly list for completeness issues
+        anomaly_list = _create_completeness_anomalies(completeness_tests, transactions)
+        
+        # Save to database with unified structure
         general_analysis_result = GeneralAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
-            analysis_type='general_analysis',
-            analysis_version='1.0.0',
-            trial_balance_summary=general_results.get('trial_balance_summary', {}),
-            gl_account_summaries=general_results.get('gl_account_summaries', []),
-            user_summaries=general_results.get('user_summaries', []),
-            statistical_calculations=general_results.get('statistical_calculations', {}),
-            chart_data=general_results.get('chart_data', {}),
-            export_data=general_results.get('export_data', []),
-            processing_duration=general_results.get('processing_duration', 0),
+            analysis_type='enhanced_general_analysis',
+            analysis_version='2.0.0',
+            # Unified structure fields
+            analysis_summary=analysis_summary,
+            anomaly_list=anomaly_list,
+            chart_data=chart_data,
+            risk_assessment=risk_assessment,
+            audit_recommendations=audit_recommendations,
+            compliance_assessment=compliance_assessment,
+            export_data=export_data,
+            # Legacy fields for backward compatibility
+            trial_balance_summary=analysis_summary.get('trial_balance', {}),
+            gl_account_summaries=completeness_tests.get('gl_account_balances', []),
+            user_summaries=statistical_analysis.get('user_statistics', {}),
+            statistical_calculations=statistical_analysis,
+            processing_duration=(timezone.now() - start_time).total_seconds(),
             status='COMPLETED'
         )
         
         processing_duration = (timezone.now() - start_time).total_seconds()
         
         debug_task_state(task_name, job_id, "COMPLETED", 
-                        f"General Analysis completed and saved to database in {processing_duration:.2f} seconds")
+                        f"Enhanced General Analysis completed and saved to database in {processing_duration:.2f} seconds")
         
         return {
             'analysis_id': str(general_analysis_result.id),
             'status': 'COMPLETED',
             'processing_duration': processing_duration,
-            'table': 'GeneralAnalysisResult'
+            'table': 'GeneralAnalysisResult',
+            'anomaly_count': len(anomaly_list)
         }
         
     except Exception as e:
-        error_msg = f"Error in General Analysis: {str(e)}"
+        error_msg = f"Error in Enhanced General Analysis: {str(e)}"
         debug_task_exception(task_name, job_id, e, "GENERAL_ANALYSIS_ERROR")
         
         # Save failed result to database
@@ -380,8 +412,8 @@ def run_general_analysis(self, job_id):
             GeneralAnalysisResult.objects.create(
                 data_file=data_file,
                 processing_job=job,
-                analysis_type='general_analysis',
-                analysis_version='1.0.0',
+                analysis_type='enhanced_general_analysis',
+                analysis_version='2.0.0',
                 status='FAILED',
                 error_message=error_msg
             )
@@ -393,10 +425,9 @@ def run_general_analysis(self, job_id):
 @shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
 def run_duplicate_analysis(self, job_id):
     """
-    Rule-based Duplicate Analysis Task
+    Optimized Duplicate Analysis Task with Unified Structure
     
-    Identifies duplicate transactions based on business rules with hierarchical classification.
-    Uses rule-based detection instead of ML models.
+    Identifies duplicate transactions and creates standardized output structure.
     
     Args:
         job_id (str): UUID of the FileProcessingJob to process
@@ -413,90 +444,192 @@ def run_duplicate_analysis(self, job_id):
         
         debug_task_state(task_name, job_id, "JOB_RETRIEVED", f"Processing file: {data_file.file_name}")
         
-        # Get transactions for this file
-        transactions = SAPGLPosting.objects.filter(data_file=data_file)
+        # Get transactions for this file with optimized query
+        transactions = list(SAPGLPosting.objects.filter(data_file=data_file).select_related())
         
         debug_task_data(task_name, job_id, "TRANSACTIONS", f"Found {len(transactions)} transactions")
         
-        # Enhanced Rule-based Duplicate Detection with Single Type Classification
+        # Try to use trained model first
+        model_manager = AnalysisModelManager()
+        duplicate_model = model_manager.get_model('duplicate')
+        
         duplicates = []
-        duplicate_groups = {}
-        processed_transactions = set()  # Track processed transactions to avoid multiple classifications
+        detection_method = 'rule_based'
         
-        # Group transactions by key fields for duplicate detection
-        for i, transaction1 in enumerate(transactions):
-            if transaction1.id in processed_transactions:
-                continue  # Skip if already classified
-                
-            best_duplicate_type = None
-            best_risk_score = 0
-            best_transaction2 = None
-            best_matching_fields = []
+        if duplicate_model.is_trained:
+            debug_task_state(task_name, job_id, "USING_TRAINED_MODEL", "Using trained duplicate detection model")
+            detection_method = 'trained_model'
             
-            # Find the highest priority duplicate type for this transaction
-            for j, transaction2 in enumerate(transactions):
-                if i == j or transaction2.id in processed_transactions:
-                    continue  # Skip self-comparison and already processed transactions
-                
-                duplicate_type, risk_score = _check_duplicate_rules(transaction1, transaction2)
-                
-                if duplicate_type and risk_score > best_risk_score:
-                    best_duplicate_type = duplicate_type
-                    best_risk_score = risk_score
-                    best_transaction2 = transaction2
-                    best_matching_fields = _get_matching_fields(transaction1, transaction2)
+            # Use trained model predictions
+            model_predictions = duplicate_model.predict(transactions)
             
-            # If a duplicate is found, create the record and mark both transactions as processed
-            if best_duplicate_type:
-                duplicate_record = {
-                    'transaction1': {
-                        'id': str(transaction1.id),
-                        'document_number': transaction1.document_number,
-                        'gl_account': transaction1.gl_account,
-                        'user_name': transaction1.user_name,
-                        'posting_date': transaction1.posting_date.isoformat() if transaction1.posting_date else None,
-                        'document_date': transaction1.document_date.isoformat() if transaction1.document_date else None,
-                        'amount': float(transaction1.amount_local_currency),
-                        'source': transaction1.document_type
-                    },
-                    'transaction2': {
-                        'id': str(best_transaction2.id),
-                        'document_number': best_transaction2.document_number,
-                        'gl_account': best_transaction2.gl_account,
-                        'user_name': best_transaction2.user_name,
-                        'posting_date': best_transaction2.posting_date.isoformat() if best_transaction2.posting_date else None,
-                        'document_date': best_transaction2.document_date.isoformat() if best_transaction2.document_date else None,
-                        'amount': float(best_transaction2.amount_local_currency),
-                        'source': best_transaction2.document_type
-                    },
-                    'duplicate_type': best_duplicate_type,
-                    'risk_score': best_risk_score,
-                    'risk_level': _get_duplicate_risk_level(best_risk_score),
-                    'matching_fields': best_matching_fields,
-                    'detection_method': 'rule_based_enhanced'
+            # Convert model predictions to duplicate format
+            for prediction in model_predictions:
+                if prediction.get('duplicate_score', 0) > 0:
+                    # Find the similar transaction(s) - simplified for now
+                    transaction_id = prediction['transaction_id']
+                    transaction = next((t for t in transactions if str(t.id) == transaction_id), None)
+                    
+                    if transaction:
+                        # Find similar transaction based on factors
+                        similar_transaction = find_similar_transaction(transaction, transactions, prediction.get('duplicate_factors', []))
+                        
+                        if similar_transaction:
+                            duplicate_record = {
+                                'transaction1': _serialize_transaction(transaction),
+                                'transaction2': _serialize_transaction(similar_transaction),
+                                'duplicate_type': f"ML Detected - Score: {prediction['duplicate_score']}",
+                                'risk_score': prediction['risk_score'],
+                                'risk_level': prediction['risk_level'],
+                                'matching_fields': prediction.get('duplicate_factors', []),
+                                'detection_method': 'trained_model'
+                            }
+                            duplicates.append(duplicate_record)
+        else:
+            debug_task_state(task_name, job_id, "USING_RULE_BASED", "No trained model available, using rule-based detection")
+            
+            # Fallback to rule-based detection
+            duplicate_groups = {}
+            processed_pairs = set()
+            
+            # Group transactions by key combinations for efficient duplicate detection
+            for i, transaction1 in enumerate(transactions):
+                for j, transaction2 in enumerate(transactions[i+1:], i+1):
+                    pair_key = (min(transaction1.id, transaction2.id), max(transaction1.id, transaction2.id))
+                    if pair_key in processed_pairs:
+                        continue
+                    
+                    # Check for duplicates using optimized rules
+                    duplicate_type, risk_score = _check_duplicate_rules_optimized(transaction1, transaction2)
+                    
+                    if duplicate_type:
+                        if duplicate_type not in duplicate_groups:
+                            duplicate_groups[duplicate_type] = []
+                        
+                        duplicate_record = {
+                            'transaction1': _serialize_transaction(transaction1),
+                            'transaction2': _serialize_transaction(transaction2),
+                            'duplicate_type': duplicate_type,
+                            'risk_score': risk_score,
+                            'risk_level': _get_risk_level(risk_score),
+                            'matching_fields': _get_matching_fields(transaction1, transaction2),
+                            'detection_method': 'rule_based_optimized'
+                        }
+                        
+                        duplicate_groups[duplicate_type].append(duplicate_record)
+                        processed_pairs.add(pair_key)
+            
+            # Flatten duplicate groups
+            for group_duplicates in duplicate_groups.values():
+                duplicates.extend(group_duplicates)
+        
+        # Create standardized analysis structure
+        analysis_summary = {
+            'total_transactions': len(transactions),
+            'total_duplicates': len(duplicates),
+            'duplicate_percentage': (len(duplicates) / len(transactions) * 100) if transactions else 0,
+            'duplicate_types_found': list(duplicate_groups.keys()),
+            'processing_duration': 0
+        }
+        
+        # Create standardized anomaly list
+        anomaly_list = []
+        for duplicate in duplicates:
+            # Create anomaly entries for both transactions
+            for transaction_key in ['transaction1', 'transaction2']:
+                transaction = duplicate[transaction_key]
+                anomaly = {
+                    'id': transaction['id'],
+                    'analysis_type': 'duplicate',
+                    'document_number': transaction['document_number'],
+                    'gl_account': transaction['gl_account'],
+                    'user_name': transaction['user_name'],
+                    'posting_date': transaction['posting_date'],
+                    'document_date': transaction['document_date'],
+                    'amount': transaction['amount'],
+                    'transaction_type': 'DEBIT',  # Default, could be enhanced
+                    'document_type': transaction.get('source', ''),
+                    'risk_score': duplicate['risk_score'],
+                    'risk_level': duplicate['risk_level'],
+                    'detection_method': duplicate['detection_method'],
+                    'confidence_score': 0.85,
+                    'audit_priority': _get_audit_priority(duplicate['risk_score']),
+                    'compliance_impact': _get_compliance_impact(transaction['amount']),
+                    'financial_impact': _get_financial_impact(transaction['amount']),
+                    'duplicate_info': {
+                        'duplicate_type': duplicate['duplicate_type'],
+                        'matching_transaction_id': duplicate['transaction2' if transaction_key == 'transaction1' else 'transaction1']['id']
+                    }
                 }
-                
-                duplicates.append(duplicate_record)
-                
-                # Group by duplicate type
-                if best_duplicate_type not in duplicate_groups:
-                    duplicate_groups[best_duplicate_type] = []
-                duplicate_groups[best_duplicate_type].append(duplicate_record)
-                
-                # Mark both transactions as processed to avoid multiple classifications
-                processed_transactions.add(transaction1.id)
-                processed_transactions.add(best_transaction2.id)
+                anomaly_list.append(anomaly)
         
-        # Calculate analysis statistics
-        total_transactions = len(transactions)
-        duplicate_count = len(duplicates)
-        duplicate_percentage = (duplicate_count / total_transactions * 100) if total_transactions > 0 else 0
+        # Create standardized chart data
+        chart_data = _create_unified_chart_data(transactions, 'Duplicate Analysis')
         
-        # Generate risk assessment
-        risk_assessment = _generate_duplicate_risk_assessment(duplicates, total_transactions)
+        # Create standardized risk assessment
+        risk_assessment = _create_unified_risk_assessment(anomaly_list, len(transactions))
         
-        # Generate audit recommendations
-        audit_recommendations = _generate_duplicate_audit_recommendations(duplicates, duplicate_groups)
+        # Create standardized audit recommendations
+        audit_recommendations = _create_unified_audit_recommendations(anomaly_list, 'duplicate')
+        
+        # Create standardized compliance assessment
+        compliance_assessment = _create_unified_compliance_assessment(anomaly_list, 'duplicate')
+        
+        # Create export data
+        export_data = _create_export_data(anomaly_list)
+        
+        # Save to database with unified structure
+        duplicate_analysis_result = DuplicateAnalysisResult.objects.create(
+            data_file=data_file,
+            processing_job=job,
+            analysis_type='enhanced_duplicate',
+            analysis_version='2.0.0',
+            analysis_summary=analysis_summary,
+            anomaly_list=anomaly_list,
+            chart_data=chart_data,
+            risk_assessment=risk_assessment,
+            audit_recommendations=audit_recommendations,
+            compliance_assessment=compliance_assessment,
+            export_data=export_data,
+            # Legacy fields for backward compatibility
+            duplicate_list=duplicates,
+            analysis_info=analysis_summary,
+            breakdowns=duplicate_groups,
+            processing_duration=(timezone.now() - start_time).total_seconds(),
+            status='COMPLETED'
+        )
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        
+        debug_task_state(task_name, job_id, "COMPLETED", 
+                        f"Duplicate Analysis completed and saved to database in {processing_duration:.2f} seconds")
+        
+        return {
+            'analysis_id': str(duplicate_analysis_result.id),
+            'status': 'COMPLETED',
+            'processing_duration': processing_duration,
+            'table': 'DuplicateAnalysisResult',
+            'anomaly_count': len(anomaly_list)
+        }
+        
+    except Exception as e:
+        error_msg = f"Error in Duplicate Analysis: {str(e)}"
+        debug_task_exception(task_name, job_id, e, "DUPLICATE_ANALYSIS_ERROR")
+        
+        # Save failed result to database
+        try:
+            DuplicateAnalysisResult.objects.create(
+                data_file=data_file,
+                processing_job=job,
+                analysis_type='enhanced_duplicate',
+                analysis_version='2.0.0',
+                status='FAILED',
+                error_message=error_msg
+            )
+        except:
+            pass
+        
+        return {'error': error_msg}
         
         # Generate compliance assessment
         compliance_assessment = {
@@ -562,246 +695,378 @@ def run_duplicate_analysis(self, job_id):
             'error': str(e)
         }
     
-def _check_duplicate_rules(transaction1, transaction2):
-    """
-    Enhanced duplicate detection with single type classification
-    
-    Each transaction can only be classified as one duplicate type (highest priority).
-    Rules are checked in order of priority (Type 6 = highest, Type 1 = lowest).
-    """
-    
-    # Skip if same transaction
-    if transaction1.id == transaction2.id:
-        return None, 0.0
-    
-    # Rule 1: Type 6 - Account + Effective Date + Posted Date + User + Source + Amount (HIGHEST PRIORITY)
+def _check_duplicate_rules_optimized(transaction1, transaction2):
+    """Optimized duplicate detection rules"""
+    # Type 6: Account + Effective Date + Posted Date + User + Source + Amount
     if (transaction1.gl_account == transaction2.gl_account and
         transaction1.document_date == transaction2.document_date and
         transaction1.posting_date == transaction2.posting_date and
         transaction1.user_name == transaction2.user_name and
         transaction1.document_type == transaction2.document_type and
         transaction1.amount_local_currency == transaction2.amount_local_currency):
-        
-        # Additional check for document number similarity
-        doc_similarity = _check_document_similarity(transaction1, transaction2)
-        risk_score = 95.0 + doc_similarity
-        return 'type_6', min(risk_score, 100.0)
+        return 'Type 6 Duplicate', 100
     
-    # Rule 2: Type 5 - Account + Effective Date + Amount
+    # Type 5: Account + Effective Date + Amount
     if (transaction1.gl_account == transaction2.gl_account and
         transaction1.document_date == transaction2.document_date and
         transaction1.amount_local_currency == transaction2.amount_local_currency):
-        
-        # Check if same user (increases risk)
-        user_bonus = 5.0 if transaction1.user_name == transaction2.user_name else 0.0
-        risk_score = 90.0 + user_bonus
-        return 'type_5', min(risk_score, 100.0)
+        return 'Type 5 Duplicate', 90
     
-    # Rule 3: Type 4 - Account + Posted Date + Amount
+    # Type 4: Account + Posted Date + Amount
     if (transaction1.gl_account == transaction2.gl_account and
         transaction1.posting_date == transaction2.posting_date and
         transaction1.amount_local_currency == transaction2.amount_local_currency):
-        
-        # Check if same user and source (increases risk)
-        user_bonus = 3.0 if transaction1.user_name == transaction2.user_name else 0.0
-        source_bonus = 2.0 if transaction1.document_type == transaction2.document_type else 0.0
-        risk_score = 85.0 + user_bonus + source_bonus
-        return 'type_4', min(risk_score, 100.0)
+        return 'Type 4 Duplicate', 85
     
-    # Rule 4: Type 3 - Account + User + Amount
+    # Type 3: Account + User + Amount
     if (transaction1.gl_account == transaction2.gl_account and
         transaction1.user_name == transaction2.user_name and
         transaction1.amount_local_currency == transaction2.amount_local_currency):
-        
-        # Check if same source and date proximity
-        source_bonus = 3.0 if transaction1.document_type == transaction2.document_type else 0.0
-        date_bonus = _check_date_proximity(transaction1, transaction2)
-        risk_score = 80.0 + source_bonus + date_bonus
-        return 'type_3', min(risk_score, 100.0)
+        return 'Type 3 Duplicate', 80
     
-    # Rule 5: Type 2 - Account + Source + Amount
+    # Type 2: Account + Source + Amount
     if (transaction1.gl_account == transaction2.gl_account and
         transaction1.document_type == transaction2.document_type and
         transaction1.amount_local_currency == transaction2.amount_local_currency):
-        
-        # Check if same user and date proximity
-        user_bonus = 3.0 if transaction1.user_name == transaction2.user_name else 0.0
-        date_bonus = _check_date_proximity(transaction1, transaction2)
-        risk_score = 75.0 + user_bonus + date_bonus
-        return 'type_2', min(risk_score, 100.0)
+        return 'Type 2 Duplicate', 75
     
-    # Rule 6: Type 1 - Account + Amount (LOWEST PRIORITY)
+    # Type 1: Account + Amount
     if (transaction1.gl_account == transaction2.gl_account and
         transaction1.amount_local_currency == transaction2.amount_local_currency):
-        
-        # Check multiple factors for risk scoring
-        user_bonus = 3.0 if transaction1.user_name == transaction2.user_name else 0.0
-        source_bonus = 2.0 if transaction1.document_type == transaction2.document_type else 0.0
-        date_bonus = _check_date_proximity(transaction1, transaction2)
-        doc_bonus = _check_document_similarity(transaction1, transaction2)
-        
-        risk_score = 70.0 + user_bonus + source_bonus + date_bonus + doc_bonus
-        return 'type_1', min(risk_score, 100.0)
+        return 'Type 1 Duplicate', 70
     
-    return None, 0.0
-    
-def _check_document_similarity(transaction1, transaction2):
-    """Check similarity between document numbers"""
-    if not transaction1.document_number or not transaction2.document_number:
-        return 0.0
-    
-    doc1 = str(transaction1.document_number).strip()
-    doc2 = str(transaction2.document_number).strip()
-    
-    if doc1 == doc2:
-        return 5.0  # Exact match
-    elif doc1 in doc2 or doc2 in doc1:
-        return 3.0  # Partial match
-    elif len(set(doc1) & set(doc2)) > len(doc1) * 0.7:
-        return 2.0  # Character similarity
-    
-    return 0.0
-
-def _check_date_proximity(transaction1, transaction2):
-    """Check if dates are close to each other (within 7 days)"""
-    try:
-        if transaction1.posting_date and transaction2.posting_date:
-            date_diff = abs((transaction1.posting_date - transaction2.posting_date).days)
-            if date_diff <= 1:
-                return 5.0  # Same or adjacent day
-            elif date_diff <= 3:
-                return 3.0  # Within 3 days
-            elif date_diff <= 7:
-                return 1.0  # Within week
-        elif transaction1.document_date and transaction2.document_date:
-            date_diff = abs((transaction1.document_date - transaction2.document_date).days)
-            if date_diff <= 1:
-                return 5.0
-            elif date_diff <= 3:
-                return 3.0
-            elif date_diff <= 7:
-                return 1.0
-    except:
-        pass
-    
-    return 0.0
-
-def _get_duplicate_risk_level(risk_score):
-    """Get risk level for duplicate transaction"""
-    if risk_score >= 85:
-        return 'Critical'
-    elif risk_score >= 75:
-        return 'High'
-    elif risk_score >= 70:
-        return 'Medium'
-    else:
-        return 'Low'
+    return None, 0
 
 def _get_matching_fields(transaction1, transaction2):
-    """Get list of matching fields between two transactions"""
+    """Get matching fields between two transactions"""
     matching_fields = []
     
     if transaction1.gl_account == transaction2.gl_account:
         matching_fields.append('gl_account')
-    if transaction1.document_date == transaction2.document_date:
-        matching_fields.append('document_date')
-    if transaction1.posting_date == transaction2.posting_date:
-        matching_fields.append('posting_date')
-    if transaction1.user_name == transaction2.user_name:
-        matching_fields.append('user_name')
-    if transaction1.document_type == transaction2.document_type:
-        matching_fields.append('document_type')
     if transaction1.amount_local_currency == transaction2.amount_local_currency:
         matching_fields.append('amount')
+    if transaction1.user_name == transaction2.user_name:
+        matching_fields.append('user_name')
+    if transaction1.posting_date == transaction2.posting_date:
+        matching_fields.append('posting_date')
+    if transaction1.document_date == transaction2.document_date:
+        matching_fields.append('document_date')
+    if transaction1.document_type == transaction2.document_type:
+        matching_fields.append('document_type')
     
     return matching_fields
 
-def _generate_duplicate_risk_assessment(duplicates, total_transactions):
-    """Generate comprehensive risk assessment for duplicate transactions"""
-    if not duplicates:
+def _get_risk_level(risk_score):
+    """Get risk level based on risk score"""
+    if risk_score >= 80:
+        return 'CRITICAL'
+    elif risk_score >= 60:
+        return 'HIGH'
+    elif risk_score >= 40:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
+
+def _get_audit_priority(risk_score):
+    """Get audit priority based on risk score"""
+    if risk_score >= 80:
+        return 'IMMEDIATE'
+    elif risk_score >= 60:
+        return 'HIGH'
+    elif risk_score >= 40:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
+
+def _get_compliance_impact(risk_score):
+    """Get compliance impact based on risk score"""
+    if risk_score >= 80:
+        return 'CRITICAL'
+    elif risk_score >= 60:
+        return 'HIGH'
+    elif risk_score >= 40:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
+
+def _get_financial_impact(amount):
+    """Get financial impact based on amount"""
+    amount_float = float(amount)
+    if amount_float > 1000000:
+        return 'CRITICAL'
+    elif amount_float > 100000:
+        return 'HIGH'
+    elif amount_float > 10000:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
+
+def _create_unified_chart_data(transactions, analysis_type):
+    """Create unified chart data for any analysis type"""
+    if not transactions:
         return {
-            'overall_risk': 'Low',
-            'risk_score': 0,
-            'risk_factors': [],
-            'recommendations': ['No duplicate transactions detected']
+            'amount_charts': {},
+            'account_charts': {},
+            'user_charts': {},
+            'date_charts': {}
         }
     
-    # Calculate risk metrics
-    critical_duplicates = len([d for d in duplicates if d['risk_level'] == 'Critical'])
-    high_duplicates = len([d for d in duplicates if d['risk_level'] == 'High'])
-    total_duplicate_amount = sum(abs(d['transaction1']['amount']) + abs(d['transaction2']['amount']) for d in duplicates)
+    # Amount distribution
+    amount_ranges = [
+        {'min': 0, 'max': 1000, 'label': '0-1K'},
+        {'min': 1000, 'max': 10000, 'label': '1K-10K'},
+        {'min': 10000, 'max': 100000, 'label': '10K-100K'},
+        {'min': 100000, 'max': 1000000, 'label': '100K-1M'},
+        {'min': 1000000, 'max': float('inf'), 'label': '1M+'}
+    ]
     
-    # Determine overall risk
-    if critical_duplicates > 0:
-        overall_risk = 'Critical'
-    elif high_duplicates > len(duplicates) * 0.3:
-        overall_risk = 'High'
-    elif high_duplicates > 0:
-        overall_risk = 'Medium'
-    else:
-        overall_risk = 'Low'
+    amount_distribution = []
+    for range_info in amount_ranges:
+        count = len([t for t in transactions 
+                    if range_info['min'] <= float(t.amount_local_currency) < range_info['max']])
+        amount_distribution.append({
+            'range': range_info['label'],
+            'count': count,
+            'percentage': (count / len(transactions) * 100) if transactions else 0
+        })
+    
+    # Account distribution
+    account_counts = {}
+    for transaction in transactions:
+        account = transaction.gl_account
+        if account not in account_counts:
+            account_counts[account] = {'count': 0, 'amount': 0}
+        account_counts[account]['count'] += 1
+        account_counts[account]['amount'] += float(transaction.amount_local_currency)
+    
+    top_accounts = sorted(account_counts.items(), key=lambda x: x[1]['amount'], reverse=True)[:10]
+    
+    # User distribution
+    user_counts = {}
+    for transaction in transactions:
+        user = transaction.user_name
+        if user not in user_counts:
+            user_counts[user] = {'count': 0, 'amount': 0}
+        user_counts[user]['count'] += 1
+        user_counts[user]['amount'] += float(transaction.amount_local_currency)
+    
+    top_users = sorted(user_counts.items(), key=lambda x: x[1]['amount'], reverse=True)[:10]
+    
+    # Date distribution (monthly)
+    monthly_counts = {}
+    for transaction in transactions:
+        if transaction.posting_date:
+            month_key = transaction.posting_date.strftime('%Y-%m')
+            if month_key not in monthly_counts:
+                monthly_counts[month_key] = {'count': 0, 'amount': 0}
+            monthly_counts[month_key]['count'] += 1
+            monthly_counts[month_key]['amount'] += float(transaction.amount_local_currency)
+    
+    monthly_data = sorted(monthly_counts.items())
     
     return {
-        'overall_risk': overall_risk,
-        'risk_score': (critical_duplicates + high_duplicates) / len(duplicates) * 100 if duplicates else 0,
-        'critical_duplicates': critical_duplicates,
-        'high_duplicates': high_duplicates,
-        'total_duplicate_amount': total_duplicate_amount,
-        'risk_factors': [
-            'Duplicate transactions detected',
-            f'{critical_duplicates} critical duplicates' if critical_duplicates > 0 else None,
-            f'{high_duplicates} high-risk duplicates' if high_duplicates > 0 else None,
-            f'Total duplicate amount: {total_duplicate_amount:,.2f}' if total_duplicate_amount > 0 else None
-        ],
-        'recommendations': [
-            'Review all duplicate transactions for business justification',
-            'Investigate critical and high-risk duplicates',
-            'Verify if duplicates are legitimate business transactions',
-            'Check for system errors or processing issues'
-        ]
+        'amount_charts': {
+            'amount_distribution': {
+                'labels': [item['range'] for item in amount_distribution],
+                'data': [item['count'] for item in amount_distribution],
+                'title': f'{analysis_type} - Amount Distribution'
+            }
+        },
+        'account_charts': {
+            'top_accounts': {
+                'labels': [account for account, _ in top_accounts],
+                'data': [data['amount'] for _, data in top_accounts],
+                'title': f'{analysis_type} - Top Accounts by Amount'
+            }
+        },
+        'user_charts': {
+            'top_users': {
+                'labels': [user for user, _ in top_users],
+                'data': [data['amount'] for _, data in top_users],
+                'title': f'{analysis_type} - Top Users by Amount'
+            }
+        },
+        'date_charts': {
+            'monthly_trend': {
+                'labels': [month for month, _ in monthly_data],
+                'data': [data['count'] for _, data in monthly_data],
+                'title': f'{analysis_type} - Monthly Transaction Trend'
+            }
+        }
     }
 
-def _generate_duplicate_audit_recommendations(duplicates, duplicate_groups):
-    """Generate audit recommendations for duplicate transactions"""
+def _create_unified_risk_assessment(anomaly_list, total_transactions):
+    """Create unified risk assessment"""
+    if not anomaly_list:
+        return {
+            'overall_risk_score': 0,
+            'overall_risk_level': 'LOW',
+            'risk_distribution': {'low': 0, 'medium': 0, 'high': 0, 'critical': 0},
+            'risk_factors': [],
+            'total_anomalies': 0,
+            'anomaly_percentage': 0
+        }
+    
+    # Calculate risk distribution
+    risk_distribution = {'low': 0, 'medium': 0, 'high': 0, 'critical': 0}
+    total_risk_score = 0
+    risk_factors = []
+    
+    for anomaly in anomaly_list:
+        risk_score = anomaly.get('risk_score', 0)
+        risk_level = anomaly.get('risk_level', 'low').lower()
+        risk_distribution[risk_level] = risk_distribution.get(risk_level, 0) + 1
+        total_risk_score += risk_score
+    
+    # Calculate overall risk score
+    overall_risk_score = total_risk_score / len(anomaly_list) if anomaly_list else 0
+    overall_risk_level = _get_risk_level(overall_risk_score)
+    
+    # Identify risk factors
+    high_value_count = len([a for a in anomaly_list if a.get('amount', 0) > 1000000])
+    if high_value_count > 0:
+        risk_factors.append({
+            'factor': 'High-value anomalies',
+            'count': high_value_count,
+            'impact': 'HIGH'
+        })
+    
+    critical_count = risk_distribution.get('critical', 0)
+    if critical_count > 0:
+        risk_factors.append({
+            'factor': 'Critical risk anomalies',
+            'count': critical_count,
+            'impact': 'CRITICAL'
+        })
+    
+    return {
+        'overall_risk_score': overall_risk_score,
+        'overall_risk_level': overall_risk_level,
+        'risk_distribution': risk_distribution,
+        'risk_factors': risk_factors,
+        'total_anomalies': len(anomaly_list),
+        'anomaly_percentage': (len(anomaly_list) / total_transactions * 100) if total_transactions > 0 else 0
+    }
+
+def _create_unified_audit_recommendations(anomaly_list, analysis_type):
+    """Create unified audit recommendations"""
     recommendations = {
-        'priority_recommendations': [],
-        'type_recommendations': [],
-        'general_recommendations': []
+        'high_priority': [],
+        'medium_priority': [],
+        'low_priority': []
     }
     
-    if not duplicates:
-        recommendations['general_recommendations'].append('No duplicate transactions detected - no specific recommendations')
+    if not anomaly_list:
         return recommendations
     
-    # Priority recommendations
-    critical_duplicates = [d for d in duplicates if d['risk_level'] == 'Critical']
-    if critical_duplicates:
-        recommendations['priority_recommendations'].append(
-            f'Investigate {len(critical_duplicates)} critical duplicate transactions'
-        )
+    # High priority recommendations
+    critical_count = len([a for a in anomaly_list if a.get('risk_level') == 'critical'])
+    if critical_count > 0:
+        recommendations['high_priority'].append({
+            'action': 'Immediate investigation required',
+            'description': f'Found {critical_count} critical-risk {analysis_type} anomalies',
+            'priority': 'CRITICAL',
+            'timeline': 'Immediate'
+        })
     
-    high_value_duplicates = [d for d in duplicates if abs(d['transaction1']['amount']) > 100000]
-    if high_value_duplicates:
-        recommendations['priority_recommendations'].append(
-            f'Review {len(high_value_duplicates)} high-value duplicate transactions (>100,000)'
-        )
+    high_value_count = len([a for a in anomaly_list if a.get('amount', 0) > 1000000])
+    if high_value_count > 0:
+        recommendations['high_priority'].append({
+            'action': 'High-value anomaly review',
+            'description': f'Found {high_value_count} high-value {analysis_type} anomalies',
+            'priority': 'HIGH',
+            'timeline': 'Within 48 hours'
+        })
     
-    # Type-specific recommendations
-    for duplicate_type, type_duplicates in duplicate_groups.items():
-        if len(type_duplicates) > 5:
-            recommendations['type_recommendations'].append(
-                f'Review {len(type_duplicates)} {duplicate_type} duplicates'
-            )
+    # Medium priority recommendations
+    if len(anomaly_list) > 10:
+        recommendations['medium_priority'].append({
+            'action': 'Systematic review',
+            'description': f'Review {len(anomaly_list)} {analysis_type} anomalies for patterns',
+            'priority': 'MEDIUM',
+            'timeline': 'Within 1 week'
+        })
     
-    # General recommendations
-    recommendations['general_recommendations'].extend([
-        'Verify business justification for all duplicate transactions',
-        'Check for system errors or processing issues',
-        'Review duplicate posting patterns for unusual activity',
-        'Consider implementing duplicate detection controls'
-    ])
+    # Low priority recommendations
+    recommendations['low_priority'].append({
+        'action': 'Process improvement',
+        'description': f'Consider process improvements to reduce {analysis_type} anomalies',
+        'priority': 'LOW',
+        'timeline': 'Ongoing'
+    })
     
     return recommendations
+
+def _create_unified_compliance_assessment(anomaly_list, analysis_type):
+    """Create unified compliance assessment"""
+    compliance_issues = []
+    
+    if not anomaly_list:
+        return {'compliance_issues': compliance_issues, 'overall_compliance': 'COMPLIANT'}
+    
+    # Check for high-value anomalies
+    high_value_anomalies = [a for a in anomaly_list if a.get('amount', 0) > 1000000]
+    if high_value_anomalies:
+        compliance_issues.append({
+            'issue': 'High-value anomalies detected',
+            'severity': 'HIGH',
+            'description': f'Found {len(high_value_anomalies)} high-value {analysis_type} anomalies',
+            'regulatory_impact': 'May require regulatory reporting',
+            'recommendation': 'Review and investigate immediately'
+        })
+    
+    # Check for critical risk anomalies
+    critical_anomalies = [a for a in anomaly_list if a.get('risk_level') == 'critical']
+    if critical_anomalies:
+        compliance_issues.append({
+            'issue': 'Critical risk anomalies detected',
+            'severity': 'CRITICAL',
+            'description': f'Found {len(critical_anomalies)} critical-risk {analysis_type} anomalies',
+            'regulatory_impact': 'May indicate control weaknesses',
+            'recommendation': 'Immediate investigation and remediation required'
+        })
+    
+    # Determine overall compliance
+    if any(issue['severity'] == 'CRITICAL' for issue in compliance_issues):
+        overall_compliance = 'NON_COMPLIANT'
+    elif any(issue['severity'] == 'HIGH' for issue in compliance_issues):
+        overall_compliance = 'AT_RISK'
+    else:
+        overall_compliance = 'COMPLIANT'
+    
+    return {
+        'compliance_issues': compliance_issues,
+        'overall_compliance': overall_compliance,
+        'total_issues': len(compliance_issues)
+    }
+
+def _create_export_data(anomaly_list):
+    """Create export-ready data"""
+    export_data = []
+    
+    for anomaly in anomaly_list:
+        export_entry = {
+            'ID': anomaly.get('id', ''),
+            'Analysis_Type': anomaly.get('analysis_type', ''),
+            'Document_Number': anomaly.get('document_number', ''),
+            'GL_Account': anomaly.get('gl_account', ''),
+            'User_Name': anomaly.get('user_name', ''),
+            'Posting_Date': anomaly.get('posting_date', ''),
+            'Document_Date': anomaly.get('document_date', ''),
+            'Amount': anomaly.get('amount', 0),
+            'Transaction_Type': anomaly.get('transaction_type', ''),
+            'Document_Type': anomaly.get('document_type', ''),
+            'Risk_Score': anomaly.get('risk_score', 0),
+            'Risk_Level': anomaly.get('risk_level', ''),
+            'Detection_Method': anomaly.get('detection_method', ''),
+            'Confidence_Score': anomaly.get('confidence_score', 0),
+            'Audit_Priority': anomaly.get('audit_priority', ''),
+            'Compliance_Impact': anomaly.get('compliance_impact', ''),
+            'Financial_Impact': anomaly.get('financial_impact', '')
+        }
+        export_data.append(export_entry)
+    
+    return export_data
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
 def run_backdated_analysis(self, job_id):
@@ -3852,13 +4117,13 @@ def retrain_rule_based_models(self, job_id):
 # INDIVIDUAL ANALYSIS MODEL TRAINING TASKS
 # ============================================================================
 
-@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=600, soft_time_limit=480)
 def train_duplicate_analysis_model(self, job_id):
     """
-    Duplicate Analysis Model Training Task
+    Duplicate Analysis Model Training Task with ML Integration
     
-    Trains duplicate detection model by analyzing historical transaction patterns.
-    Uses statistical analysis to determine optimal similarity thresholds.
+    Trains duplicate detection model using actual machine learning algorithms.
+    Uses new data + historical sample for incremental learning.
     
     Args:
         job_id (str): UUID of the FileProcessingJob to process
@@ -3875,18 +4140,28 @@ def train_duplicate_analysis_model(self, job_id):
         
         debug_task_state(task_name, job_id, "JOB_RETRIEVED", f"Training duplicate model for file: {data_file.file_name}")
         
-        # Get all historical transactions for training
-        transactions = SAPGLPosting.objects.all()
+        # Get new data from this job
+        new_transactions = list(SAPGLPosting.objects.filter(data_file=data_file))
         
-        debug_task_data(task_name, job_id, "TRANSACTIONS", f"Found {len(transactions)} transactions for training")
+        # Get sample of historical data for incremental learning
+        historical_sample = list(SAPGLPosting.objects.exclude(
+            data_file=data_file
+        ).order_by('?')[:len(new_transactions) * 2])  # 2x the new data size
         
-        if len(transactions) < 100:
+        # Combine new and historical data
+        training_data = new_transactions + historical_sample
+        
+        debug_task_data(task_name, job_id, "TRAINING_DATA", 
+                       f"Training with {len(new_transactions)} new + {len(historical_sample)} historical transactions")
+        
+        if len(training_data) < 100:
             error_msg = "Insufficient data for training. Need at least 100 transactions."
             debug_task_state(task_name, job_id, "FAILED", error_msg)
             return {'error': error_msg}
         
-        # Train duplicate detection model
-        training_results = _train_duplicate_detection_model(transactions)
+        # Train duplicate detection model using actual ML implementation
+        ml_trainer = MLModelTrainer()
+        training_results = ml_trainer.train_duplicate_model(training_data)
         
         # Calculate training statistics
         training_duration = (timezone.now() - start_time).total_seconds()
@@ -3896,21 +4171,15 @@ def train_duplicate_analysis_model(self, job_id):
         
         training_session = DuplicateAnalysisModelTraining.objects.create(
             session_name=f"Duplicate Analysis Training Session {job_id}",
-            description="Duplicate detection model training session",
+            description=f"Training with new data from job {job_id} + historical sample",
             model_type='duplicate_analysis',
-            training_data_size=len(transactions),
+            training_data_size=len(training_data),
             training_data_date_range={
-                'min_date': min(t.posting_date for t in transactions if t.posting_date).isoformat(),
-                'max_date': max(t.posting_date for t in transactions if t.posting_date).isoformat()
+                'min_date': min(t.posting_date for t in training_data if t.posting_date).isoformat(),
+                'max_date': max(t.posting_date for t in training_data if t.posting_date).isoformat()
             },
             training_results=training_results,
-            performance_metrics={
-                'training_success': True,
-                'training_duration': training_duration,
-                'data_quality_score': _calculate_data_quality_score(transactions),
-                'model_accuracy': training_results.get('training_accuracy', 0.0),
-                'false_positive_rate': training_results.get('false_positive_rate', 0.0)
-            },
+            performance_metrics=training_results.get('performance_metrics', {}),
             status='COMPLETED',
             started_at=start_time,
             completed_at=timezone.now(),
@@ -3918,13 +4187,18 @@ def train_duplicate_analysis_model(self, job_id):
         )
         
         debug_task_state(task_name, job_id, "COMPLETED", 
-                        f"Duplicate analysis model training completed in {training_duration:.2f} seconds")
+                        f"Duplicate analysis model training completed. Accuracy: {training_results.get('best_accuracy', 0):.2f}")
         
         return {
             'success': True,
             'training_id': str(training_session.id),
             'training_duration': training_duration,
-            'model_accuracy': training_results.get('training_accuracy', 0.0)
+            'best_accuracy': training_results.get('best_accuracy', 0.0),
+            'performance_metrics': training_results.get('performance_metrics', {}),
+            'optimal_thresholds': training_results.get('optimal_thresholds', {}),
+            'training_data_size': len(training_data),
+            'new_data_size': len(new_transactions),
+            'historical_sample_size': len(historical_sample)
         }
         
     except Exception as e:
@@ -4826,3 +5100,789 @@ def _train_overall_risk_model(transactions):
         'training_accuracy': 0.90,
         'false_positive_rate': 0.10
     }
+
+# ============================================================================
+# ENHANCED GENERAL ANALYSIS HELPER FUNCTIONS
+# ============================================================================
+
+def _create_general_analysis_summary(transactions, data_file):
+    """Create comprehensive analysis summary with all requested statistics"""
+    if not transactions:
+        return {}
+    
+    # Basic transaction statistics
+    total_transactions = len(transactions)
+    unique_accounts = len(set(t.gl_account for t in transactions))
+    unique_users = len(set(t.user_name for t in transactions))
+    
+    # Date range analysis
+    posting_dates = [t.posting_date for t in transactions if t.posting_date]
+    if posting_dates:
+        min_date = min(posting_dates)
+        max_date = max(posting_dates)
+        days_of_transactions = (max_date - min_date).days + 1
+    else:
+        min_date = max_date = None
+        days_of_transactions = 0
+    
+    # Amount statistics
+    amounts = [float(t.amount_local_currency) for t in transactions]
+    total_amount = sum(amounts)
+    mean_amount = total_amount / len(amounts) if amounts else 0
+    
+    # Calculate standard deviation
+    if len(amounts) > 1:
+        variance = sum((x - mean_amount) ** 2 for x in amounts) / (len(amounts) - 1)
+        std_deviation = variance ** 0.5
+    else:
+        std_deviation = 0
+    
+    # Debit/Credit analysis
+    debit_transactions = [t for t in transactions if t.transaction_type == 'DEBIT']
+    credit_transactions = [t for t in transactions if t.transaction_type == 'CREDIT']
+    
+    total_debits = sum(float(t.amount_local_currency) for t in debit_transactions)
+    total_credits = sum(float(t.amount_local_currency) for t in credit_transactions)
+    
+    return {
+        'file_info': {
+            'file_name': data_file.file_name,
+            'file_size': data_file.file_size,
+            'upload_date': data_file.upload_date.isoformat() if data_file.upload_date else None
+        },
+        'transaction_overview': {
+            'total_transactions': total_transactions,
+            'unique_accounts': unique_accounts,
+            'unique_users': unique_users,
+            'days_of_transactions': days_of_transactions,
+            'date_range': {
+                'start_date': min_date.isoformat() if min_date else None,
+                'end_date': max_date.isoformat() if max_date else None
+            }
+        },
+        'amount_statistics': {
+            'total_amount': total_amount,
+            'mean_amount': mean_amount,
+            'std_deviation': std_deviation,
+            'min_amount': min(amounts) if amounts else 0,
+            'max_amount': max(amounts) if amounts else 0,
+            'median_amount': sorted(amounts)[len(amounts)//2] if amounts else 0
+        },
+        'trial_balance': {
+            'total_debits': total_debits,
+            'total_credits': total_credits,
+            'net_balance': total_debits - total_credits,
+            'debit_count': len(debit_transactions),
+            'credit_count': len(credit_transactions),
+            'debit_credit_ratio': total_debits / total_credits if total_credits > 0 else None
+        },
+        'currency': transactions[0].local_currency if transactions else 'SAR'
+    }
+
+def _perform_completeness_tests(transactions, data_file):
+    """Perform comprehensive completeness tests including open/closing balances and first transactions"""
+    if not transactions:
+        return {}
+    
+    # Group transactions by GL account
+    account_data = {}
+    for transaction in transactions:
+        account_id = transaction.gl_account
+        if account_id not in account_data:
+            account_data[account_id] = []
+        account_data[account_id].append(transaction)
+    
+    # Sort transactions by posting date for each account
+    for account_id in account_data:
+        account_data[account_id].sort(key=lambda x: x.posting_date)
+    
+    gl_account_balances = []
+    completeness_issues = []
+    
+    for account_id, account_transactions in account_data.items():
+        if not account_transactions:
+            continue
+        
+        # Get first and last transactions
+        first_transaction = account_transactions[0]
+        last_transaction = account_transactions[-1]
+        
+        # Calculate running balance
+        running_balance = 0.0
+        transaction_balances = []
+        
+        for transaction in account_transactions:
+            if transaction.transaction_type == 'DEBIT':
+                running_balance += float(transaction.amount_local_currency)
+            else:
+                running_balance -= float(transaction.amount_local_currency)
+            
+            transaction_balances.append({
+                'transaction_id': transaction.id,
+                'posting_date': transaction.posting_date.isoformat() if transaction.posting_date else None,
+                'amount': float(transaction.amount_local_currency),
+                'transaction_type': transaction.transaction_type,
+                'running_balance': running_balance
+            })
+        
+        # Calculate opening and closing balances
+        opening_balance = 0.0  # Assuming starting balance is 0
+        closing_balance = running_balance
+        
+        # Count credit and debit transactions
+        debit_count = len([t for t in account_transactions if t.transaction_type == 'DEBIT'])
+        credit_count = len([t for t in account_transactions if t.transaction_type == 'CREDIT'])
+        
+        # Check for completeness issues
+        issues = []
+        
+        # Check for missing opening balance
+        if opening_balance == 0 and len(account_transactions) > 0:
+            issues.append({
+                'type': 'missing_opening_balance',
+                'severity': 'medium',
+                'description': f'No opening balance found for account {account_id}'
+            })
+        
+        # Check for unusual balance patterns
+        if abs(closing_balance) > 1000000:  # Large closing balance
+            issues.append({
+                'type': 'large_closing_balance',
+                'severity': 'high',
+                'description': f'Large closing balance ({closing_balance:,.2f}) for account {account_id}'
+            })
+        
+        # Check for single-sided transactions
+        if debit_count == 0 or credit_count == 0:
+            issues.append({
+                'type': 'single_sided_account',
+                'severity': 'medium',
+                'description': f'Account {account_id} has only {"debit" if debit_count > 0 else "credit"} transactions'
+            })
+        
+        account_balance_info = {
+            'account_id': account_id,
+            'account_name': getattr(first_transaction, 'gl_account_name', f'Account {account_id}'),
+            'opening_balance': opening_balance,
+            'closing_balance': closing_balance,
+            'first_transaction': {
+                'id': first_transaction.id,
+                'posting_date': first_transaction.posting_date.isoformat() if first_transaction.posting_date else None,
+                'document_number': first_transaction.document_number,
+                'amount': float(first_transaction.amount_local_currency),
+                'transaction_type': first_transaction.transaction_type,
+                'user_name': first_transaction.user_name
+            },
+            'last_transaction': {
+                'id': last_transaction.id,
+                'posting_date': last_transaction.posting_date.isoformat() if last_transaction.posting_date else None,
+                'document_number': last_transaction.document_number,
+                'amount': float(last_transaction.amount_local_currency),
+                'transaction_type': last_transaction.transaction_type,
+                'user_name': last_transaction.user_name
+            },
+            'transaction_summary': {
+                'total_transactions': len(account_transactions),
+                'debit_count': debit_count,
+                'credit_count': credit_count,
+                'total_debits': sum(float(t.amount_local_currency) for t in account_transactions if t.transaction_type == 'DEBIT'),
+                'total_credits': sum(float(t.amount_local_currency) for t in account_transactions if t.transaction_type == 'CREDIT')
+            },
+            'transaction_balances': transaction_balances,
+            'completeness_issues': issues
+        }
+        
+        gl_account_balances.append(account_balance_info)
+        completeness_issues.extend(issues)
+    
+    # Sort by closing balance (highest first)
+    gl_account_balances.sort(key=lambda x: abs(x['closing_balance']), reverse=True)
+    
+    return {
+        'gl_account_balances': gl_account_balances,
+        'completeness_issues': completeness_issues,
+        'total_accounts': len(gl_account_balances),
+        'accounts_with_issues': len([acc for acc in gl_account_balances if acc['completeness_issues']]),
+        'total_issues': len(completeness_issues)
+    }
+
+def _calculate_comprehensive_statistics(transactions):
+    """Calculate comprehensive statistical measures including mean, deviation, and all audit-related stats"""
+    if not transactions:
+        return {}
+    
+    import numpy as np
+    
+    # Amount statistics
+    amounts = [float(t.amount_local_currency) for t in transactions]
+    amounts_array = np.array(amounts)
+    
+    amount_statistics = {
+        'count': len(amounts),
+        'mean': float(np.mean(amounts_array)),
+        'median': float(np.median(amounts_array)),
+        'std': float(np.std(amounts_array)),
+        'min': float(np.min(amounts_array)),
+        'max': float(np.max(amounts_array)),
+        'q1': float(np.percentile(amounts_array, 25)),
+        'q3': float(np.percentile(amounts_array, 75)),
+        'iqr': float(np.percentile(amounts_array, 75) - np.percentile(amounts_array, 25)),
+        'skewness': float(_calculate_skewness(amounts_array)),
+        'kurtosis': float(_calculate_kurtosis(amounts_array)),
+        'coefficient_of_variation': float(np.std(amounts_array) / np.mean(amounts_array)) if np.mean(amounts_array) != 0 else 0
+    }
+    
+    # User statistics
+    user_transaction_counts = {}
+    user_amounts = {}
+    
+    for transaction in transactions:
+        user_name = transaction.user_name
+        amount = float(transaction.amount_local_currency)
+        
+        if user_name not in user_transaction_counts:
+            user_transaction_counts[user_name] = 0
+            user_amounts[user_name] = []
+        
+        user_transaction_counts[user_name] += 1
+        user_amounts[user_name].append(amount)
+    
+    user_statistics = {
+        'total_users': len(user_transaction_counts),
+        'user_transaction_counts': user_transaction_counts,
+        'user_amount_statistics': {}
+    }
+    
+    for user_name, amounts_list in user_amounts.items():
+        amounts_array = np.array(amounts_list)
+        user_statistics['user_amount_statistics'][user_name] = {
+            'transaction_count': len(amounts_list),
+            'total_amount': float(np.sum(amounts_array)),
+            'mean_amount': float(np.mean(amounts_array)),
+            'std_amount': float(np.std(amounts_array)),
+            'min_amount': float(np.min(amounts_array)),
+            'max_amount': float(np.max(amounts_array))
+        }
+    
+    # Account statistics
+    account_transaction_counts = {}
+    account_amounts = {}
+    
+    for transaction in transactions:
+        account_id = transaction.gl_account
+        amount = float(transaction.amount_local_currency)
+        
+        if account_id not in account_transaction_counts:
+            account_transaction_counts[account_id] = 0
+            account_amounts[account_id] = []
+        
+        account_transaction_counts[account_id] += 1
+        account_amounts[account_id].append(amount)
+    
+    account_statistics = {
+        'total_accounts': len(account_transaction_counts),
+        'account_transaction_counts': account_transaction_counts,
+        'account_amount_statistics': {}
+    }
+    
+    for account_id, amounts_list in account_amounts.items():
+        amounts_array = np.array(amounts_list)
+        account_statistics['account_amount_statistics'][account_id] = {
+            'transaction_count': len(amounts_list),
+            'total_amount': float(np.sum(amounts_array)),
+            'mean_amount': float(np.mean(amounts_array)),
+            'std_amount': float(np.std(amounts_array)),
+            'min_amount': float(np.min(amounts_array)),
+            'max_amount': float(np.max(amounts_array))
+        }
+    
+    # Temporal statistics
+    posting_dates = [t.posting_date for t in transactions if t.posting_date]
+    if posting_dates:
+        date_counts = {}
+        for date in posting_dates:
+            date_str = date.strftime('%Y-%m-%d')
+            date_counts[date_str] = date_counts.get(date_str, 0) + 1
+        
+        temporal_statistics = {
+            'date_range': {
+                'start_date': min(posting_dates).isoformat(),
+                'end_date': max(posting_dates).isoformat(),
+                'total_days': (max(posting_dates) - min(posting_dates)).days + 1
+            },
+            'daily_transaction_counts': date_counts,
+            'avg_transactions_per_day': len(transactions) / len(date_counts) if date_counts else 0,
+            'busiest_day': max(date_counts.items(), key=lambda x: x[1]) if date_counts else None,
+            'quietest_day': min(date_counts.items(), key=lambda x: x[1]) if date_counts else None
+        }
+    else:
+        temporal_statistics = {}
+    
+    return {
+        'amount_statistics': amount_statistics,
+        'user_statistics': user_statistics,
+        'account_statistics': account_statistics,
+        'temporal_statistics': temporal_statistics
+    }
+
+def _calculate_audit_statistics(transactions):
+    """Calculate audit-related statistics for risk assessment"""
+    if not transactions:
+        return {}
+    
+    # High-value transaction analysis
+    high_value_threshold = 100000
+    high_value_transactions = [t for t in transactions if abs(float(t.amount_local_currency)) > high_value_threshold]
+    
+    # Manual entry analysis
+    manual_transactions = [t for t in transactions if 'MANUAL' in t.document_type.upper()]
+    
+    # Weekend transaction analysis
+    weekend_transactions = [t for t in transactions if t.posting_date and t.posting_date.weekday() in [5, 6]]
+    
+    # Backdated transaction analysis
+    backdated_transactions = []
+    for t in transactions:
+        if t.document_date and t.posting_date and t.posting_date > t.document_date:
+            days_diff = (t.posting_date - t.document_date).days
+            backdated_transactions.append({
+                'transaction_id': t.id,
+                'document_date': t.document_date.isoformat(),
+                'posting_date': t.posting_date.isoformat(),
+                'days_difference': days_diff,
+                'amount': float(t.amount_local_currency)
+            })
+    
+    # Round number analysis
+    round_number_transactions = [t for t in transactions if float(t.amount_local_currency) % 1000 == 0]
+    
+    # User concentration analysis
+    user_amounts = {}
+    for t in transactions:
+        user_name = t.user_name
+        amount = abs(float(t.amount_local_currency))
+        if user_name not in user_amounts:
+            user_amounts[user_name] = 0
+        user_amounts[user_name] += amount
+    
+    top_users = sorted(user_amounts.items(), key=lambda x: x[1], reverse=True)[:10]
+    
+    return {
+        'high_value_analysis': {
+            'threshold': high_value_threshold,
+            'count': len(high_value_transactions),
+            'percentage': (len(high_value_transactions) / len(transactions)) * 100,
+            'total_amount': sum(abs(float(t.amount_local_currency)) for t in high_value_transactions)
+        },
+        'manual_entry_analysis': {
+            'count': len(manual_transactions),
+            'percentage': (len(manual_transactions) / len(transactions)) * 100,
+            'total_amount': sum(float(t.amount_local_currency) for t in manual_transactions)
+        },
+        'weekend_analysis': {
+            'count': len(weekend_transactions),
+            'percentage': (len(weekend_transactions) / len(transactions)) * 100,
+            'total_amount': sum(float(t.amount_local_currency) for t in weekend_transactions)
+        },
+        'backdated_analysis': {
+            'count': len(backdated_transactions),
+            'percentage': (len(backdated_transactions) / len(transactions)) * 100,
+            'transactions': backdated_transactions
+        },
+        'round_number_analysis': {
+            'count': len(round_number_transactions),
+            'percentage': (len(round_number_transactions) / len(transactions)) * 100,
+            'total_amount': sum(float(t.amount_local_currency) for t in round_number_transactions)
+        },
+        'user_concentration_analysis': {
+            'top_users': top_users,
+            'concentration_risk': sum(amount for _, amount in top_users[:3]) / sum(user_amounts.values()) if user_amounts else 0
+        }
+    }
+
+def _create_general_chart_data(transactions, analysis_summary, completeness_tests):
+    """Create unified chart data for general analysis"""
+    if not transactions:
+        return {
+            'amount_charts': {},
+            'account_charts': {},
+            'user_charts': {},
+            'date_charts': {}
+        }
+    
+    # Amount charts
+    amounts = [float(t.amount_local_currency) for t in transactions]
+    amount_ranges = [
+        (0, 1000, '0-1K'),
+        (1000, 10000, '1K-10K'),
+        (10000, 100000, '10K-100K'),
+        (100000, 1000000, '100K-1M'),
+        (1000000, float('inf'), '1M+')
+    ]
+    
+    amount_distribution = []
+    for min_val, max_val, label in amount_ranges:
+        if max_val == float('inf'):
+            count = len([a for a in amounts if a >= min_val])
+        else:
+            count = len([a for a in amounts if min_val <= a < max_val])
+        amount_distribution.append({'label': label, 'count': count})
+    
+    amount_charts = {
+        'amount_distribution': {
+            'labels': [item['label'] for item in amount_distribution],
+            'data': [item['count'] for item in amount_distribution],
+            'type': 'bar'
+        },
+        'trial_balance': {
+            'labels': ['Total Debits', 'Total Credits', 'Net Balance'],
+            'data': [
+                analysis_summary['trial_balance']['total_debits'],
+                analysis_summary['trial_balance']['total_credits'],
+                analysis_summary['trial_balance']['net_balance']
+            ],
+            'type': 'pie'
+        }
+    }
+    
+    # Account charts
+    account_balances = completeness_tests.get('gl_account_balances', [])
+    top_accounts = account_balances[:10]
+    
+    account_charts = {
+        'account_balances': {
+            'labels': [f"{acc['account_id']} - {acc['account_name'][:20]}" for acc in top_accounts],
+            'data': [abs(acc['closing_balance']) for acc in top_accounts],
+            'type': 'bar'
+        },
+        'account_transaction_counts': {
+            'labels': [f"{acc['account_id']}" for acc in top_accounts],
+            'data': [acc['transaction_summary']['total_transactions'] for acc in top_accounts],
+            'type': 'bar'
+        }
+    }
+    
+    # User charts
+    user_transaction_counts = {}
+    for transaction in transactions:
+        user_name = transaction.user_name
+        user_transaction_counts[user_name] = user_transaction_counts.get(user_name, 0) + 1
+    
+    top_users = sorted(user_transaction_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    
+    user_charts = {
+        'user_activity': {
+            'labels': [user[0] for user in top_users],
+            'data': [user[1] for user in top_users],
+            'type': 'bar'
+        }
+    }
+    
+    # Date charts
+    posting_dates = [t.posting_date for t in transactions if t.posting_date]
+    if posting_dates:
+        date_counts = {}
+        for date in posting_dates:
+            date_str = date.strftime('%Y-%m-%d')
+            date_counts[date_str] = date_counts.get(date_str, 0) + 1
+        
+        sorted_dates = sorted(date_counts.items())
+        date_charts = {
+            'daily_transactions': {
+                'labels': [date[0] for date in sorted_dates],
+                'data': [date[1] for date in sorted_dates],
+                'type': 'line'
+            }
+        }
+    else:
+        date_charts = {}
+    
+    return {
+        'amount_charts': amount_charts,
+        'account_charts': account_charts,
+        'user_charts': user_charts,
+        'date_charts': date_charts
+    }
+
+def _create_general_risk_assessment(transactions, completeness_tests):
+    """Create risk assessment for general analysis"""
+    if not transactions:
+        return {}
+    
+    # Calculate risk factors
+    total_transactions = len(transactions)
+    completeness_issues = completeness_tests.get('completeness_issues', [])
+    
+    # Risk scoring
+    risk_score = 0.0
+    
+    # Completeness issues risk
+    risk_score += len(completeness_issues) * 5.0
+    
+    # High value transactions risk
+    high_value_count = len([t for t in transactions if abs(float(t.amount_local_currency)) > 100000])
+    risk_score += high_value_count * 2.0
+    
+    # Manual entries risk
+    manual_count = len([t for t in transactions if 'MANUAL' in t.document_type.upper()])
+    risk_score += manual_count * 3.0
+    
+    # Weekend transactions risk
+    weekend_count = len([t for t in transactions if t.posting_date and t.posting_date.weekday() in [5, 6]])
+    risk_score += weekend_count * 1.5
+    
+    # Normalize risk score
+    normalized_risk_score = min(risk_score / total_transactions, 100.0) if total_transactions > 0 else 0.0
+    
+    # Determine risk level
+    if normalized_risk_score >= 80:
+        risk_level = 'CRITICAL'
+    elif normalized_risk_score >= 60:
+        risk_level = 'HIGH'
+    elif normalized_risk_score >= 40:
+        risk_level = 'MEDIUM'
+    elif normalized_risk_score >= 20:
+        risk_level = 'LOW'
+    else:
+        risk_level = 'MINIMAL'
+    
+    return {
+        'overall_risk_score': normalized_risk_score,
+        'risk_level': risk_level,
+        'risk_factors': {
+            'completeness_issues': len(completeness_issues),
+            'high_value_transactions': high_value_count,
+            'manual_entries': manual_count,
+            'weekend_transactions': weekend_count
+        },
+        'risk_distribution': {
+            'critical': len([issue for issue in completeness_issues if issue.get('severity') == 'critical']),
+            'high': len([issue for issue in completeness_issues if issue.get('severity') == 'high']),
+            'medium': len([issue for issue in completeness_issues if issue.get('severity') == 'medium']),
+            'low': len([issue for issue in completeness_issues if issue.get('severity') == 'low'])
+        }
+    }
+
+def _create_general_audit_recommendations(completeness_tests, statistical_analysis):
+    """Create audit recommendations based on completeness tests and statistics"""
+    recommendations = []
+    
+    # Completeness-based recommendations
+    completeness_issues = completeness_tests.get('completeness_issues', [])
+    
+    for issue in completeness_issues:
+        if issue.get('type') == 'missing_opening_balance':
+            recommendations.append({
+                'priority': 'HIGH',
+                'category': 'COMPLETENESS',
+                'title': 'Missing Opening Balances',
+                'description': issue.get('description', ''),
+                'action': 'Review and document opening balances for all GL accounts',
+                'impact': 'May affect trial balance accuracy'
+            })
+        elif issue.get('type') == 'large_closing_balance':
+            recommendations.append({
+                'priority': 'HIGH',
+                'category': 'BALANCE',
+                'title': 'Large Closing Balances',
+                'description': issue.get('description', ''),
+                'action': 'Investigate large closing balances for potential errors or unusual activity',
+                'impact': 'May indicate posting errors or unusual transactions'
+            })
+        elif issue.get('type') == 'single_sided_account':
+            recommendations.append({
+                'priority': 'MEDIUM',
+                'category': 'COMPLETENESS',
+                'title': 'Single-Sided Accounts',
+                'description': issue.get('description', ''),
+                'action': 'Review accounts with only debit or credit transactions',
+                'impact': 'May indicate incomplete posting or unusual account activity'
+            })
+    
+    # Statistical-based recommendations
+    amount_stats = statistical_analysis.get('amount_statistics', {})
+    if amount_stats.get('std', 0) > amount_stats.get('mean', 0) * 2:
+        recommendations.append({
+            'priority': 'MEDIUM',
+            'category': 'STATISTICAL',
+            'title': 'High Transaction Amount Variability',
+            'description': f'Standard deviation ({amount_stats["std"]:,.2f}) is significantly higher than mean ({amount_stats["mean"]:,.2f})',
+            'action': 'Review transactions with unusually high or low amounts',
+            'impact': 'May indicate data quality issues or unusual transactions'
+        })
+    
+    return {
+        'recommendations': recommendations,
+        'total_recommendations': len(recommendations),
+        'high_priority_count': len([r for r in recommendations if r['priority'] == 'HIGH']),
+        'medium_priority_count': len([r for r in recommendations if r['priority'] == 'MEDIUM']),
+        'low_priority_count': len([r for r in recommendations if r['priority'] == 'LOW'])
+    }
+
+def _create_general_compliance_assessment(completeness_tests, audit_statistics):
+    """Create compliance assessment for general analysis"""
+    compliance_issues = []
+    compliance_score = 100.0
+    
+    # Completeness compliance
+    completeness_issues = completeness_tests.get('completeness_issues', [])
+    if completeness_issues:
+        compliance_score -= len(completeness_issues) * 5.0
+        compliance_issues.append({
+            'category': 'COMPLETENESS',
+            'issues': len(completeness_issues),
+            'description': f'Found {len(completeness_issues)} completeness issues'
+        })
+    
+    # Manual entry compliance
+    manual_analysis = audit_statistics.get('manual_entry_analysis', {})
+    manual_percentage = manual_analysis.get('percentage', 0)
+    if manual_percentage > 20:  # More than 20% manual entries
+        compliance_score -= 15.0
+        compliance_issues.append({
+            'category': 'MANUAL_ENTRIES',
+            'issues': 1,
+            'description': f'High percentage of manual entries ({manual_percentage:.1f}%)'
+        })
+    
+    # Weekend transaction compliance
+    weekend_analysis = audit_statistics.get('weekend_analysis', {})
+    weekend_percentage = weekend_analysis.get('percentage', 0)
+    if weekend_percentage > 10:  # More than 10% weekend transactions
+        compliance_score -= 10.0
+        compliance_issues.append({
+            'category': 'WEEKEND_TRANSACTIONS',
+            'issues': 1,
+            'description': f'High percentage of weekend transactions ({weekend_percentage:.1f}%)'
+        })
+    
+    # Backdated transaction compliance
+    backdated_analysis = audit_statistics.get('backdated_analysis', {})
+    backdated_percentage = backdated_analysis.get('percentage', 0)
+    if backdated_percentage > 5:  # More than 5% backdated transactions
+        compliance_score -= 20.0
+        compliance_issues.append({
+            'category': 'BACKDATED_TRANSACTIONS',
+            'issues': 1,
+            'description': f'High percentage of backdated transactions ({backdated_percentage:.1f}%)'
+        })
+    
+    compliance_score = max(compliance_score, 0.0)
+    
+    # Determine compliance level
+    if compliance_score >= 90:
+        compliance_level = 'EXCELLENT'
+    elif compliance_score >= 80:
+        compliance_level = 'GOOD'
+    elif compliance_score >= 70:
+        compliance_level = 'FAIR'
+    elif compliance_score >= 60:
+        compliance_level = 'POOR'
+    else:
+        compliance_level = 'CRITICAL'
+    
+    return {
+        'compliance_score': compliance_score,
+        'compliance_level': compliance_level,
+        'compliance_issues': compliance_issues,
+        'total_issues': len(compliance_issues),
+        'risk_categories': list(set(issue['category'] for issue in compliance_issues))
+    }
+
+def _create_general_export_data(transactions, analysis_summary, completeness_tests, statistical_analysis):
+    """Create export-ready data for general analysis"""
+    return {
+        'analysis_summary': analysis_summary,
+        'completeness_tests': completeness_tests,
+        'statistical_analysis': statistical_analysis,
+        'export_timestamp': timezone.now().isoformat(),
+        'total_records': len(transactions),
+        'export_format': 'json',
+        'version': '2.0.0'
+    }
+
+def _create_completeness_anomalies(completeness_tests, transactions):
+    """Create standardized anomaly list for completeness issues"""
+    anomalies = []
+    
+    completeness_issues = completeness_tests.get('completeness_issues', [])
+    
+    for issue in completeness_issues:
+        if issue.get('type') == 'missing_opening_balance':
+            # Find transactions for the account with missing opening balance
+            account_id = issue.get('account_id', '')
+            account_transactions = [t for t in transactions if t.gl_account == account_id]
+            
+            if account_transactions:
+                first_transaction = min(account_transactions, key=lambda x: x.posting_date)
+                anomaly = {
+                    'id': first_transaction.id,
+                    'analysis_type': 'completeness',
+                    'document_number': first_transaction.document_number,
+                    'gl_account': first_transaction.gl_account,
+                    'user_name': first_transaction.user_name,
+                    'posting_date': first_transaction.posting_date.isoformat() if first_transaction.posting_date else None,
+                    'document_date': first_transaction.document_date.isoformat() if first_transaction.document_date else None,
+                    'amount': float(first_transaction.amount_local_currency),
+                    'transaction_type': first_transaction.transaction_type,
+                    'document_type': first_transaction.document_type,
+                    'risk_score': 75.0,
+                    'risk_level': 'HIGH',
+                    'detection_method': 'completeness_test',
+                    'confidence_score': 0.90,
+                    'audit_priority': 'HIGH',
+                    'compliance_impact': 'HIGH',
+                    'financial_impact': 'MEDIUM',
+                    'completeness_info': {
+                        'issue_type': issue.get('type'),
+                        'severity': issue.get('severity'),
+                        'description': issue.get('description')
+                    }
+                }
+                anomalies.append(anomaly)
+    
+    return anomalies
+
+def _calculate_skewness(data):
+    """Calculate skewness of the data"""
+    if len(data) < 3:
+        return 0.0
+    mean = np.mean(data)
+    std = np.std(data)
+    if std == 0:
+        return 0.0
+    skewness = np.mean(((data - mean) / std) ** 3)
+    return skewness
+
+def _calculate_kurtosis(data):
+    """Calculate kurtosis of the data"""
+    if len(data) < 4:
+        return 0.0
+    mean = np.mean(data)
+    std = np.std(data)
+    if std == 0:
+        return 0.0
+    kurtosis = np.mean(((data - mean) / std) ** 4) - 3
+    return kurtosis
+
+def find_similar_transaction(transaction, all_transactions, factors):
+    """Find similar transaction based on model factors"""
+    for other_transaction in all_transactions:
+        if other_transaction.id == transaction.id:
+            continue
+        
+        # Check similarity based on factors
+        similarity_score = 0
+        if 'amount_similar' in factors and abs(float(transaction.amount_local_currency) - float(other_transaction.amount_local_currency)) < 0.01:
+            similarity_score += 1
+        if 'account_similar' in factors and transaction.gl_account == other_transaction.gl_account:
+            similarity_score += 1
+        if 'user_similar' in factors and transaction.user_name == other_transaction.user_name:
+            similarity_score += 1
+        if 'date_similar' in factors and transaction.posting_date == other_transaction.posting_date:
+            similarity_score += 1
+        
+        if similarity_score >= 2:  # At least 2 factors match
+            return other_transaction
+    
+    return None
