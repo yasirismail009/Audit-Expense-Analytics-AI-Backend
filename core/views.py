@@ -19,7 +19,13 @@ from rest_framework.pagination import PageNumberPagination
 from django.db.models import Q
 from rest_framework.views import APIView
 
-from .models import SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult, HolidayAnalysisResult, GeneralAnalysisResult
+from .models import (
+    SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, 
+    RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, 
+    ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult, HolidayAnalysisResult, 
+    GeneralAnalysisResult, AIRiskAssessment, RiskPattern, AnomalyCluster, 
+    AIRiskRecommendation, RiskTrend, ModelPerformance
+)
 from .serializers import (
     DataFileSerializer, DataFileUploadSerializer, DataUploadResponseSerializer,
     FileProcessingJobSerializer, MLModelTrainingSerializer, TargetedAnomalyUploadSerializer,
@@ -209,7 +215,11 @@ class DataFileViewSet(viewsets.ModelViewSet):
                     parsed_date = datetime.strptime(posting_date_str, '%m/%d/%Y').date()
                     posting.posting_date = parsed_date
                 except:
-                    pass
+                    # Set a default date if parsing fails
+                    posting.posting_date = datetime.now().date()
+            else:
+                # Set a default date if no posting date provided
+                posting.posting_date = datetime.now().date()
             
             document_date_str = row.get('Document Date', '')
             if document_date_str:
@@ -877,7 +887,11 @@ class TargetedAnomalyUploadView(generics.CreateAPIView):
                     parsed_date = datetime.strptime(posting_date_str, '%m/%d/%Y').date()
                     posting.posting_date = parsed_date
                 except:
-                    pass
+                    # Set a default date if parsing fails
+                    posting.posting_date = datetime.now().date()
+            else:
+                # Set a default date if no posting date provided
+                posting.posting_date = datetime.now().date()
             
             document_date_str = row.get('Document Date', '')
             if document_date_str:
@@ -1365,7 +1379,7 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'backdated_count': backdated_count,
                     'total_amount': total_amount,
                     'risk_distribution': risk_distribution,
-                    'analysis_info': backdated_analysis.analysis_info or {}
+                    'analysis_summary': backdated_analysis.analysis_summary or {}
                 }
                 anomaly_stats['total_anomalies'] += backdated_count
                 anomaly_stats['anomaly_types_detected'].append('backdated')
@@ -1391,7 +1405,7 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'total_transactions': total_transactions,
                     'anomalies_count': anomalies_count,
                     'high_risk_users_count': high_risk_users_count,
-                    'analysis_info': user_analysis.analysis_info or {},
+                    'analysis_summary': user_analysis.analysis_summary or {},
                     'user_anomalies': user_analysis.user_anomalies or [],
                     'user_risk_assessment': user_analysis.user_risk_assessment or {}
                 }
@@ -1413,7 +1427,7 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'analysis_date': unusual_days_analysis.analysis_date.isoformat(),
                     'weekend_transactions_count': weekend_count,
                     'unusual_days_count': unusual_days_count,
-                    'analysis_info': unusual_days_analysis.analysis_info or {}
+                    'analysis_summary': unusual_days_analysis.analysis_summary or {}
                 }
                 anomaly_stats['total_anomalies'] += weekend_count + unusual_days_count
                 anomaly_stats['anomaly_types_detected'].extend(['weekend_activity', 'unusual_days'])
@@ -1433,7 +1447,7 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'analysis_date': closing_entries_analysis.analysis_date.isoformat(),
                     'closing_entries_count': closing_count,
                     'post_close_entries_count': post_close_count,
-                    'analysis_info': closing_entries_analysis.analysis_info or {}
+                    'analysis_summary': closing_entries_analysis.analysis_summary or {}
                 }
                 anomaly_stats['total_anomalies'] += closing_count + post_close_count
                 anomaly_stats['anomaly_types_detected'].extend(['closing_entries', 'post_close_entries'])
@@ -1441,20 +1455,20 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
             # Holiday Analysis
             if holiday_analysis:
                 try:
-                    # Get data from analysis_info first, then fallback to model methods
-                    analysis_info = holiday_analysis.analysis_info or {}
+                    # Get data from analysis_summary first, then fallback to model methods
+                    analysis_summary = holiday_analysis.analysis_summary or {}
                     
-                    # Extract holiday data from analysis_info
-                    holiday_count = analysis_info.get('holiday_transactions_count', 0)
+                    # Extract holiday data from analysis_summary
+                    holiday_count = analysis_summary.get('holiday_transactions_count', 0)
                     if holiday_count == 0:
                         holiday_count = holiday_analysis.get_holiday_postings_count()
                     
-                    holiday_percentage = analysis_info.get('holiday_percentage', 0)
+                    holiday_percentage = analysis_summary.get('holiday_percentage', 0)
                     if holiday_percentage == 0:
                         holiday_percentage = holiday_analysis.get_holiday_percentage()
                     
                     # Count unique holidays from breakdown
-                    holiday_breakdown = analysis_info.get('holiday_breakdown', [])
+                    holiday_breakdown = analysis_summary.get('holiday_breakdown', [])
                     unique_holidays = len([h for h in holiday_breakdown if h and len(h) > 1 and h[1] > 0])
                     if unique_holidays == 0:
                         unique_holidays = holiday_analysis.get_unique_holidays()
@@ -1462,7 +1476,7 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     overall_risk_score = holiday_analysis.get_overall_risk_score()
                     
                     # Calculate total holiday amount
-                    total_holiday_amount = analysis_info.get('total_holiday_amount', 0)
+                    total_holiday_amount = analysis_summary.get('total_holiday_amount', 0)
                     
                 except Exception as e:
                     logger.warning(f"Error getting holiday analysis data: {e}")
@@ -1480,7 +1494,7 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'unique_holidays': unique_holidays,
                     'overall_risk_score': overall_risk_score,
                     'total_holiday_amount': total_holiday_amount,
-                    'analysis_info': holiday_analysis.analysis_info or {}
+                    'analysis_summary': holiday_analysis.analysis_summary or {}
                 }
                 anomaly_stats['total_anomalies'] += holiday_count
                 anomaly_stats['anomaly_types_detected'].append('holiday_posting')
@@ -2264,15 +2278,24 @@ class DuplicateAnalysisView(generics.GenericAPIView):
                     ]
                 }, status=404)
             
-            # Prepare response data
+            # Prepare response data with complete unified structure
             response_data = {
-                'analysis_info': {
+                # Unified fields from BaseAnalysisResult
+                'analysis_summary': duplicate_analysis.analysis_summary or {
                     'analysis_id': str(duplicate_analysis.id),
                     'analysis_date': duplicate_analysis.analysis_date,
                     'processing_duration': duplicate_analysis.processing_duration,
                     'status': duplicate_analysis.status,
-                    'analysis_version': duplicate_analysis.analysis_version or '1.0.0'
+                    'analysis_version': duplicate_analysis.analysis_version or '2.0.0'
                 },
+                'anomaly_list': duplicate_analysis.anomaly_list or [],
+                'chart_data': duplicate_analysis.chart_data or {},
+                'risk_assessment': duplicate_analysis.risk_assessment or {},
+                'audit_recommendations': duplicate_analysis.audit_recommendations or {},
+                'compliance_assessment': duplicate_analysis.compliance_assessment or {},
+                'export_data': duplicate_analysis.export_data or [],
+                
+                # Legacy fields for backward compatibility
                 'summary': {
                     'total_duplicates': len(duplicate_analysis.duplicate_list or []),
                     'total_amount': duplicate_analysis.get_total_amount(),
@@ -2319,6 +2342,14 @@ class DuplicateAnalysisView(generics.GenericAPIView):
             # Add detailed insights if available
             if duplicate_analysis.detailed_insights:
                 response_data['insights'] = duplicate_analysis.detailed_insights
+            
+            # Add ML insights from breakdowns if available
+            if duplicate_analysis.breakdowns and 'ml_insights' in duplicate_analysis.breakdowns:
+                response_data['ml_insights'] = duplicate_analysis.breakdowns['ml_insights']
+            
+            # Add detection methods from breakdowns if available
+            if duplicate_analysis.breakdowns and 'detection_methods' in duplicate_analysis.breakdowns:
+                response_data['detection_methods'] = duplicate_analysis.breakdowns['detection_methods']
             
             # Add duplicate activity summary if available
             duplicate_activity_summary = self._generate_duplicate_activity_summary(duplicate_analysis)
@@ -2493,11 +2524,12 @@ class DuplicateAnalysisView(generics.GenericAPIView):
             transaction2 = duplicate.get('transaction2', {})
             
             for transaction in [transaction1, transaction2]:
-                user = transaction.get('user', 'Unknown')
-                if user not in user_activity:
-                    user_activity[user] = {'count': 0, 'total_amount': 0}
-                user_activity[user]['count'] += 1
-                user_activity[user]['total_amount'] += transaction.get('amount', 0)
+                if transaction is not None:  # Check if transaction is not None
+                    user = transaction.get('user', 'Unknown')
+                    if user not in user_activity:
+                        user_activity[user] = {'count': 0, 'total_amount': 0}
+                    user_activity[user]['count'] += 1
+                    user_activity[user]['total_amount'] += transaction.get('amount', 0)
         
         patterns['user_activity_patterns'] = user_activity
         
@@ -2560,10 +2592,11 @@ class DuplicateAnalysisView(generics.GenericAPIView):
             transaction2 = duplicate.get('transaction2', {})
             
             for transaction in [transaction1, transaction2]:
-                user = transaction.get('user', 'Unknown')
-                if user not in by_user:
-                    by_user[user] = []
-                by_user[user].append(duplicate)
+                if transaction is not None:  # Check if transaction is not None
+                    user = transaction.get('user', 'Unknown')
+                    if user not in by_user:
+                        by_user[user] = []
+                    by_user[user].append(duplicate)
         
         return by_user
     
@@ -2632,7 +2665,46 @@ class DuplicateAnalysisView(generics.GenericAPIView):
         if high_value_count > 0:
             recommendations.append(f"Prioritize review of {high_value_count} high-value duplicate transactions")
         
+        # Add ML-specific recommendations
+        ml_recommendations = self._generate_ml_recommendations(duplicate_analysis)
+        recommendations.extend(ml_recommendations)
+        
         return recommendations
+
+    def _generate_ml_recommendations(self, duplicate_analysis):
+        """Generate ML-specific recommendations for duplicate analysis"""
+        ml_recommendations = []
+        
+        # Check if ML model was used
+        if hasattr(duplicate_analysis, 'detection_method') and duplicate_analysis.detection_method == 'trained_model':
+            ml_recommendations.extend([
+                "ML model detected duplicates with high confidence - prioritize review",
+                "Consider retraining ML model with new data patterns",
+                "ML predictions show optimal threshold adjustments needed"
+            ])
+        
+        # Check for confidence scores
+        if hasattr(duplicate_analysis, 'confidence_scores') and duplicate_analysis.confidence_scores:
+            avg_confidence = sum(duplicate_analysis.confidence_scores) / len(duplicate_analysis.confidence_scores)
+            if avg_confidence > 0.9:
+                ml_recommendations.append("High ML confidence scores - strong evidence of duplicates")
+            elif avg_confidence < 0.7:
+                ml_recommendations.append("Low ML confidence scores - manual review recommended")
+        
+        # Check for false positive indicators
+        if hasattr(duplicate_analysis, 'false_positive_indicators') and duplicate_analysis.false_positive_indicators:
+            ml_recommendations.append(f"ML identified {len(duplicate_analysis.false_positive_indicators)} potential false positives")
+            ml_recommendations.append("Review low-confidence predictions for accuracy")
+        
+        # Model performance recommendations
+        if hasattr(duplicate_analysis, 'model_accuracy') and duplicate_analysis.model_accuracy:
+            accuracy = duplicate_analysis.model_accuracy
+            if accuracy < 0.8:
+                ml_recommendations.append(f"ML model accuracy ({accuracy:.1%}) below threshold - retraining recommended")
+            elif accuracy > 0.95:
+                ml_recommendations.append(f"ML model performing excellently ({accuracy:.1%}) - consider production deployment")
+        
+        return ml_recommendations
     
     def _generate_risk_assessment(self, duplicate_analysis):
         """Generate comprehensive risk assessment for duplicate analysis"""
@@ -3069,9 +3141,10 @@ class UserAnalysisView(generics.GenericAPIView):
                     ]
                 }, status=status.HTTP_404_NOT_FOUND)
             
-            # Prepare comprehensive response data
+            # Prepare comprehensive response data with complete unified structure
             response_data = {
-                'analysis_info': {
+                # Unified fields from BaseAnalysisResult
+                'analysis_summary': user_analysis.analysis_summary or {
                     'analysis_id': str(user_analysis.id),
                     'analysis_date': user_analysis.analysis_date.isoformat(),
                     'analysis_type': user_analysis.analysis_type,
@@ -3085,6 +3158,14 @@ class UserAnalysisView(generics.GenericAPIView):
                         'total_records': data_file.total_records
                     }
                 },
+                'anomaly_list': user_analysis.anomaly_list or [],
+                'chart_data': user_analysis.chart_data or {},
+                'risk_assessment': user_analysis.risk_assessment or {},
+                'audit_recommendations': user_analysis.audit_recommendations or {},
+                'compliance_assessment': user_analysis.compliance_assessment or {},
+                'export_data': user_analysis.export_data or [],
+                
+                # Legacy fields for backward compatibility
                 'summary': {
                     'total_users': user_analysis.get_total_users(),
                     'total_transactions': user_analysis.get_total_transactions(),
@@ -3165,6 +3246,14 @@ class UserAnalysisView(generics.GenericAPIView):
                     'recommendations_export': self._prepare_recommendations_export(user_analysis)
                 }
             }
+            
+            # Add ML insights from breakdowns if available
+            if user_analysis.breakdowns and 'ml_insights' in user_analysis.breakdowns:
+                response_data['ml_insights'] = user_analysis.breakdowns['ml_insights']
+            
+            # Add detection methods from breakdowns if available
+            if user_analysis.breakdowns and 'detection_methods' in user_analysis.breakdowns:
+                response_data['detection_methods'] = user_analysis.breakdowns['detection_methods']
             
             # Log successful retrieval
             user_count = user_analysis.get_total_users()
@@ -3632,7 +3721,65 @@ class UserAnalysisView(generics.GenericAPIView):
                 ]
             })
         
+        # Add ML-specific high priority recommendations
+        ml_recommendations = self._generate_ml_user_recommendations(user_analysis, priority='HIGH')
+        recommendations.extend(ml_recommendations)
+        
         return recommendations
+
+    def _generate_ml_user_recommendations(self, user_analysis, priority='ALL'):
+        """Generate ML-specific recommendations for user analysis"""
+        ml_recommendations = []
+        
+        # Check for ML detected anomalies
+        if hasattr(user_analysis, 'ml_detected_anomalies') and user_analysis.ml_detected_anomalies:
+            ml_recommendations.append({
+                'priority': 'HIGH',
+                'category': 'ML Anomaly Detection',
+                'recommendation': f'ML model identified {len(user_analysis.ml_detected_anomalies)} user anomalies',
+                'rationale': 'ML predictions provide data-driven insights for investigation',
+                'action_items': [
+                    'Review ML-detected anomalies for accuracy',
+                    'Validate ML model performance on new data',
+                    'Consider ML insights for risk assessment'
+                ]
+            })
+        
+        # Check for anomaly severity breakdown
+        if hasattr(user_analysis, 'anomaly_severity_breakdown') and user_analysis.anomaly_severity_breakdown:
+            severity_data = user_analysis.anomaly_severity_breakdown
+            if severity_data.get('HIGH', 0) > 0:
+                ml_recommendations.append({
+                    'priority': 'HIGH',
+                    'category': 'ML Risk Assessment',
+                    'recommendation': f'ML identified {severity_data["HIGH"]} high-severity user anomalies',
+                    'rationale': 'High-severity anomalies require immediate attention',
+                    'action_items': [
+                        'Prioritize high-severity ML predictions',
+                        'Review ML model thresholds for high-risk detection',
+                        'Implement enhanced monitoring for high-risk users'
+                    ]
+                })
+        
+        # Check for detection method
+        if hasattr(user_analysis, 'detection_method') and user_analysis.detection_method == 'trained_model':
+            ml_recommendations.append({
+                'priority': 'MEDIUM',
+                'category': 'ML Model Performance',
+                'recommendation': 'ML model used for anomaly detection - validate predictions',
+                'rationale': 'Trained ML models provide automated risk assessment',
+                'action_items': [
+                    'Compare ML predictions with rule-based results',
+                    'Assess ML model accuracy and confidence',
+                    'Document ML model performance metrics'
+                ]
+            })
+        
+        # Filter by priority if specified
+        if priority != 'ALL':
+            ml_recommendations = [r for r in ml_recommendations if r['priority'] == priority]
+        
+        return ml_recommendations
     
     def _generate_medium_priority_recommendations(self, user_analysis):
         """Generate medium priority audit recommendations"""
@@ -3947,6 +4094,112 @@ class UserAnalysisView(generics.GenericAPIView):
             })
         
         return recommendations
+
+class ManualEntryAnalysisView(generics.GenericAPIView):
+    """
+    Manual Entry Analysis View - Detects high-risk manual journal entries
+    Specifically targets Management Override Risk in Journal Entry Testing
+    """
+    
+    def post(self, request):
+        """Run manual entry analysis for a data file"""
+        try:
+            file_id = request.data.get('file_id')
+            if not file_id:
+                return Response(
+                    {'error': 'file_id is required'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get the data file
+            try:
+                data_file = DataFile.objects.get(id=file_id)
+            except DataFile.DoesNotExist:
+                return Response(
+                    {'error': 'Data file not found'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Check if analysis already exists
+            existing_analysis = ManualEntryAnalysisResult.objects.filter(
+                data_file=data_file
+            ).first()
+            
+            if existing_analysis:
+                return Response({
+                    'message': 'Manual entry analysis already exists for this file',
+                    'analysis_id': str(existing_analysis.id),
+                    'analysis_summary': existing_analysis.analysis_summary
+                }, status=status.HTTP_200_OK)
+            
+            # Create processing job
+            job = FileProcessingJob.objects.create(
+                data_file=data_file,
+                job_type='manual_entry_analysis',
+                status='PENDING'
+            )
+            
+            # Run analysis in background
+            from core.tasks import run_manual_entry_analysis
+            task = run_manual_entry_analysis.delay(str(job.id))
+            
+            return Response({
+                'message': 'Manual entry analysis started',
+                'job_id': str(job.id),
+                'task_id': str(task.id),
+                'status': 'PENDING'
+            }, status=status.HTTP_202_ACCEPTED)
+            
+        except Exception as e:
+            logger.error(f"Error starting manual entry analysis: {e}")
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    def get(self, request):
+        """Get manual entry analysis results"""
+        try:
+            file_id = request.query_params.get('file_id')
+            if not file_id:
+                return Response(
+                    {'error': 'file_id is required'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get the analysis result
+            try:
+                analysis = ManualEntryAnalysisResult.objects.get(
+                    data_file_id=file_id
+                )
+            except ManualEntryAnalysisResult.DoesNotExist:
+                return Response(
+                    {'error': 'Manual entry analysis not found'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Format response
+            response_data = {
+                'analysis_id': str(analysis.id),
+                'analysis_date': analysis.analysis_date,
+                'analysis_summary': analysis.analysis_summary,
+                'risk_assessment': analysis.risk_assessment,
+                'audit_recommendations': analysis.audit_recommendations,
+                'compliance_assessment': analysis.compliance_assessment,
+                'manual_entries': analysis.manual_entries,
+                'period_end_adjustments': analysis.period_end_adjustments,
+                'management_override_indicators': analysis.management_override_indicators,
+                'chart_data': analysis.chart_data
+            }
+            
+            return Response(response_data, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f"Error retrieving manual entry analysis: {e}")
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 class BackdatedAnalysisView(generics.GenericAPIView):
     """API view for retrieving backdated analysis results by file ID.
@@ -4380,7 +4633,7 @@ class BackdatedAnalysisView(generics.GenericAPIView):
             backdated_entries = backdated_analysis.backdated_entries or []
             
             # Calculate statistics from the actual data structure
-            total_transactions = backdated_analysis.analysis_info.get('total_transactions', 0)
+            total_transactions = backdated_analysis.analysis_summary.get('total_transactions', 0)
             backdated_count = len(backdated_entries)
             
             # Calculate risk statistics for backdated transactions
@@ -4429,8 +4682,24 @@ class BackdatedAnalysisView(generics.GenericAPIView):
             # Generate comprehensive chart data
             chart_data = self._generate_backdated_chart_data_from_entries(backdated_entries, total_transactions)
             
-            # Prepare response data
+            # Prepare response data with complete unified structure
             response_data = {
+                # Unified fields from BaseAnalysisResult
+                'analysis_summary': backdated_analysis.analysis_summary or {
+                    'analysis_id': str(backdated_analysis.id),
+                    'analysis_date': backdated_analysis.analysis_date,
+                    'processing_duration': backdated_analysis.processing_duration,
+                    'status': backdated_analysis.status,
+                    'analysis_version': backdated_analysis.analysis_version or '2.0.0'
+                },
+                'anomaly_list': backdated_analysis.anomaly_list or [],
+                'chart_data': backdated_analysis.chart_data or {},
+                'risk_assessment': backdated_analysis.risk_assessment or {},
+                'audit_recommendations': backdated_analysis.audit_recommendations or {},
+                'compliance_assessment': backdated_analysis.compliance_assessment or {},
+                'export_data': backdated_analysis.export_data or [],
+                
+                # Legacy fields for backward compatibility
                 'file_info': {
                     'file_id': str(file_id),
                     'file_name': data_file.file_name,
@@ -4440,13 +4709,6 @@ class BackdatedAnalysisView(generics.GenericAPIView):
                     'fiscal_year': data_file.fiscal_year,
                     'uploaded_at': data_file.uploaded_at,
                     'processed_at': data_file.processed_at
-                },
-                'analysis_info': {
-                    'analysis_id': str(backdated_analysis.id),
-                    'analysis_date': backdated_analysis.analysis_date,
-                    'processing_duration': backdated_analysis.processing_duration,
-                    'status': backdated_analysis.status,
-                    'analysis_version': backdated_analysis.analysis_version or '1.0.0'
                 },
                 'summary_statistics': {
                     'total_transactions': total_transactions,
@@ -4468,11 +4730,11 @@ class BackdatedAnalysisView(generics.GenericAPIView):
                     'overall_risk_score': float(avg_risk_score)
                 },
                 'chart_data': chart_data,
-                'backdated_patterns': backdated_analysis.analysis_info or {},
+                'backdated_patterns': backdated_analysis.analysis_summary or {},
                 'analysis_metadata': {
-                    'detection_methods': backdated_analysis.analysis_info.get('detection_methods', []),
-                    'confidence_scores': backdated_analysis.analysis_info.get('confidence_scores', {}),
-                    'false_positive_indicators': backdated_analysis.analysis_info.get('false_positive_indicators', [])
+                    'detection_methods': backdated_analysis.analysis_summary.get('detection_methods', []),
+                    'confidence_scores': backdated_analysis.analysis_summary.get('confidence_scores', {}),
+                    'false_positive_indicators': backdated_analysis.analysis_summary.get('false_positive_indicators', [])
                 },
                 'recommendations': [
                     {
@@ -4561,6 +4823,14 @@ class BackdatedAnalysisView(generics.GenericAPIView):
             
             response_data['critical_alerts'] = critical_alerts
             
+            # Add ML insights from breakdowns if available
+            if backdated_analysis.breakdowns and 'ml_insights' in backdated_analysis.breakdowns:
+                response_data['ml_insights'] = backdated_analysis.breakdowns['ml_insights']
+            
+            # Add detection methods from breakdowns if available
+            if backdated_analysis.breakdowns and 'detection_methods' in backdated_analysis.breakdowns:
+                response_data['detection_methods'] = backdated_analysis.breakdowns['detection_methods']
+            
             # Log successful response
             logger.info(f"Successfully retrieved backdated analysis for file {file_id} with {backdated_count} backdated transactions")
             
@@ -4617,17 +4887,26 @@ class UnusualDaysAnalysisView(generics.GenericAPIView):
                     ]
                 }, status=404)
             
-            # Prepare response data
+            # Prepare response data with complete unified structure
             response_data = {
-                'analysis_info': {
+                # Unified fields from BaseAnalysisResult
+                'analysis_summary': unusual_days_analysis.analysis_summary or {
                     'analysis_id': str(unusual_days_analysis.id),
                     'analysis_date': unusual_days_analysis.analysis_date,
                     'processing_duration': unusual_days_analysis.processing_duration,
                     'status': unusual_days_analysis.status,
-                    'analysis_version': unusual_days_analysis.analysis_version or '1.0.0'
+                    'analysis_version': unusual_days_analysis.analysis_version or '2.0.0'
                 },
+                'anomaly_list': unusual_days_analysis.anomaly_list or [],
+                'chart_data': unusual_days_analysis.chart_data or {},
+                'risk_assessment': unusual_days_analysis.risk_assessment or {},
+                'audit_recommendations': unusual_days_analysis.audit_recommendations or {},
+                'compliance_assessment': unusual_days_analysis.compliance_assessment or {},
+                'export_data': unusual_days_analysis.export_data or [],
+                
+                # Legacy fields for backward compatibility
                         'summary': {
-            'total_transactions': unusual_days_analysis.analysis_info.get('total_transactions', 0),
+            'total_transactions': unusual_days_analysis.analysis_summary.get('total_transactions', 0),
             'weekend_postings': len(unusual_days_analysis.weekend_postings or []),
             'unusual_days_detected': len(unusual_days_analysis.unusual_days or []),
             'risk_level': self._calculate_risk_level(unusual_days_analysis),
@@ -4667,6 +4946,14 @@ class UnusualDaysAnalysisView(generics.GenericAPIView):
                 # }
             }
             
+             # Add ML insights from breakdowns if available
+            if unusual_days_analysis.breakdowns and 'ml_insights' in unusual_days_analysis.breakdowns:
+                response_data['ml_insights'] = unusual_days_analysis.breakdowns['ml_insights']
+            
+            # Add detection methods from breakdowns if available
+            if unusual_days_analysis.breakdowns and 'detection_methods' in unusual_days_analysis.breakdowns:
+                response_data['detection_methods'] = unusual_days_analysis.breakdowns['detection_methods']
+            
             # Log successful retrieval
             weekend_count = unusual_days_analysis.get_weekend_transactions_count()
             unusual_days_count = unusual_days_analysis.get_unusual_days_count()
@@ -4699,7 +4986,7 @@ class UnusualDaysAnalysisView(generics.GenericAPIView):
         unusual_days = unusual_days_analysis.unusual_days or []
         
         total_unusual = len(unusual_days)
-        total_transactions = unusual_days_analysis.analysis_info.get('total_transactions', 0)
+        total_transactions = unusual_days_analysis.analysis_summary.get('total_transactions', 0)
         
         if total_transactions == 0:
             return 'LOW'
@@ -4720,7 +5007,7 @@ class UnusualDaysAnalysisView(generics.GenericAPIView):
         unusual_days = unusual_days_analysis.unusual_days or []
         
         total_unusual = len(unusual_days)
-        total_transactions = unusual_days_analysis.analysis_info.get('total_transactions', 0)
+        total_transactions = unusual_days_analysis.analysis_summary.get('total_transactions', 0)
         
         if total_transactions == 0:
             return 0.0
@@ -4739,7 +5026,7 @@ class UnusualDaysAnalysisView(generics.GenericAPIView):
     def _calculate_weekend_risk_score(self, unusual_days_analysis):
         """Calculate weekend risk score"""
         unusual_days = unusual_days_analysis.unusual_days or []
-        total_transactions = unusual_days_analysis.analysis_info.get('total_transactions', 0)
+        total_transactions = unusual_days_analysis.analysis_summary.get('total_transactions', 0)
         
         if total_transactions == 0:
             return 0.0
@@ -4757,7 +5044,7 @@ class UnusualDaysAnalysisView(generics.GenericAPIView):
     def _calculate_unusual_pattern_risk_score(self, unusual_days_analysis):
         """Calculate unusual pattern risk score"""
         unusual_days = unusual_days_analysis.unusual_days or []
-        total_transactions = unusual_days_analysis.analysis_info.get('total_transactions', 0)
+        total_transactions = unusual_days_analysis.analysis_summary.get('total_transactions', 0)
         
         if total_transactions == 0:
             return 0.0
@@ -4774,7 +5061,7 @@ class UnusualDaysAnalysisView(generics.GenericAPIView):
     def _calculate_high_value_weekend_risk_score(self, unusual_days_analysis):
         """Calculate high value weekend risk score"""
         unusual_days = unusual_days_analysis.unusual_days or []
-        total_transactions = unusual_days_analysis.analysis_info.get('total_transactions', 0)
+        total_transactions = unusual_days_analysis.analysis_summary.get('total_transactions', 0)
         
         if total_transactions == 0:
             return 0.0
@@ -4941,15 +5228,24 @@ class ClosingEntriesAnalysisView(generics.GenericAPIView):
                 total_closing_amount = 0.0
                 risk_level = 'LOW'
             
-            # Prepare comprehensive response data
+            # Prepare comprehensive response data with complete unified structure
             response_data = {
-                'analysis_info': {
+                # Unified fields from BaseAnalysisResult
+                'analysis_summary': closing_entries_analysis.analysis_summary or {
                     'analysis_id': str(closing_entries_analysis.id),
                     'analysis_date': closing_entries_analysis.analysis_date,
                     'processing_duration': closing_entries_analysis.processing_duration,
                     'status': closing_entries_analysis.status,
-                    'analysis_version': closing_entries_analysis.analysis_version or '1.0.0'
+                    'analysis_version': closing_entries_analysis.analysis_version or '2.0.0'
                 },
+                'anomaly_list': closing_entries_analysis.anomaly_list or [],
+                'chart_data': closing_entries_analysis.chart_data or {},
+                'risk_assessment': closing_entries_analysis.risk_assessment or {},
+                'audit_recommendations': closing_entries_analysis.audit_recommendations or {},
+                'compliance_assessment': closing_entries_analysis.compliance_assessment or {},
+                'export_data': closing_entries_analysis.export_data or [],
+                
+                # Legacy fields for backward compatibility
                 'summary': {
                     'total_transactions': total_transactions,
                     'closing_entries_count': closing_entries_count,
@@ -4993,6 +5289,14 @@ class ClosingEntriesAnalysisView(generics.GenericAPIView):
                     'fs_line_export': self._prepare_fs_line_export(closing_entries_analysis.fs_line_closing or {})
                 }
             }
+            
+            # Add ML insights from breakdowns if available
+            if closing_entries_analysis.breakdowns and 'ml_insights' in closing_entries_analysis.breakdowns:
+                response_data['ml_insights'] = closing_entries_analysis.breakdowns['ml_insights']
+            
+            # Add detection methods from breakdowns if available
+            if closing_entries_analysis.breakdowns and 'detection_methods' in closing_entries_analysis.breakdowns:
+                response_data['detection_methods'] = closing_entries_analysis.breakdowns['detection_methods']
             
             # Log successful retrieval
             closing_count = closing_entries_analysis.get_closing_entries_count()
@@ -5175,21 +5479,30 @@ class HolidayAnalysisView(generics.GenericAPIView):
                     ]
                 }, status=404)
             
-            # Prepare response data
+            # Prepare response data with complete unified structure
             response_data = {
-                'analysis_info': {
+                # Unified fields from BaseAnalysisResult
+                'analysis_summary': holiday_analysis.analysis_summary or {
                     'analysis_id': str(holiday_analysis.id),
                     'analysis_date': holiday_analysis.analysis_date,
                     'processing_duration': holiday_analysis.processing_duration,
                     'status': holiday_analysis.status,
-                    'analysis_version': holiday_analysis.analysis_version or '1.0.0'
+                    'analysis_version': holiday_analysis.analysis_version or '2.0.0'
                 },
+                'anomaly_list': holiday_analysis.anomaly_list or [],
+                'chart_data': holiday_analysis.chart_data or {},
+                'risk_assessment': holiday_analysis.risk_assessment or {},
+                'audit_recommendations': holiday_analysis.audit_recommendations or {},
+                'compliance_assessment': holiday_analysis.compliance_assessment or {},
+                'export_data': holiday_analysis.export_data or [],
+                
+                # Legacy fields for backward compatibility
                 'summary': {
                     'total_holiday_postings': len(holiday_analysis.holiday_postings or []),
                     'holiday_percentage': holiday_analysis.get_holiday_percentage(),
                     'unique_holidays': holiday_analysis.get_unique_holidays(),
-                    'country_code': holiday_analysis.analysis_info.get('country_code', 'saudiarabian'),
-                    'fiscal_year': holiday_analysis.analysis_info.get('fiscal_year', ''),
+                    'country_code': holiday_analysis.analysis_summary.get('country_code', 'saudiarabian'),
+                    'fiscal_year': holiday_analysis.analysis_summary.get('fiscal_year', ''),
                     'risk_level': holiday_analysis.get_risk_level(),
                     'overall_risk_score': holiday_analysis.get_overall_risk_score(),
                     'high_value_holiday_count': len(holiday_analysis.get_high_value_holiday_postings()),
@@ -5236,6 +5549,14 @@ class HolidayAnalysisView(generics.GenericAPIView):
             holiday_activity_summary = holiday_analysis.get_holiday_activity_summary()
             if holiday_activity_summary:
                 response_data['holiday_activity_summary'] = holiday_activity_summary
+            
+            # Add ML insights from breakdowns if available
+            if holiday_analysis.breakdowns and 'ml_insights' in holiday_analysis.breakdowns:
+                response_data['ml_insights'] = holiday_analysis.breakdowns['ml_insights']
+            
+            # Add detection methods from breakdowns if available
+            if holiday_analysis.breakdowns and 'detection_methods' in holiday_analysis.breakdowns:
+                response_data['detection_methods'] = holiday_analysis.breakdowns['detection_methods']
             
             # Log successful retrieval
             holiday_count = len(holiday_analysis.holiday_postings or [])
@@ -10140,7 +10461,7 @@ class ExcelExportView(generics.GenericAPIView):
             if duplicate_analysis:
                 analysis_results['duplicate_analysis'] = {
                     'duplicate_list': duplicate_analysis.duplicate_list or [],
-                    'analysis_info': duplicate_analysis.analysis_info or {},
+                    'analysis_summary': duplicate_analysis.analysis_summary or {},
                     'chart_data': duplicate_analysis.chart_data or {},
                     'audit_recommendations': duplicate_analysis.audit_recommendations or {}
                 }
@@ -10153,7 +10474,7 @@ class ExcelExportView(generics.GenericAPIView):
             if backdated_analysis:
                 analysis_results['backdated_analysis'] = {
                     'backdated_entries': backdated_analysis.backdated_entries or [],
-                    'analysis_info': backdated_analysis.analysis_info or {},
+                    'analysis_summary': backdated_analysis.analysis_summary or {},
                     'chart_data': backdated_analysis.chart_data or {},
                     'audit_recommendations': backdated_analysis.audit_recommendations or {}
                 }
@@ -10166,7 +10487,7 @@ class ExcelExportView(generics.GenericAPIView):
             if closing_analysis:
                 analysis_results['closing_entries_analysis'] = {
                     'closing_entries': closing_analysis.closing_entries or [],
-                    'analysis_info': closing_analysis.analysis_info or {},
+                    'analysis_summary': closing_analysis.analysis_summary or {},
                     'chart_data': closing_analysis.chart_data or {},
                     'audit_recommendations': getattr(closing_analysis, 'audit_recommendations', {})
                 }
@@ -10179,7 +10500,7 @@ class ExcelExportView(generics.GenericAPIView):
             if holiday_analysis:
                 analysis_results['holiday_analysis'] = {
                     'holiday_postings': holiday_analysis.holiday_postings or [],
-                    'analysis_info': holiday_analysis.analysis_info or {},
+                    'analysis_summary': holiday_analysis.analysis_summary or {},
                     'chart_data': holiday_analysis.chart_data or {},
                     'audit_recommendations': holiday_analysis.audit_recommendations or {}
                 }
@@ -10206,7 +10527,7 @@ class ExcelExportView(generics.GenericAPIView):
             if unusual_days_analysis:
                 analysis_results['unusual_days_analysis'] = {
                     'unusual_days': unusual_days_analysis.unusual_days or [],
-                    'analysis_info': unusual_days_analysis.analysis_info or {},
+                    'analysis_summary': unusual_days_analysis.analysis_summary or {},
                     'chart_data': unusual_days_analysis.chart_data or {},
                     'audit_recommendations': getattr(unusual_days_analysis, 'audit_recommendations', {})
                 }

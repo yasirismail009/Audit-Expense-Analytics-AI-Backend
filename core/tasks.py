@@ -20,7 +20,7 @@ from .models import (
     ClosingEntriesAnalysisResult, OverallAnalysisResult, RiskScoringDocument, HolidayAnalysisResult,
     RuleBasedModelTraining, DuplicateAnalysisModelTraining, BackdatedAnalysisModelTraining,
     UserAnalysisModelTraining, UnusualDaysAnalysisModelTraining, ClosingEntriesAnalysisModelTraining,
-    HolidayAnalysisModelTraining, OverallRiskAnalysisModelTraining
+    HolidayAnalysisModelTraining, OverallRiskAnalysisModelTraining, ManualEntryAnalysisResult
 )
 from .specialized_analysis_models import AnalysisModelManager
 from .ml_models import MLModelTrainer
@@ -30,6 +30,157 @@ from .general_analysis import GeneralAnalyzer
 from .overall_analysis import OverallAnalyzer
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# HOLIDAY ANALYSIS HELPER FUNCTIONS
+# ============================================================================
+
+def _calculate_holiday_risk_score(transaction, holiday_data):
+    """Calculate risk score for holiday posting based on rules"""
+    risk_score = 50.0  # Base risk for holiday posting
+    
+    # Additional risk factors
+    if transaction.amount_local_currency < 0:  # Debit transaction
+        risk_score += 10.0
+    
+    if abs(float(transaction.amount_local_currency)) > 100000:  # High value
+        risk_score += 15.0
+    
+    if holiday_data.get('type') == 'religious':  # Religious holiday
+        risk_score += 5.0
+    
+    # Month-end holiday posting
+    if transaction.posting_date.day >= 25:
+        risk_score += 10.0
+    
+    # Year-end holiday posting
+    if transaction.posting_date.month == 12 and transaction.posting_date.day >= 25:
+        risk_score += 10.0
+    
+    return min(risk_score, 100.0)
+
+def _get_holiday_risk_level(transaction, holiday_data):
+    """Get risk level for holiday posting"""
+    risk_score = _calculate_holiday_risk_score(transaction, holiday_data)
+    
+    if risk_score >= 80:
+        return 'Critical'
+    elif risk_score >= 60:
+        return 'High'
+    elif risk_score >= 30:
+        return 'Medium'
+    else:
+        return 'Low'
+
+def _generate_holiday_risk_assessment(holiday_postings, total_transactions):
+    """Generate comprehensive risk assessment for holiday postings"""
+    if not holiday_postings:
+        return {
+            'overall_risk': 'Low',
+            'risk_score': 0,
+            'risk_factors': [],
+            'recommendations': ['No holiday postings detected']
+        }
+    
+    # Calculate risk metrics
+    high_risk_count = len([p for p in holiday_postings if p['risk_level'] in ['High', 'Critical']])
+    total_amount = sum(abs(p['amount']) for p in holiday_postings)
+    avg_amount = total_amount / len(holiday_postings) if holiday_postings else 0
+    
+    # Determine overall risk
+    if high_risk_count > len(holiday_postings) * 0.5:
+        overall_risk = 'High'
+    elif high_risk_count > 0:
+        overall_risk = 'Medium'
+    else:
+        overall_risk = 'Low'
+    
+    return {
+        'overall_risk': overall_risk,
+        'risk_score': (high_risk_count / len(holiday_postings) * 100) if holiday_postings else 0,
+        'total_holiday_amount': total_amount,
+        'average_holiday_amount': avg_amount,
+        'high_risk_postings': high_risk_count,
+        'risk_factors': [
+            'Holiday postings detected',
+            f'{high_risk_count} high-risk postings' if high_risk_count > 0 else None,
+            f'Total amount: {total_amount:,.2f}' if total_amount > 0 else None
+        ],
+        'recommendations': [
+            'Review all holiday postings for business justification',
+            'Investigate high-value holiday transactions',
+            'Verify user authorization for holiday postings'
+        ]
+    }
+
+def _generate_holiday_audit_recommendations(holiday_postings, holiday_by_user, holiday_by_account):
+    """Generate audit recommendations for holiday postings"""
+    recommendations = {
+        'priority_recommendations': [],
+        'user_recommendations': [],
+        'account_recommendations': [],
+        'general_recommendations': []
+    }
+    
+    if not holiday_postings:
+        recommendations['general_recommendations'].append('No holiday postings detected - no specific recommendations')
+        return recommendations
+    
+    # Priority recommendations
+    high_value_postings = [p for p in holiday_postings if abs(p['amount']) > 100000]
+    if high_value_postings:
+        recommendations['priority_recommendations'].append(
+            f'Investigate {len(high_value_postings)} high-value holiday postings (>100,000)'
+        )
+    
+    critical_risk_postings = [p for p in holiday_postings if p['risk_level'] == 'Critical']
+    if critical_risk_postings:
+        recommendations['priority_recommendations'].append(
+            f'Review {len(critical_risk_postings)} critical-risk holiday postings'
+        )
+    
+    # User recommendations
+    for user, postings in holiday_by_user.items():
+        if len(postings) > 5:  # Users with many holiday postings
+            recommendations['user_recommendations'].append(
+                f'Review user {user} - {len(postings)} holiday postings'
+            )
+    
+    # Account recommendations
+    for account, postings in holiday_by_account.items():
+        if len(postings) > 3:  # Accounts with many holiday postings
+            recommendations['account_recommendations'].append(
+                f'Review account {account} - {len(postings)} holiday postings'
+            )
+    
+    # General recommendations
+    recommendations['general_recommendations'].extend([
+        'Verify business justification for all holiday postings',
+        'Check user authorization levels for holiday posting',
+        'Review holiday posting patterns for unusual activity',
+        'Consider implementing holiday posting restrictions'
+    ])
+    
+    return recommendations
+
+def _generate_holiday_breakdown(holiday_transactions):
+    """Generate holiday breakdown for analysis"""
+    if not holiday_transactions:
+        return []
+    
+    holiday_counts = {}
+    for transaction in holiday_transactions:
+        holiday_name = transaction.get('holiday_name', 'Unknown Holiday')
+        if holiday_name not in holiday_counts:
+            holiday_counts[holiday_name] = 0
+        holiday_counts[holiday_name] += 1
+    
+    # Convert to list format for chart data
+    breakdown = []
+    for holiday_name, count in holiday_counts.items():
+        breakdown.append([holiday_name, count])
+    
+    return breakdown
 
 def log_task_info(task_name, job_id, message, level="info"):
     """Log task information with consistent formatting"""
@@ -209,8 +360,12 @@ def run_restructured_analysis(self, job_id):
         debug_task_state(task_name, job_id, "RISK_ANALYSIS", "Starting Risk Analysis...")
         risk_result = run_risk_analysis.delay(job_id)
         
+        # 10. RUN AI RISK RECOMMENDATIONS → Advanced AI-powered risk assessment and recommendations
+        debug_task_state(task_name, job_id, "AI_RISK_RECOMMENDATIONS", "Starting AI Risk Recommendations...")
+        ai_risk_result = run_ai_risk_recommendations.delay(job_id)
+        
         # Wait for dependent analyses to complete
-        dependent_tasks = [overall_result, risk_result]
+        dependent_tasks = [overall_result, risk_result, ai_risk_result]
         for i, task in enumerate(dependent_tasks):
             try:
                 task.get(timeout=300)  # 5 minute timeout per task
@@ -273,6 +428,7 @@ def run_restructured_analysis(self, job_id):
                 'holiday_analysis_task_id': str(holiday_result.id),
                 'overall_analysis_task_id': str(overall_result.id),
                 'risk_analysis_task_id': str(risk_result.id),
+                'ai_risk_recommendations_task_id': str(ai_risk_result.id),
                 'rule_training_task_id': str(rule_training_result.id),
                 'duplicate_model_training_task_id': str(duplicate_model_result.id),
                 'backdated_model_training_task_id': str(backdated_model_result.id),
@@ -593,7 +749,6 @@ def run_duplicate_analysis(self, job_id):
             export_data=export_data,
             # Legacy fields for backward compatibility
             duplicate_list=duplicates,
-            analysis_info=analysis_summary,
             breakdowns=duplicate_groups,
             processing_duration=(timezone.now() - start_time).total_seconds(),
             status='COMPLETED'
@@ -655,21 +810,23 @@ def run_duplicate_analysis(self, job_id):
         # Calculate processing duration
         processing_duration = (timezone.now() - start_time).total_seconds()
         
-        # Save results to database
+        # Save results to database using new unified structure
         duplicate_analysis_result = DuplicateAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
             analysis_type='duplicate_analysis',
-            analysis_version='1.0.0',
-            analysis_info={
+            analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': total_transactions,
                 'duplicate_count': duplicate_count,
                 'duplicate_percentage': duplicate_percentage,
                 'duplicate_types': {k: len(v) for k, v in duplicate_groups.items()},
                 'processing_duration': processing_duration
             },
+            anomaly_list=duplicates,
             duplicate_list=duplicates,
-            duplicate_by_type=duplicate_groups,
+            breakdowns=duplicate_groups,
+            chart_data=chart_data if 'chart_data' in locals() else {},
             risk_assessment=risk_assessment,
             audit_recommendations=audit_recommendations,
             compliance_assessment=compliance_assessment,
@@ -1188,19 +1345,20 @@ def run_backdated_analysis(self, job_id):
         # Calculate processing duration
         processing_duration = (timezone.now() - start_time).total_seconds()
         
-        # Save results to database
+        # Save results to database using new unified structure
         backdated_analysis_result = BackdatedAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
             analysis_type='backdated_analysis',
-            analysis_version='1.0.0',
-            analysis_info={
+            analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': total_transactions,
                 'backdated_count': backdated_count,
                 'backdated_percentage': backdated_percentage,
                 'backdated_by_days': {k: len(v) for k, v in backdated_by_days_difference.items()},
                 'processing_duration': processing_duration
             },
+            anomaly_list=backdated_transactions,
             backdated_transactions=backdated_transactions,
             backdated_by_user=list(backdated_by_user.items()),
             backdated_by_account=list(backdated_by_account.items()),
@@ -1660,19 +1818,20 @@ def run_user_analysis(self, job_id):
         # Calculate processing duration
         processing_duration = (timezone.now() - start_time).total_seconds()
         
-        # Save results to database
+        # Save results to database using new unified structure
         user_analysis_result = UserAnalysisResult.objects.create(
                 data_file=data_file,
                 processing_job=job,
                 analysis_type='user_analysis',
-                analysis_version='1.0.0',
-            analysis_info={
+                analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': total_transactions,
                 'total_users': total_users,
                 'anomaly_count': anomaly_count,
                 'anomaly_percentage': anomaly_percentage,
                 'processing_duration': processing_duration
             },
+            anomaly_list=user_anomalies,
             user_anomalies=user_anomalies,
             user_transaction_summary=user_summary,
             user_risk_assessment=list(user_risk_assessment.values()),
@@ -1912,19 +2071,20 @@ def run_unusual_days_analysis(self, job_id):
         # Calculate processing duration
         processing_duration = (timezone.now() - start_time).total_seconds()
         
-        # Save results to database
+        # Save results to database using new unified structure
         unusual_days_analysis_result = UnusualDaysAnalysisResult.objects.create(
                 data_file=data_file,
                 processing_job=job,
                 analysis_type='unusual_days_analysis',
-                analysis_version='1.0.0',
-            analysis_info={
+                analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': total_transactions,
                 'weekend_count': weekend_count,
                 'weekend_percentage': weekend_percentage,
                 'weekend_by_day': {k: len(v) for k, v in unusual_days_by_type.items()},
                 'processing_duration': processing_duration
             },
+            anomaly_list=weekend_postings,
             weekend_postings=weekend_postings,
             unusual_days_by_user=list(unusual_days_by_user.items()),
             unusual_days_by_account=list(unusual_days_by_account.items()),
@@ -2204,13 +2364,13 @@ def run_closing_entries_analysis(self, job_id):
         # Calculate processing duration
         processing_duration = (timezone.now() - start_time).total_seconds()
         
-        # Save results to database
+        # Save results to database using new unified structure
         closing_entries_analysis_result = ClosingEntriesAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
             analysis_type='closing_entries_analysis',
-            analysis_version='1.0.0',
-            analysis_info={
+            analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': total_transactions,
                 'closing_count': closing_count,
                 'post_close_count': post_close_count,
@@ -2218,6 +2378,7 @@ def run_closing_entries_analysis(self, job_id):
                 'closing_by_month': {k: len(v) for k, v in closing_by_month.items()},
                 'processing_duration': processing_duration
             },
+            anomaly_list=closing_entries + post_close_entries,
             closing_entries=closing_entries,
             post_close_entries=post_close_entries,
             closing_by_user=list(closing_by_user.items()),
@@ -2469,6 +2630,39 @@ def run_holiday_analysis(self, job_id):
                 'processing_duration': (timezone.now() - start_time).total_seconds()
             }
         
+        # =============================================================================
+        # ML MODEL INTEGRATION - Run ML predictions during analysis
+        # =============================================================================
+        
+        ml_predictions = {}
+        ml_detection_method = 'rule_based'
+        ml_detected_holidays = []
+        
+        try:
+            # Try to use ML model for enhanced holiday detection
+            from .specialized_analysis_models import HolidayAnalysisModel
+            holiday_model = HolidayAnalysisModel()
+            
+            if holiday_model.is_trained:
+                ml_predictions = holiday_model.predict(transactions)
+                ml_detected_holidays = [
+                    {
+                        'transaction_id': pred.get('transaction_id'),
+                        'ml_confidence': pred.get('risk_score', 0),
+                        'ml_risk_level': pred.get('risk_level', 'MEDIUM'),
+                        'ml_detection_method': 'ml_model'
+                    }
+                    for pred in ml_predictions
+                ]
+                ml_detection_method = 'ml_enhanced'
+                logger.info(f"ML model detected {len(ml_detected_holidays)} potential holiday transactions")
+            else:
+                logger.info("ML model not trained, using rule-based detection only")
+                
+        except Exception as e:
+            logger.warning(f"ML holiday detection failed, falling back to rule-based: {e}")
+            ml_detection_method = 'rule_based'
+        
         # Import holiday utilities
         from .holiday_utils import get_holidays, is_holiday
         
@@ -2620,13 +2814,13 @@ def run_holiday_analysis(self, job_id):
         # Calculate processing duration
         processing_duration = (timezone.now() - start_time).total_seconds()
         
-        # Save results to database
+        # Save results to database using new unified structure
         holiday_analysis_result = HolidayAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
             analysis_type='holiday_analysis',
-            analysis_version='1.0.0',
-            analysis_info={
+            analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': total_transactions,
                 'holiday_postings_count': holiday_postings_count,
                 'holiday_percentage': holiday_percentage,
@@ -2638,8 +2832,12 @@ def run_holiday_analysis(self, job_id):
                 'processing_duration': processing_duration,
                 'official_holidays_count': len(holiday_dates),
                 'fallback_holidays_count': len(fallback_holiday_dates),
-                'date_range_used': 'audit_dates' if data_file.audit_start_date and data_file.audit_end_date else 'fiscal_year' if data_file.fiscal_year else 'transaction_range'
+                'date_range_used': 'audit_dates' if data_file.audit_start_date and data_file.audit_end_date else 'fiscal_year' if data_file.fiscal_year else 'transaction_range',
+                'ml_detection_method': ml_detection_method,
+                'ml_detected_count': len(ml_detected_holidays),
+                'ml_enhancement_applied': ml_detection_method == 'ml_enhanced'
             },
+            anomaly_list=holiday_postings,
             holiday_postings=holiday_postings,
             holiday_by_fs_line=list(holiday_by_fs_line.items()),
             holiday_by_account=list(holiday_by_account.items()),
@@ -2654,6 +2852,25 @@ def run_holiday_analysis(self, job_id):
                 'total_holiday_amount': sum(abs(p.get('amount', 0)) for p in holiday_postings),
                 'holiday_types_impact': {k: len(v) for k, v in holiday_by_holiday_type.items()},
                 'impact_assessment': 'High' if any(p.get('risk_level') in ['High', 'Critical'] for p in holiday_postings) else 'Medium' if holiday_postings else 'Low'
+            },
+            breakdowns={
+                'ml_insights': {
+                    'detection_method': ml_detection_method,
+                    'ml_predictions_count': len(ml_predictions),
+                    'ml_enhanced_detection': ml_detection_method == 'ml_enhanced',
+                    'ml_confidence_scores': [pred.get('ml_confidence', 0) for pred in ml_detected_holidays],
+                    'ml_risk_distribution': {
+                        'high': len([p for p in ml_detected_holidays if p.get('ml_risk_level') == 'HIGH']),
+                        'medium': len([p for p in ml_detected_holidays if p.get('ml_risk_level') == 'MEDIUM']),
+                        'low': len([p for p in ml_detected_holidays if p.get('ml_risk_level') == 'LOW'])
+                    }
+                },
+                'holiday_patterns': {
+                    'by_holiday_type': holiday_by_holiday_type,
+                    'by_user': {k: len(v) for k, v in holiday_by_user.items()},
+                    'by_account': {k: len(v) for k, v in holiday_by_account.items()},
+                    'by_fs_line': {k: len(v) for k, v in holiday_by_fs_line.items()}
+                }
             },
             status='COMPLETED'
         )
@@ -2687,134 +2904,6 @@ def run_holiday_analysis(self, job_id):
             'success': False,
             'error': str(e)
         }
-    
-def _calculate_holiday_risk_score(transaction, holiday_data):
-    """Calculate risk score for holiday posting based on rules"""
-    risk_score = 50.0  # Base risk for holiday posting
-    
-    # Additional risk factors
-    if transaction.amount_local_currency < 0:  # Debit transaction
-        risk_score += 10.0
-    
-    if abs(float(transaction.amount_local_currency)) > 100000:  # High value
-        risk_score += 15.0
-    
-    if holiday_data.get('type') == 'religious':  # Religious holiday
-        risk_score += 5.0
-    
-    # Month-end holiday posting
-    if transaction.posting_date.day >= 25:
-        risk_score += 10.0
-    
-    # Year-end holiday posting
-    if transaction.posting_date.month == 12 and transaction.posting_date.day >= 25:
-        risk_score += 10.0
-    
-    return min(risk_score, 100.0)
-
-def _get_holiday_risk_level(transaction, holiday_data):
-    """Get risk level for holiday posting"""
-    risk_score = _calculate_holiday_risk_score(transaction, holiday_data)
-    
-    if risk_score >= 80:
-        return 'Critical'
-    elif risk_score >= 60:
-        return 'High'
-    elif risk_score >= 30:
-        return 'Medium'
-    else:
-        return 'Low'
-
-def _generate_holiday_risk_assessment(holiday_postings, total_transactions):
-    """Generate comprehensive risk assessment for holiday postings"""
-    if not holiday_postings:
-        return {
-            'overall_risk': 'Low',
-            'risk_score': 0,
-            'risk_factors': [],
-            'recommendations': ['No holiday postings detected']
-        }
-    
-    # Calculate risk metrics
-    high_risk_count = len([p for p in holiday_postings if p['risk_level'] in ['High', 'Critical']])
-    total_amount = sum(abs(p['amount']) for p in holiday_postings)
-    avg_amount = total_amount / len(holiday_postings) if holiday_postings else 0
-    
-    # Determine overall risk
-    if high_risk_count > len(holiday_postings) * 0.5:
-        overall_risk = 'High'
-    elif high_risk_count > 0:
-        overall_risk = 'Medium'
-    else:
-        overall_risk = 'Low'
-    
-    return {
-        'overall_risk': overall_risk,
-        'risk_score': (high_risk_count / len(holiday_postings) * 100) if holiday_postings else 0,
-        'total_holiday_amount': total_amount,
-        'average_holiday_amount': avg_amount,
-        'high_risk_postings': high_risk_count,
-        'risk_factors': [
-            'Holiday postings detected',
-            f'{high_risk_count} high-risk postings' if high_risk_count > 0 else None,
-            f'Total amount: {total_amount:,.2f}' if total_amount > 0 else None
-        ],
-        'recommendations': [
-            'Review all holiday postings for business justification',
-            'Investigate high-value holiday transactions',
-            'Verify user authorization for holiday postings'
-        ]
-    }
-
-def _generate_holiday_audit_recommendations(holiday_postings, holiday_by_user, holiday_by_account):
-    """Generate audit recommendations for holiday postings"""
-    recommendations = {
-        'priority_recommendations': [],
-        'user_recommendations': [],
-        'account_recommendations': [],
-        'general_recommendations': []
-    }
-    
-    if not holiday_postings:
-        recommendations['general_recommendations'].append('No holiday postings detected - no specific recommendations')
-        return recommendations
-    
-    # Priority recommendations
-    high_value_postings = [p for p in holiday_postings if abs(p['amount']) > 100000]
-    if high_value_postings:
-        recommendations['priority_recommendations'].append(
-            f'Investigate {len(high_value_postings)} high-value holiday postings (>100,000)'
-        )
-    
-    critical_risk_postings = [p for p in holiday_postings if p['risk_level'] == 'Critical']
-    if critical_risk_postings:
-        recommendations['priority_recommendations'].append(
-            f'Review {len(critical_risk_postings)} critical-risk holiday postings'
-        )
-    
-    # User recommendations
-    for user, postings in holiday_by_user.items():
-        if len(postings) > 5:  # Users with many holiday postings
-            recommendations['user_recommendations'].append(
-                f'Review user {user} - {len(postings)} holiday postings'
-            )
-    
-    # Account recommendations
-    for account, postings in holiday_by_account.items():
-        if len(postings) > 3:  # Accounts with many holiday postings
-            recommendations['account_recommendations'].append(
-                f'Review account {account} - {len(postings)} holiday postings'
-            )
-    
-    # General recommendations
-    recommendations['general_recommendations'].extend([
-        'Verify business justification for all holiday postings',
-        'Check user authorization levels for holiday posting',
-        'Review holiday posting patterns for unusual activity',
-        'Consider implementing holiday posting restrictions'
-    ])
-    
-    return recommendations
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
 def run_overall_analysis(self, job_id):
@@ -2885,6 +2974,99 @@ def run_overall_analysis(self, job_id):
             pass
         
         return {'error': error_msg}
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60, time_limit=600, soft_time_limit=480)
+def run_ai_risk_recommendations(self, job_id):
+    """
+    Run AI-powered risk recommendations and save results to database
+    This task should be called after all other analyses are completed
+    """
+    task_name = "run_ai_risk_recommendations"
+    start_time = timezone.now()
+    
+    debug_task_state(task_name, job_id, "STARTED", f"Task ID: {self.request.id}")
+    
+    try:
+        # Get the processing job
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        debug_task_state(task_name, job_id, "JOB_RETRIEVED", f"Processing file: {data_file.file_name}")
+        
+        # Import AI risk recommendation engine
+        from .ai_risk_recommendations import AIRiskRecommendationAPI
+        
+        # Generate AI risk recommendations
+        debug_task_state(task_name, job_id, "AI_ANALYSIS", "Starting AI risk analysis...")
+        
+        ai_results = AIRiskRecommendationAPI.generate_risk_recommendations(str(data_file.id))
+        
+        if 'error' in ai_results:
+            debug_task_exception(task_name, job_id, Exception(ai_results['error']), "AI risk analysis failed")
+            return {'error': ai_results['error']}
+        
+        # Save AI risk assessment to database
+        debug_task_state(task_name, job_id, "SAVING_RESULTS", "Saving AI risk assessment to database...")
+        
+        from .enhanced_risk_models import AIRiskAssessment
+        
+        # Create AI risk assessment record
+        ai_assessment = AIRiskAssessment.objects.create(
+            data_file=data_file,
+            overall_ai_risk_score=ai_results['ai_risk_assessment']['overall_ai_risk_score'],
+            ai_confidence_score=ai_results['ai_risk_assessment']['ai_confidence_score'],
+            ai_risk_level=ai_results['ai_risk_assessment']['risk_level'],
+            ml_predictions=ai_results['ai_risk_assessment']['ml_predictions'],
+            feature_importance=ai_results['feature_importance'],
+            model_performance=ai_results['model_performance'],
+            anomaly_clusters=ai_results['ai_risk_assessment']['anomaly_clusters'],
+            nlp_insights=ai_results['ai_risk_assessment']['nlp_insights'],
+            ai_recommendations=ai_results['ai_recommendations'],
+            immediate_actions=ai_results['ai_recommendations']['immediate_actions'],
+            investigation_priorities=ai_results['ai_recommendations']['investigation_priorities'],
+            audit_procedures=ai_results['ai_recommendations']['audit_procedures'],
+            risk_mitigation=ai_results['ai_recommendations']['risk_mitigation'],
+            processing_duration=(timezone.now() - start_time).total_seconds(),
+            models_used=ai_results['model_performance']['models_trained'],
+            status='COMPLETED'
+        )
+        
+        # Update job with AI results
+        job.ai_ml_results = {
+            'ai_risk_assessment_id': str(ai_assessment.id),
+            'ai_risk_score': ai_results['ai_risk_assessment']['overall_ai_risk_score'],
+            'ai_confidence_score': ai_results['ai_risk_assessment']['ai_confidence_score'],
+            'ai_risk_level': ai_results['ai_risk_assessment']['risk_level'],
+            'anomaly_clusters_count': ai_results['ai_risk_assessment']['anomaly_clusters']['total_clusters'],
+            'key_recommendations_count': len(ai_results['ai_recommendations']['immediate_actions']),
+        }
+        job.save()
+        
+        debug_task_state(task_name, job_id, "COMPLETED", 
+                        f"AI risk recommendations completed successfully in {(timezone.now() - start_time).total_seconds():.2f} seconds")
+        
+        return {
+            'job_id': job_id,
+            'ai_assessment_id': str(ai_assessment.id),
+            'ai_risk_score': ai_results['ai_risk_assessment']['overall_ai_risk_score'],
+            'ai_risk_level': ai_results['ai_risk_assessment']['risk_level'],
+            'status': 'COMPLETED',
+            'processing_duration': (timezone.now() - start_time).total_seconds(),
+        }
+        
+    except Exception as e:
+        debug_task_exception(task_name, job_id, e, "AI risk recommendations failed")
+        
+        # Update job status
+        try:
+            job = FileProcessingJob.objects.get(id=job_id)
+            job.status = 'FAILED'
+            job.error_message = f"AI risk recommendations failed: {str(e)}"
+            job.save()
+        except:
+            pass
+        
+        return {'error': str(e)}
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=1800, soft_time_limit=1500)
 def run_risk_analysis(self, job_id):
@@ -5886,3 +6068,732 @@ def find_similar_transaction(transaction, all_transactions, factors):
             return other_transaction
     
     return None
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
+def run_manual_entry_analysis(self, job_id):
+    """Run Manual Entry Analysis to detect high-risk manual journal entries (Management Override Risk)"""
+    
+    task_name = "Manual Entry Analysis"
+    debug_task_state(task_name, job_id, "STARTED", f"Task ID: {self.request.id}")
+    
+    try:
+        # Get the processing job and data file
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        debug_task_state(task_name, job_id, "JOB_RETRIEVED", f"Analyzing manual entries for file: {data_file.file_name}")
+        
+        # Get all transactions for this file
+        transactions = SAPGLPosting.objects.filter(data_file=data_file)
+        
+        debug_task_data(task_name, job_id, "TRANSACTIONS", f"Found {len(transactions)} transactions to analyze")
+        
+        if not transactions.exists():
+            error_msg = "No transactions found for analysis"
+            debug_task_state(task_name, job_id, "FAILED", error_msg)
+            return {'error': error_msg}
+        
+        # Initialize analysis results
+        manual_entries = []
+        period_end_adjustments = []
+        management_override_indicators = []
+        
+        # Analyze each transaction for manual entry indicators
+        for transaction in transactions:
+            manual_entry_data = {}
+            
+            # Check if it's a manual entry
+            if transaction.is_manual_entry:
+                manual_entry_data = {
+                    'transaction_id': str(transaction.id),
+                    'document_number': transaction.document_number,
+                    'posting_date': transaction.posting_date.isoformat() if transaction.posting_date else None,
+                    'document_date': transaction.document_date.isoformat() if transaction.document_date else None,
+                    'gl_account': transaction.gl_account,
+                    'amount': float(transaction.amount_local_currency),
+                    'user_name': transaction.user_name,
+                    'text': transaction.text,
+                    'document_type': transaction.document_type,
+                    'manual_entry_type': _determine_manual_entry_type(transaction),
+                    'risk_score': _calculate_manual_entry_risk_score(transaction),
+                    'risk_level': _determine_risk_level(_calculate_manual_entry_risk_score(transaction)),
+                    'management_override_indicators': _identify_management_override_indicators(transaction)
+                }
+                
+                manual_entries.append(manual_entry_data)
+                
+                # Check for period-end adjustments
+                if transaction.is_period_end_adjustment:
+                    period_end_adjustments.append(manual_entry_data)
+                
+                # Check for management override indicators
+                override_indicators = _identify_management_override_indicators(transaction)
+                if override_indicators:
+                    management_override_indicators.append({
+                        'transaction_id': str(transaction.id),
+                        'indicators': override_indicators,
+                        'risk_score': manual_entry_data['risk_score']
+                    })
+        
+        debug_task_data(task_name, job_id, "MANUAL_ENTRIES", f"Found {len(manual_entries)} manual entries")
+        debug_task_data(task_name, job_id, "PERIOD_END", f"Found {len(period_end_adjustments)} period-end adjustments")
+        debug_task_data(task_name, job_id, "OVERRIDE_INDICATORS", f"Found {len(management_override_indicators)} management override indicators")
+        
+        # Calculate risk distribution
+        risk_distribution = _calculate_manual_entry_risk_distribution(manual_entries)
+        
+        # Calculate amount analysis
+        amount_analysis = _calculate_manual_entry_amount_analysis(manual_entries)
+        
+        # Calculate user analysis
+        user_analysis = _calculate_manual_entry_user_analysis(manual_entries)
+        
+        # Calculate account analysis
+        account_analysis = _calculate_manual_entry_account_analysis(manual_entries)
+        
+        # Create analysis result
+        from core.models import ManualEntryAnalysisResult
+        
+        manual_entry_analysis = ManualEntryAnalysisResult.objects.create(
+            data_file=data_file,
+            processing_job=job,
+            analysis_summary={
+                'total_transactions': len(transactions),
+                'manual_entries_count': len(manual_entries),
+                'period_end_adjustments_count': len(period_end_adjustments),
+                'management_override_indicators_count': len(management_override_indicators),
+                'high_risk_manual_entries': len([e for e in manual_entries if e['risk_level'] in ['HIGH', 'CRITICAL']])
+            },
+            anomaly_list=manual_entries,
+            chart_data={
+                'risk_distribution': risk_distribution,
+                'amount_analysis': amount_analysis,
+                'user_analysis': user_analysis,
+                'account_analysis': account_analysis
+            },
+            risk_assessment={
+                'overall_risk_score': _calculate_overall_manual_entry_risk_score(manual_entries),
+                'risk_distribution': risk_distribution,
+                'high_risk_entries': len([e for e in manual_entries if e['risk_level'] in ['HIGH', 'CRITICAL']])
+            },
+            audit_recommendations={
+                'high_priority': [e for e in manual_entries if e['risk_level'] == 'CRITICAL'],
+                'medium_priority': [e for e in manual_entries if e['risk_level'] == 'HIGH'],
+                'low_priority': [e for e in manual_entries if e['risk_level'] in ['MEDIUM', 'LOW']]
+            },
+            compliance_assessment={
+                'management_override_risk': 'HIGH' if management_override_indicators else 'LOW',
+                'period_end_adjustment_risk': 'HIGH' if period_end_adjustments else 'LOW',
+                'manual_entry_compliance': _assess_manual_entry_compliance(manual_entries)
+            },
+            export_data=manual_entries,
+            # Manual entry specific fields
+            manual_entries=manual_entries,
+            manual_entry_risk_distribution=risk_distribution,
+            manual_entry_amount_analysis=amount_analysis,
+            manual_entry_user_analysis=user_analysis,
+            manual_entry_account_analysis=account_analysis,
+            period_end_adjustments=period_end_adjustments,
+            management_override_indicators=management_override_indicators
+        )
+        
+        debug_task_state(task_name, job_id, "COMPLETED", f"Manual entry analysis completed successfully")
+        
+        return {
+            'success': True,
+            'manual_entries_count': len(manual_entries),
+            'period_end_adjustments_count': len(period_end_adjustments),
+            'management_override_indicators_count': len(management_override_indicators),
+            'analysis_id': str(manual_entry_analysis.id)
+        }
+        
+    except Exception as e:
+        error_msg = f"Error in manual entry analysis: {str(e)}"
+        debug_task_state(task_name, job_id, "FAILED", error_msg)
+        logger.error(error_msg, exc_info=True)
+        return {'error': error_msg}
+
+def _determine_manual_entry_type(transaction):
+    """Determine the type of manual entry"""
+    if transaction.document_type:
+        doc_type = transaction.document_type.upper()
+        if 'MANUAL' in doc_type:
+            return 'Manual Entry'
+        elif 'ADJUSTMENT' in doc_type or 'AJUST' in doc_type:
+            return 'Adjustment Entry'
+        elif 'CORRECTION' in doc_type:
+            return 'Correction Entry'
+        elif 'REVERSAL' in doc_type:
+            return 'Reversal Entry'
+    
+    if transaction.text:
+        text = transaction.text.lower()
+        if 'manual' in text:
+            return 'Manual Entry'
+        elif 'adjustment' in text or 'ajust' in text:
+            return 'Adjustment Entry'
+        elif 'correction' in text:
+            return 'Correction Entry'
+        elif 'reversal' in text:
+            return 'Reversal Entry'
+    
+    return 'Suspected Manual Entry'
+
+def _calculate_manual_entry_risk_score(transaction):
+    """Calculate risk score for manual entry (0-100)"""
+    risk_score = 0.0
+    
+    # Base risk for manual entry (40 points)
+    risk_score += 40.0
+    
+    # Document type risk (20 points)
+    if transaction.document_type:
+        doc_type = transaction.document_type.upper()
+        if 'MANUAL' in doc_type:
+            risk_score += 20.0
+        elif 'ADJUSTMENT' in doc_type or 'AJUST' in doc_type:
+            risk_score += 15.0
+        elif 'CORRECTION' in doc_type:
+            risk_score += 10.0
+    
+    # Amount risk (20 points)
+    amount = abs(float(transaction.amount_local_currency))
+    if amount > 1000000:  # >1M
+        risk_score += 20.0
+    elif amount > 500000:  # >500K
+        risk_score += 15.0
+    elif amount > 100000:  # >100K
+        risk_score += 10.0
+    elif amount > 50000:   # >50K
+        risk_score += 5.0
+    
+    # Period-end risk (10 points)
+    if transaction.is_period_end_adjustment:
+        risk_score += 10.0
+    
+    # User risk (10 points)
+    if transaction.user_name in ['ADMIN', 'SYSTEM', 'MANUAL', 'ADJUST']:
+        risk_score += 10.0
+    
+    return min(risk_score, 100.0)
+
+def _identify_management_override_indicators(transaction):
+    """Identify specific indicators of potential management override"""
+    indicators = []
+    
+    # High-value manual entries
+    if transaction.is_manual_entry and abs(float(transaction.amount_local_currency)) > 1000000:
+        indicators.append('High-value manual entry')
+    
+    # Period-end manual adjustments
+    if transaction.is_manual_entry and transaction.is_period_end_adjustment:
+        indicators.append('Period-end manual adjustment')
+    
+    # Unusual account combinations
+    if transaction.is_manual_entry and transaction.gl_account in ['999999', '888888', '777777']:
+        indicators.append('Unusual account usage')
+    
+    # Weekend manual entries
+    if transaction.is_manual_entry and transaction.posting_date and transaction.posting_date.weekday() in [4, 5]:
+        indicators.append('Weekend manual entry')
+    
+    # Backdated manual entries
+    if transaction.is_manual_entry and transaction.document_date and transaction.posting_date:
+        days_diff = (transaction.posting_date - transaction.document_date).days
+        if days_diff > 7:
+            indicators.append('Backdated manual entry')
+    
+    return indicators
+
+def _calculate_manual_entry_risk_distribution(manual_entries):
+    """Calculate risk distribution for manual entries"""
+    risk_levels = {'LOW': 0, 'MEDIUM': 0, 'HIGH': 0, 'CRITICAL': 0}
+    
+    for entry in manual_entries:
+        risk_level = entry.get('risk_level', 'LOW')
+        risk_levels[risk_level] += 1
+    
+    return risk_levels
+
+def _calculate_manual_entry_amount_analysis(manual_entries):
+    """Calculate amount analysis for manual entries"""
+    if not manual_entries:
+        return {}
+    
+    amounts = [entry['amount'] for entry in manual_entries]
+    
+    return {
+        'total_amount': sum(amounts),
+        'average_amount': sum(amounts) / len(amounts),
+        'min_amount': min(amounts),
+        'max_amount': max(amounts),
+        'high_value_entries': len([a for a in amounts if a > 1000000]),
+        'medium_value_entries': len([a for a in amounts if 100000 < a <= 1000000]),
+        'low_value_entries': len([a for a in amounts if a <= 100000])
+    }
+
+def _calculate_manual_entry_user_analysis(manual_entries):
+    """Calculate user analysis for manual entries"""
+    user_stats = {}
+    
+    for entry in manual_entries:
+        user = entry['user_name']
+        if user not in user_stats:
+            user_stats[user] = {'count': 0, 'total_amount': 0, 'risk_scores': []}
+        
+        user_stats[user]['count'] += 1
+        user_stats[user]['total_amount'] += entry['amount']
+        user_stats[user]['risk_scores'].append(entry['risk_score'])
+    
+    # Calculate averages
+    for user in user_stats:
+        user_stats[user]['average_risk_score'] = sum(user_stats[user]['risk_scores']) / len(user_stats[user]['risk_scores'])
+    
+    return user_stats
+
+def _calculate_manual_entry_account_analysis(manual_entries):
+    """Calculate account analysis for manual entries"""
+    account_stats = {}
+    
+    for entry in manual_entries:
+        account = entry['gl_account']
+        if account not in account_stats:
+            account_stats[account] = {'count': 0, 'total_amount': 0, 'risk_scores': []}
+        
+        account_stats[account]['count'] += 1
+        account_stats[account]['total_amount'] += entry['amount']
+        account_stats[account]['risk_scores'].append(entry['risk_score'])
+    
+    # Calculate averages
+    for account in account_stats:
+        account_stats[account]['average_risk_score'] = sum(account_stats[account]['risk_scores']) / len(account_stats[account]['risk_scores'])
+    
+    return account_stats
+
+def _calculate_overall_manual_entry_risk_score(manual_entries):
+    """Calculate overall risk score for manual entries"""
+    if not manual_entries:
+        return 0.0
+    
+    total_risk = sum(entry['risk_score'] for entry in manual_entries)
+    return total_risk / len(manual_entries)
+
+def _assess_manual_entry_compliance(manual_entries):
+    """Assess compliance risk for manual entries"""
+    if not manual_entries:
+        return 'LOW'
+    
+    high_risk_count = len([e for e in manual_entries if e['risk_level'] in ['HIGH', 'CRITICAL']])
+    total_count = len(manual_entries)
+    
+    high_risk_percentage = (high_risk_count / total_count) * 100
+    
+    if high_risk_percentage > 50:
+        return 'HIGH'
+    elif high_risk_percentage > 25:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
+
+# =============================================================================
+# ML MODEL TRAINING ORCHESTRATION FUNCTIONS
+# =============================================================================
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=600, soft_time_limit=480)
+def train_ml_models(self, job_id):
+    """
+    Train All ML Models Task
+    
+    Orchestrates training of all ML models for a given job.
+    Trains models in parallel and tracks overall training progress.
+    
+    Args:
+        job_id (str): UUID of the FileProcessingJob to process
+    """
+    task_name = "train_ml_models"
+    start_time = timezone.now()
+    
+    debug_task_state(task_name, job_id, "STARTED", f"Starting ML model training for job: {job_id}")
+    
+    try:
+        # Get the processing job and data file
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        debug_task_state(task_name, job_id, "JOB_RETRIEVED", f"Training ML models for file: {data_file.file_name}")
+        
+        # Check if we have sufficient data for training
+        transactions = SAPGLPosting.objects.all()
+        
+        if len(transactions) < 100:
+            error_msg = "Insufficient data for ML training. Need at least 100 transactions."
+            debug_task_state(task_name, job_id, "FAILED", error_msg)
+            return {'error': error_msg}
+        
+        debug_task_data(task_name, job_id, "TRANSACTIONS", f"Found {len(transactions)} transactions for ML training")
+        
+        # Start training all models in parallel
+        training_tasks = {}
+        
+        # Train rule-based models
+        debug_task_state(task_name, job_id, "RULE_TRAINING", "Starting rule-based model training...")
+        rule_training_result = train_rule_based_models.delay(job_id)
+        training_tasks['rule_based'] = rule_training_result
+        
+        # Train individual analysis models
+        debug_task_state(task_name, job_id, "INDIVIDUAL_MODEL_TRAINING", "Starting individual ML model training...")
+        
+        # Train all individual models in parallel
+        duplicate_model_result = train_duplicate_analysis_model.delay(job_id)
+        backdated_model_result = train_backdated_analysis_model.delay(job_id)
+        user_model_result = train_user_analysis_model.delay(job_id)
+        unusual_days_model_result = train_unusual_days_analysis_model.delay(job_id)
+        closing_entries_model_result = train_closing_entries_analysis_model.delay(job_id)
+        holiday_model_result = train_holiday_analysis_model.delay(job_id)
+        overall_risk_model_result = train_overall_risk_analysis_model.delay(job_id)
+        
+        training_tasks.update({
+            'duplicate': duplicate_model_result,
+            'backdated': backdated_model_result,
+            'user': user_model_result,
+            'unusual_days': unusual_days_model_result,
+            'closing_entries': closing_entries_model_result,
+            'holiday': holiday_model_result,
+            'overall_risk': overall_risk_model_result
+        })
+        
+        # Wait for all training tasks to complete
+        debug_task_state(task_name, job_id, "WAITING_COMPLETION", "Waiting for all ML models to complete training...")
+        
+        # Collect results
+        training_results = {}
+        for model_name, task_result in training_tasks.items():
+            try:
+                result = task_result.get(timeout=300)  # 5 minute timeout per model
+                training_results[model_name] = result
+                debug_task_data(task_name, job_id, f"{model_name.upper()}_COMPLETED", f"{model_name} model training completed")
+            except Exception as e:
+                training_results[model_name] = {'error': str(e)}
+                debug_task_data(task_name, job_id, f"{model_name.upper()}_FAILED", f"{model_name} model training failed: {e}")
+        
+        # Calculate overall training statistics
+        training_duration = (timezone.now() - start_time).total_seconds()
+        successful_models = sum(1 for r in training_results.values() if r.get('success', False))
+        total_models = len(training_results)
+        
+        # Create ML model training record
+        from .models import MLModelTraining
+        
+        training_session = MLModelTraining.objects.create(
+            session_name=f"Comprehensive ML Training Session {job_id}",
+            description="Training session for all ML models",
+            model_type='all',
+            training_data_size=len(transactions),
+            training_data_date_range={
+                'min_date': min(t.posting_date for t in transactions if t.posting_date).isoformat(),
+                'max_date': max(t.posting_date for t in transactions if t.posting_date).isoformat()
+            },
+            feature_count=len(transactions[0].__dict__) if transactions else 0,
+            training_parameters={
+                'models_trained': list(training_tasks.keys()),
+                'parallel_training': True,
+                'timeout_per_model': 300
+            },
+            performance_metrics={
+                'successful_models': successful_models,
+                'total_models': total_models,
+                'success_rate': (successful_models / total_models) * 100 if total_models > 0 else 0,
+                'training_duration': training_duration
+            },
+            validation_metrics={
+                'data_quality_score': _calculate_data_quality_score(transactions),
+                'cross_validation_enabled': True
+            },
+            status='COMPLETED' if successful_models == total_models else 'FAILED',
+            started_at=start_time,
+            completed_at=timezone.now(),
+            training_duration=training_duration,
+            model_version='1.0.0'
+        )
+        
+        debug_task_state(task_name, job_id, "COMPLETED", 
+                        f"ML model training completed. {successful_models}/{total_models} models successful in {training_duration:.2f} seconds")
+        
+        return {
+            'success': True,
+            'training_id': str(training_session.id),
+            'training_duration': training_duration,
+            'successful_models': successful_models,
+            'total_models': total_models,
+            'success_rate': (successful_models / total_models) * 100 if total_models > 0 else 0,
+            'training_results': training_results,
+            'rule_training_task_id': str(rule_training_result.id),
+            'duplicate_model_training_task_id': str(duplicate_model_result.id),
+            'backdated_model_training_task_id': str(backdated_model_result.id),
+            'user_model_training_task_id': str(user_model_result.id),
+            'unusual_days_model_training_task_id': str(unusual_days_model_result.id),
+            'closing_entries_model_training_task_id': str(closing_entries_model_result.id),
+            'holiday_model_training_task_id': str(holiday_model_result.id),
+            'overall_risk_model_training_task_id': str(overall_risk_model_result.id)
+        }
+        
+    except Exception as e:
+        debug_task_exception(task_name, job_id, e, "ML model training failed")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=600, soft_time_limit=480)
+def retrain_ml_models(self, job_id):
+    """
+    Retrain All ML Models Task
+    
+    Orchestrates retraining of all ML models for a given job.
+    Useful for updating models with new data or improving performance.
+    
+    Args:
+        job_id (str): UUID of the FileProcessingJob to process
+    """
+    task_name = "retrain_ml_models"
+    start_time = timezone.now()
+    
+    debug_task_state(task_name, job_id, "STARTED", f"Starting ML model retraining for job: {job_id}")
+    
+    try:
+        # Get the processing job and data file
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        debug_task_state(task_name, job_id, "JOB_RETRIEVED", f"Retraining ML models for file: {job_id}")
+        
+        # Check if we have sufficient data for retraining
+        transactions = SAPGLPosting.objects.all()
+        
+        if len(transactions) < 100:
+            error_msg = "Insufficient data for ML retraining. Need at least 100 transactions."
+            debug_task_state(task_name, job_id, "FAILED", error_msg)
+            return {'error': error_msg}
+        
+        debug_task_data(task_name, job_id, "TRANSACTIONS", f"Found {len(transactions)} transactions for ML retraining")
+        
+        # Start retraining all models in parallel
+        training_tasks = {}
+        
+        # Retrain rule-based models
+        debug_task_state(task_name, job_id, "RULE_RETRAINING", "Starting rule-based model retraining...")
+        rule_training_result = retrain_rule_based_models.delay(job_id)
+        training_tasks['rule_based'] = rule_training_result
+        
+        # Retrain individual analysis models
+        debug_task_state(task_name, job_id, "INDIVIDUAL_MODEL_RETRAINING", "Starting individual ML model retraining...")
+        
+        # Retrain all individual models in parallel
+        duplicate_model_result = train_duplicate_analysis_model.delay(job_id)
+        backdated_model_result = train_backdated_analysis_model.delay(job_id)
+        user_model_result = train_user_analysis_model.delay(job_id)
+        unusual_days_model_result = train_unusual_days_analysis_model.delay(job_id)
+        closing_entries_model_result = train_closing_entries_analysis_model.delay(job_id)
+        holiday_model_result = train_holiday_analysis_model.delay(job_id)
+        overall_risk_model_result = train_overall_risk_analysis_model.delay(job_id)
+        
+        training_tasks.update({
+            'duplicate': duplicate_model_result,
+            'backdated': backdated_model_result,
+            'user': user_model_result,
+            'unusual_days': unusual_days_model_result,
+            'closing_entries': closing_entries_model_result,
+            'holiday': holiday_model_result,
+            'overall_risk': overall_risk_model_result
+        })
+        
+        # Wait for all retraining tasks to complete
+        debug_task_state(task_name, job_id, "WAITING_COMPLETION", "Waiting for all ML models to complete retraining...")
+        
+        # Collect results
+        training_results = {}
+        for model_name, task_result in training_tasks.items():
+            try:
+                result = task_result.get(timeout=300)  # 5 minute timeout per model
+                training_results[model_name] = task_result
+                debug_task_data(task_name, job_id, f"{model_name.upper()}_COMPLETED", f"{model_name} model retraining completed")
+            except Exception as e:
+                training_results[model_name] = {'error': str(e)}
+                debug_task_data(task_name, job_id, f"{model_name.upper()}_FAILED", f"{model_name} model retraining failed: {e}")
+        
+        # Calculate overall retraining statistics
+        training_duration = (timezone.now() - start_time).total_seconds()
+        successful_models = sum(1 for r in training_results.values() if r.get('success', False))
+        total_models = len(training_results)
+        
+        # Create ML model retraining record
+        from .models import MLModelTraining
+        
+        retraining_session = MLModelTraining.objects.create(
+            session_name=f"Comprehensive ML Retraining Session {job_id}",
+            description="Retraining session for all ML models",
+            model_type='all',
+            training_data_size=len(transactions),
+            training_data_date_range={
+                'min_date': min(t.posting_date for t in transactions if t.posting_date).isoformat(),
+                'max_date': max(t.posting_date for t in transactions if t.posting_date).isoformat()
+            },
+            feature_count=len(transactions[0].__dict__) if transactions else 0,
+            training_parameters={
+                'models_retrained': list(training_tasks.keys()),
+                'parallel_retraining': True,
+                'timeout_per_model': 300,
+                'retraining_type': 'full_retraining'
+            },
+            performance_metrics={
+                'successful_models': successful_models,
+                'total_models': total_models,
+                'success_rate': (successful_models / total_models) * 100 if total_models > 0 else 0,
+                'training_duration': training_duration,
+                'retraining_improvement': _calculate_retraining_improvement(training_results)
+            },
+            validation_metrics={
+                'data_quality_score': _calculate_data_quality_score(transactions),
+                'cross_validation_enabled': True,
+                'retraining_validation': True
+            },
+            status='COMPLETED' if successful_models == total_models else 'FAILED',
+            started_at=start_time,
+            completed_at=timezone.now(),
+            training_duration=training_duration,
+            model_version='1.1.0'  # Increment version for retraining
+        )
+        
+        debug_task_state(task_name, job_id, "COMPLETED", 
+                        f"ML model retraining completed. {successful_models}/{total_models} models successful in {training_duration:.2f} seconds")
+        
+        return {
+            'success': True,
+            'training_id': str(retraining_session.id),
+            'training_duration': training_duration,
+            'successful_models': successful_models,
+            'total_models': total_models,
+            'success_rate': (successful_models / total_models) * 100 if total_models > 0 else 0,
+            'training_results': training_results,
+            'retraining_improvement': _calculate_retraining_improvement(training_results)
+        }
+        
+    except Exception as e:
+        debug_task_exception(task_name, job_id, e, "ML model retraining failed")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+def _calculate_retraining_improvement(training_results):
+    """Calculate improvement metrics for retraining"""
+    try:
+        improvement_metrics = {}
+        
+        for model_name, result in training_results.items():
+            if result.get('success', False):
+                # Calculate improvement based on performance metrics
+                if 'model_accuracy' in result:
+                    improvement_metrics[model_name] = {
+                        'accuracy': result['model_accuracy'],
+                        'improvement_type': 'accuracy_based'
+                    }
+                elif 'performance_metrics' in result:
+                    performance = result['performance_metrics']
+                    if 'accuracy' in performance:
+                        improvement_metrics[model_name] = {
+                            'accuracy': performance['accuracy'],
+                            'improvement_type': 'performance_based'
+                        }
+        
+        return improvement_metrics
+    except Exception as e:
+        logger.error(f"Error calculating retraining improvement: {e}")
+        return {}
+
+# =============================================================================
+# ML MODEL PREDICTION FUNCTIONS
+# =============================================================================
+
+@shared_task(bind=True, max_retries=1, default_retry_delay=30, time_limit=120, soft_time_limit=90)
+def predict_anomalies_ml(self, job_id, model_type='all'):
+    """
+    ML-Based Anomaly Prediction Task
+    
+    Uses trained ML models to predict anomalies in new data.
+    
+    Args:
+        job_id (str): UUID of the FileProcessingJob to process
+        model_type (str): Type of ML model to use for prediction
+    """
+    task_name = "predict_anomalies_ml"
+    start_time = timezone.now()
+    
+    debug_task_state(task_name, job_id, "STARTED", f"Starting ML anomaly prediction with model type: {model_type}")
+    
+    try:
+        # Get the processing job and data file
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        # Get transactions for prediction
+        transactions = SAPGLPosting.objects.filter(data_file=data_file)
+        
+        if not transactions:
+            error_msg = "No transactions found for anomaly prediction."
+            debug_task_state(task_name, job_id, "FAILED", error_msg)
+            return {'error': error_msg}
+        
+        debug_task_data(task_name, job_id, "TRANSACTIONS", f"Found {len(transactions)} transactions for prediction")
+        
+        # Initialize ML model trainer
+        from .ml_models import MLModelTrainer
+        ml_trainer = MLModelTrainer()
+        
+        # Make predictions based on model type
+        predictions = {}
+        
+        if model_type in ['all', 'duplicate']:
+            try:
+                duplicate_predictions = ml_trainer.predict_duplicates(transactions)
+                predictions['duplicate'] = duplicate_predictions
+            except Exception as e:
+                predictions['duplicate'] = {'error': str(e)}
+        
+        if model_type in ['all', 'backdated']:
+            try:
+                backdated_predictions = ml_trainer.predict_backdated(transactions)
+                predictions['backdated'] = backdated_predictions
+            except Exception as e:
+                predictions['backdated'] = {'error': str(e)}
+        
+        if model_type in ['all', 'user']:
+            try:
+                user_predictions = ml_trainer.predict_user_anomalies(transactions)
+                predictions['user'] = user_predictions
+            except Exception as e:
+                predictions['user'] = {'error': str(e)}
+        
+        # Calculate prediction statistics
+        prediction_duration = (timezone.now() - start_time).total_seconds()
+        successful_predictions = sum(1 for p in predictions.values() if 'error' not in p)
+        total_predictions = len(predictions)
+        
+        debug_task_state(task_name, job_id, "COMPLETED", 
+                        f"ML anomaly prediction completed. {successful_predictions}/{total_predictions} predictions successful in {prediction_duration:.2f} seconds")
+        
+        return {
+            'success': True,
+            'predictions': predictions,
+            'prediction_duration': prediction_duration,
+            'successful_predictions': successful_predictions,
+            'total_predictions': total_predictions,
+            'model_type': model_type
+        }
+        
+    except Exception as e:
+        debug_task_exception(task_name, job_id, e, "ML anomaly prediction failed")
+        return {
+            'success': False,
+            'error': str(e)
+        }

@@ -120,7 +120,7 @@ class Command(BaseCommand):
                 'duplicate_count': duplicate_count,
                 'backdated_count': backdated_count,
                 'holiday_count': holiday_count,
-                'holiday_breakdown': holiday_analysis.analysis_info.get('holiday_breakdown', []) if holiday_analysis else [],
+                'holiday_breakdown': holiday_analysis.analysis_summary.get('holiday_breakdown', []) if holiday_analysis else [],
                 'user_anomalies': user_anomalies,
                 'unusual_days_count': unusual_days_count,
                 'closing_entries_count': closing_entries_count,

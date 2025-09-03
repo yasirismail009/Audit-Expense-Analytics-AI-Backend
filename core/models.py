@@ -399,6 +399,45 @@ class SAPGLPosting(models.Model):
         return any(ord(char) in arabic_range for char in self.text)
     
     @property
+    def is_manual_entry(self):
+        """Check if transaction is a manual journal entry (high risk for management override)"""
+        # Check document type for manual indicators
+        if self.document_type:
+            manual_indicators = ['MANUAL', 'ADJUSTMENT', 'CORRECTION', 'REVERSAL', 'AJUST']
+            if any(indicator in self.document_type.upper() for indicator in manual_indicators):
+                return True
+        
+        # Check text for manual indicators
+        if self.text:
+            manual_text_indicators = ['manual', 'adjustment', 'correction', 'reversal', 'ajust', 'manual entry']
+            if any(indicator in self.text.lower() for indicator in manual_text_indicators):
+                return True
+        
+        # Check for specific account types that are commonly manual
+        manual_accounts = ['999999', '888888', '777777', '666666']  # Common manual entry accounts
+        if self.gl_account in manual_accounts:
+            return True
+        
+        return False
+    
+    @property
+    def is_period_end_adjustment(self):
+        """Check if transaction is a period-end adjustment (high risk for management override)"""
+        if not self.posting_date:
+            return False
+        
+        # Check if posting is in last 3 days of month or first 3 days of next month
+        day_of_month = self.posting_date.day
+        if day_of_month >= 28 or day_of_month <= 3:
+            return True
+        
+        # Check if posting is in last month of fiscal year
+        if self.posting_period in [12, 16]:  # December or last period
+            return True
+        
+        return False
+    
+    @property
     def is_expense_account(self):
         """Check if GL account is an expense account"""
         # Common expense account patterns
@@ -708,6 +747,7 @@ class BackdatedAnalysisResult(BaseAnalysisResult):
     backdated_by_account = models.JSONField(default=list, help_text='Backdated entries grouped by account')
     backdated_by_user = models.JSONField(default=list, help_text='Backdated entries grouped by user')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
+    breakdowns = models.JSONField(default=dict, help_text='Various breakdowns including ML insights')
     
     class Meta:
         db_table = 'backdated_analysis_results'
@@ -728,6 +768,7 @@ class UserAnalysisResult(BaseAnalysisResult):
     user_risk_assessment = models.JSONField(default=dict, help_text='User risk assessment and scoring')
     user_patterns = models.JSONField(default=dict, help_text='User activity patterns and trends')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
+    breakdowns = models.JSONField(default=dict, help_text='Various breakdowns including ML insights')
     
     class Meta:
         db_table = 'user_analysis_results'
@@ -771,6 +812,7 @@ class UnusualDaysAnalysisResult(BaseAnalysisResult):
     fs_line_day_patterns = models.JSONField(default=list, help_text='FS line activity by day of week')
     unusual_days = models.JSONField(default=list, help_text='List of unusual day patterns detected')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
+    breakdowns = models.JSONField(default=dict, help_text='Various breakdowns including ML insights')
     
     class Meta:
         db_table = 'unusual_days_analysis_results'
@@ -791,6 +833,14 @@ class ClosingEntriesAnalysisResult(BaseAnalysisResult):
     post_close_entries = models.JSONField(default=list, help_text='List of post-close entries detected')
     closing_patterns = models.JSONField(default=dict, help_text='Closing entry patterns and trends')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
+    breakdowns = models.JSONField(default=dict, help_text='Various breakdowns including ML insights')
+    
+    # Additional fields referenced in views
+    post_close_analysis = models.JSONField(default=dict, help_text='Post-close analysis data')
+    fs_line_closing = models.JSONField(default=dict, help_text='Financial statement line closing data')
+    user_closing = models.JSONField(default=dict, help_text='User closing patterns')
+    month_end_patterns = models.JSONField(default=dict, help_text='Month-end closing patterns')
+    closing_window_analysis = models.JSONField(default=dict, help_text='Closing window analysis data')
     
     class Meta:
         db_table = 'closing_entries_analysis_results'
@@ -802,6 +852,39 @@ class ClosingEntriesAnalysisResult(BaseAnalysisResult):
     def get_post_close_entries_count(self):
         """Get count of post-close entries"""
         return len(self.post_close_entries) if self.post_close_entries else 0
+    
+    def get_total_transactions(self):
+        """Get total number of transactions"""
+        if not self.analysis_summary:
+            return 0
+        return self.analysis_summary.get('total_transactions', 0)
+    
+    def get_closing_entries_risk_score(self):
+        """Get risk score for closing entries"""
+        if not self.closing_entries:
+            return 0.0
+        # Calculate risk based on closing entries
+        high_value_count = sum(1 for entry in self.closing_entries 
+                              if float(entry.get('amount', 0)) > 1000000)
+        return min(100.0, len(self.closing_entries) * 5 + high_value_count * 10)
+    
+    def get_post_close_risk_score(self):
+        """Get risk score for post-close entries"""
+        if not self.post_close_entries:
+            return 0.0
+        # Calculate risk based on post-close entries
+        high_value_count = sum(1 for entry in self.post_close_entries 
+                              if float(entry.get('amount', 0)) > 1000000)
+        return min(100.0, len(self.post_close_entries) * 8 + high_value_count * 15)
+    
+    def get_high_value_post_close_risk_score(self):
+        """Get risk score for high-value post-close entries"""
+        if not self.post_close_entries:
+            return 0.0
+        # Calculate risk based on high-value post-close entries
+        high_value_entries = [entry for entry in self.post_close_entries 
+                             if float(entry.get('amount', 0)) > 1000000]
+        return min(100.0, len(high_value_entries) * 20)
 
 class HolidayAnalysisResult(BaseAnalysisResult):
     """Enhanced holiday analysis results with unified structure"""
@@ -811,6 +894,8 @@ class HolidayAnalysisResult(BaseAnalysisResult):
     holiday_breakdown = models.JSONField(default=list, help_text='Breakdown by holiday type')
     holiday_patterns = models.JSONField(default=dict, help_text='Holiday posting patterns and trends')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
+    breakdowns = models.JSONField(default=dict, help_text='Various breakdowns including ML insights')
+    breakdowns = models.JSONField(default=dict, help_text='Various breakdowns including ML insights')
     
     class Meta:
         db_table = 'holiday_analysis_results'
@@ -1168,43 +1253,7 @@ class ProcessingJobTracker(BaseProcessingResult):
         
         self.save()
 
-class GeneralAnalysisResult(BaseAnalysisResult):
-    """Model to store general analysis results including trial balance, GL account summaries, and statistical calculations"""
-    
-    # Additional general-specific fields
-    trial_balance_summary = models.JSONField(default=dict, help_text='Trial balance summary (total debits, credits, net)')
-    gl_account_summaries = models.JSONField(default=list, help_text='Detailed GL account summaries with debits, credits, balances')
-    user_summaries = models.JSONField(default=list, help_text='User activity summaries per GL account')
-    statistical_calculations = models.JSONField(default=dict, help_text='Mean, standard deviation, and other statistical measures')
-    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
-    
-    class Meta:
-        db_table = 'general_analysis_results'
-        ordering = ['-analysis_date']
-        indexes = [
-            models.Index(fields=['data_file', 'analysis_date']),
-            models.Index(fields=['status', 'analysis_date']),
-            models.Index(fields=['analysis_type']),
-        ]
-    
-    def __str__(self):
-        return f"General Analysis for {self.data_file.file_name} ({self.analysis_date.strftime('%Y-%m-%d %H:%M')})"
-    
-    def get_analysis_summary(self):
-        """Get a summary of the general analysis results"""
-        return {
-            'analysis_id': str(self.id),
-            'file_name': self.data_file.file_name,
-            'file_id': str(self.data_file.id),
-            'analysis_date': self.analysis_date.isoformat(),
-            'analysis_type': self.analysis_type,
-            'status': self.status,
-            'processing_duration': self.processing_duration,
-            'trial_balance_summary': self.trial_balance_summary,
-            'total_accounts': len(self.gl_account_summaries),
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat(),
-        }
+
 
 class OverallAnalysisResult(BaseAnalysisResult):
     """Model to store overall analysis results combining all analysis types with risk calculations"""
@@ -1326,183 +1375,6 @@ class RiskScoringDocument(BaseAnalysisResult):
             return 'MEDIUM'
         else:
             return 'LOW'
-
-class HolidayAnalysisResult(BaseAnalysisResult):
-    """Model to store Holiday Analysis results for identifying transactions posted on holidays"""
-    
-    # Additional holiday-specific fields
-    holiday_postings = models.JSONField(default=list, help_text='List of transactions posted on holidays')
-    holiday_by_fs_line = models.JSONField(default=list, help_text='Holiday postings grouped by financial statement line')
-    holiday_by_account = models.JSONField(default=list, help_text='Holiday postings grouped by GL account')
-    holiday_by_user = models.JSONField(default=list, help_text='Holiday postings grouped by user')
-    holiday_by_holiday_type = models.JSONField(default=dict, help_text='Holiday postings grouped by holiday type')
-    gl_activity_by_holiday = models.JSONField(default=dict, help_text='GL activity patterns by holiday')
-    holiday_breakdown = models.JSONField(default=list, help_text='Breakdown by holiday type')
-    holiday_patterns = models.JSONField(default=dict, help_text='Holiday posting patterns and trends')
-    financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
-    
-    class Meta:
-        db_table = 'holiday_analysis_results'
-        ordering = ['-analysis_date']
-        indexes = [
-            models.Index(fields=['data_file', 'analysis_date']),
-            models.Index(fields=['analysis_type', 'status']),
-            models.Index(fields=['processing_job', 'created_at']),
-        ]
-    
-    def __str__(self):
-        return f"Holiday Analysis for {self.data_file.file_name} - {self.analysis_date}"
-    
-    def get_analysis_summary(self):
-        """Get summary of holiday analysis results"""
-        return {
-            'total_transactions': self.analysis_info.get('total_transactions', 0),
-            'holiday_postings_count': self.analysis_info.get('holiday_postings_count', 0),
-            'holiday_percentage': self.analysis_info.get('holiday_percentage', 0),
-            'unique_holidays': self.analysis_info.get('unique_holidays', 0),
-            'country_code': self.analysis_info.get('country_code', 'saudiarabian'),
-            'fiscal_year': self.analysis_info.get('fiscal_year', ''),
-            'analysis_date': self.analysis_date.isoformat(),
-            'processing_duration': self.processing_duration
-        }
-    
-    def get_total_transactions(self):
-        """Get total transactions analyzed"""
-        return self.analysis_info.get('total_transactions', 0)
-    
-    def get_holiday_postings_count(self):
-        """Get number of holiday postings found"""
-        return self.analysis_info.get('holiday_postings_count', 0)
-    
-    def get_holiday_percentage(self):
-        """Get percentage of transactions posted on holidays"""
-        return self.analysis_info.get('holiday_percentage', 0)
-    
-    def get_unique_holidays(self):
-        """Get number of unique holidays with postings"""
-        return self.analysis_info.get('unique_holidays', 0)
-    
-    def get_risk_level(self):
-        """Get risk level based on holiday postings"""
-        holiday_percentage = self.get_holiday_percentage()
-        if holiday_percentage > 5.0:
-            return 'HIGH'
-        elif holiday_percentage > 2.0:
-            return 'MEDIUM'
-        else:
-            return 'LOW'
-    
-    def get_holiday_risk_score(self):
-        """Get holiday risk score"""
-        if not self.audit_recommendations:
-            return 0.0
-        return self.audit_recommendations.get('holiday_risk_score', 0.0)
-    
-    def get_high_value_holiday_risk_score(self):
-        """Get high value holiday risk score"""
-        if not self.audit_recommendations:
-            return 0.0
-        return self.audit_recommendations.get('high_value_holiday_risk_score', 0.0)
-    
-    def get_overall_risk_score(self):
-        """Get overall risk score"""
-        if not self.analysis_info:
-            return 0.0
-        return self.analysis_info.get('overall_risk_score', 0.0)
-    
-    def get_recommendations(self):
-        """Get risk-based recommendations"""
-        if not self.audit_recommendations:
-            return []
-        return self.audit_recommendations.get('recommendations', [])
-    
-    def get_holiday_postings_by_fs_line(self):
-        """Get holiday postings grouped by FS line"""
-        if not self.holiday_by_fs_line:
-            return {}
-        
-        by_fs_line = {}
-        for entry in self.holiday_by_fs_line:
-            fs_line = entry.get('fs_line', 'Unknown')
-            if fs_line not in by_fs_line:
-                by_fs_line[fs_line] = []
-            by_fs_line[fs_line].append(entry)
-        
-        return by_fs_line
-    
-    def get_holiday_postings_by_account(self):
-        """Get holiday postings grouped by account"""
-        if not self.holiday_by_account:
-            return {}
-        
-        by_account = {}
-        for entry in self.holiday_by_account:
-            account = entry.get('account', 'Unknown')
-            if account not in by_account:
-                by_account[account] = []
-            by_account[account].append(entry)
-        
-        return by_account
-    
-    def get_holiday_postings_by_user(self):
-        """Get holiday postings grouped by user"""
-        if not self.holiday_by_user:
-            return {}
-        
-        by_user = {}
-        for entry in self.holiday_by_user:
-            user = entry.get('user', 'Unknown')
-            if user not in by_user:
-                by_user[user] = []
-            by_user[user].append(entry)
-        
-        return by_user
-    
-    def get_high_value_holiday_postings(self, threshold=1000000):
-        """Get high value holiday postings"""
-        if not self.holiday_postings:
-            return []
-        return [p for p in self.holiday_postings if p.get('amount', 0) > threshold]
-    
-    def get_holiday_activity_summary(self):
-        """Get summary of holiday activity patterns"""
-        if not self.gl_activity_by_holiday:
-            return {}
-        
-        summary = {
-            'total_holidays': len(self.gl_activity_by_holiday),
-            'holidays_with_activity': 0,
-            'most_active_holiday': None,
-            'highest_amount_holiday': None,
-            'holiday_activity_breakdown': {}
-        }
-        
-        max_activity = 0
-        max_amount = 0
-        
-        for holiday, data in self.gl_activity_by_holiday.items():
-            activity_count = data.get('total_transactions', 0)
-            total_amount = data.get('total_amount', 0)
-            
-            if activity_count > 0:
-                summary['holidays_with_activity'] += 1
-            
-            if activity_count > max_activity:
-                max_activity = activity_count
-                summary['most_active_holiday'] = holiday
-            
-            if total_amount > max_amount:
-                max_amount = total_amount
-                summary['highest_amount_holiday'] = holiday
-            
-            summary['holiday_activity_breakdown'][holiday] = {
-                'transactions': activity_count,
-                'amount': total_amount,
-                'users': data.get('unique_users', 0),
-                'accounts': data.get('unique_accounts', 0)
-            }
-        
-        return summary
 
 class RuleBasedModelTraining(BaseModelTraining):
     """Model to store Rule-based Model Training results"""
@@ -1852,6 +1724,475 @@ class OverallRiskAnalysisModelTraining(BaseModelTraining):
     
     class Meta:
         db_table = 'overall_risk_analysis_model_training'
+        ordering = ['-started_at']
+    
+    def __str__(self):
+        return f"{self.session_name} - {self.status}"
+
+# ============================================================================
+# ENHANCED AI RISK ASSESSMENT MODELS
+# ============================================================================
+
+class AIRiskAssessment(BaseAnalysisResult):
+    """
+    AI-powered comprehensive risk assessment model
+    Stores advanced ML-based risk analysis results
+    """
+    
+    analysis_type = 'ai_risk_assessment'
+    
+    # AI Assessment metadata
+    ai_model_version = models.CharField(max_length=20, default='2.0.0')
+    
+    # AI Risk Scores
+    overall_ai_risk_score = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(100.0)],
+        help_text='AI-calculated overall risk score (0-100)'
+    )
+    ai_confidence_score = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text='AI model confidence in predictions (0-1)'
+    )
+    
+    # Risk Level Classification
+    ai_risk_level = models.CharField(max_length=20, choices=[
+        ('LOW', 'Low Risk'),
+        ('MEDIUM', 'Medium Risk'),
+        ('HIGH', 'High Risk'),
+        ('CRITICAL', 'Critical Risk'),
+    ])
+    
+    # ML Model Results
+    ml_predictions = models.JSONField(default=dict, help_text='Raw ML model predictions')
+    feature_importance = models.JSONField(default=dict, help_text='Feature importance scores')
+    model_performance = models.JSONField(default=dict, help_text='Model performance metrics')
+    
+    # Anomaly Clustering
+    anomaly_clusters = models.JSONField(default=dict, help_text='Anomaly clustering results')
+    cluster_analysis = models.JSONField(default=dict, help_text='Detailed cluster analysis')
+    
+    # NLP Insights
+    nlp_insights = models.JSONField(default=dict, help_text='NLP-generated insights')
+    risk_patterns = models.JSONField(default=dict, help_text='Identified risk patterns')
+    trend_analysis = models.JSONField(default=dict, help_text='Risk trend analysis')
+    
+    # AI Recommendations
+    ai_recommendations = models.JSONField(default=dict, help_text='AI-generated recommendations')
+    immediate_actions = models.JSONField(default=list, help_text='Immediate action items')
+    investigation_priorities = models.JSONField(default=list, help_text='Investigation priorities')
+    audit_procedures = models.JSONField(default=list, help_text='Recommended audit procedures')
+    risk_mitigation = models.JSONField(default=list, help_text='Risk mitigation strategies')
+    
+    # Processing metadata
+    models_used = models.JSONField(default=list, help_text='List of ML models used')
+    
+    class Meta:
+        db_table = 'ai_risk_assessments'
+        verbose_name = 'AI Risk Assessment'
+        verbose_name_plural = 'AI Risk Assessments'
+    
+    def __str__(self):
+        return f"AI Risk Assessment for {self.data_file.file_name} - {self.ai_risk_level}"
+    
+    def get_risk_summary(self):
+        """Get a summary of the AI risk assessment"""
+        return {
+            'assessment_id': str(self.id),
+            'file_name': self.data_file.file_name,
+            'ai_risk_score': self.overall_ai_risk_score,
+            'ai_risk_level': self.ai_risk_level,
+            'confidence_score': self.ai_confidence_score,
+            'assessment_date': self.analysis_date.isoformat(),
+            'status': self.status,
+        }
+    
+    def get_key_recommendations(self, limit=5):
+        """Get key AI recommendations"""
+        recommendations = self.ai_recommendations.get('immediate_actions', [])
+        return recommendations[:limit]
+    
+    def get_investigation_priorities(self, limit=5):
+        """Get investigation priorities"""
+        priorities = self.investigation_priorities
+        return priorities[:limit]
+
+
+class RiskPattern(models.Model):
+    """
+    Model to store identified risk patterns and their characteristics
+    """
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Pattern identification
+    pattern_name = models.CharField(max_length=255, help_text='Name of the risk pattern')
+    pattern_type = models.CharField(max_length=100, help_text='Type of risk pattern')
+    pattern_description = models.TextField(help_text='Description of the pattern')
+    
+    # Pattern characteristics
+    pattern_indicators = models.JSONField(default=list, help_text='Indicators that define this pattern')
+    pattern_frequency = models.IntegerField(default=0, help_text='How often this pattern occurs')
+    pattern_severity = models.CharField(max_length=20, choices=[
+        ('LOW', 'Low Severity'),
+        ('MEDIUM', 'Medium Severity'),
+        ('HIGH', 'High Severity'),
+        ('CRITICAL', 'Critical Severity'),
+    ])
+    
+    # Pattern analysis
+    affected_transactions = models.JSONField(default=list, help_text='Transaction IDs affected by this pattern')
+    pattern_risk_score = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(100.0)],
+        help_text='Risk score for this pattern'
+    )
+    pattern_confidence = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text='Confidence in pattern detection'
+    )
+    
+    # Pattern metadata
+    first_detected = models.DateTimeField(auto_now_add=True)
+    last_updated = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True, help_text='Whether this pattern is currently active')
+    
+    # File association
+    data_file = models.ForeignKey('DataFile', on_delete=models.CASCADE, related_name='risk_patterns')
+    ai_assessment = models.ForeignKey('AIRiskAssessment', on_delete=models.CASCADE, related_name='patterns')
+    
+    class Meta:
+        db_table = 'risk_patterns'
+        verbose_name = 'Risk Pattern'
+        verbose_name_plural = 'Risk Patterns'
+        ordering = ['-pattern_risk_score', '-first_detected']
+        indexes = [
+            models.Index(fields=['pattern_type', 'pattern_severity']),
+            models.Index(fields=['pattern_risk_score', 'first_detected']),
+            models.Index(fields=['data_file', 'is_active']),
+        ]
+    
+    def __str__(self):
+        return f"{self.pattern_name} - {self.pattern_severity}"
+
+
+class AnomalyCluster(models.Model):
+    """
+    Model to store anomaly clusters identified by AI
+    """
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Cluster identification
+    cluster_id = models.CharField(max_length=50, help_text='Unique cluster identifier')
+    cluster_name = models.CharField(max_length=255, help_text='Descriptive name for the cluster')
+    cluster_type = models.CharField(max_length=100, help_text='Type of anomaly cluster')
+    
+    # Cluster characteristics
+    cluster_size = models.IntegerField(help_text='Number of transactions in this cluster')
+    cluster_characteristics = models.JSONField(default=dict, help_text='Characteristics of this cluster')
+    cluster_anomaly_profile = models.JSONField(default=dict, help_text='Anomaly profile for this cluster')
+    
+    # Cluster analysis
+    cluster_risk_score = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(100.0)],
+        help_text='Overall risk score for this cluster'
+    )
+    cluster_confidence = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text='Confidence in cluster analysis'
+    )
+    
+    # Cluster transactions
+    transaction_ids = models.JSONField(default=list, help_text='List of transaction IDs in this cluster')
+    representative_transactions = models.JSONField(default=list, help_text='Representative transactions for this cluster')
+    
+    # Cluster metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    # Associations
+    data_file = models.ForeignKey('DataFile', on_delete=models.CASCADE, related_name='anomaly_clusters')
+    ai_assessment = models.ForeignKey('AIRiskAssessment', on_delete=models.CASCADE, related_name='clusters')
+    
+    class Meta:
+        db_table = 'anomaly_clusters'
+        verbose_name = 'Anomaly Cluster'
+        verbose_name_plural = 'Anomaly Clusters'
+        ordering = ['-cluster_risk_score', '-cluster_size']
+        indexes = [
+            models.Index(fields=['cluster_type', 'cluster_risk_score']),
+            models.Index(fields=['cluster_size', 'created_at']),
+            models.Index(fields=['data_file', 'cluster_type']),
+        ]
+    
+    def __str__(self):
+        return f"Cluster {self.cluster_id} - {self.cluster_size} transactions"
+
+
+class AIRiskRecommendation(models.Model):
+    """
+    Model to store AI-generated risk recommendations
+    """
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Recommendation details
+    recommendation_title = models.CharField(max_length=255, help_text='Title of the recommendation')
+    recommendation_type = models.CharField(max_length=100, help_text='Type of recommendation')
+    recommendation_description = models.TextField(help_text='Detailed description of the recommendation')
+    
+    # Recommendation categorization
+    RECOMMENDATION_CATEGORIES = [
+        ('IMMEDIATE_ACTION', 'Immediate Action'),
+        ('INVESTIGATION', 'Investigation'),
+        ('AUDIT_PROCEDURE', 'Audit Procedure'),
+        ('RISK_MITIGATION', 'Risk Mitigation'),
+        ('COMPLIANCE', 'Compliance'),
+        ('MONITORING', 'Monitoring'),
+        ('CONTROL_IMPROVEMENT', 'Control Improvement'),
+    ]
+    category = models.CharField(max_length=50, choices=RECOMMENDATION_CATEGORIES)
+    
+    # Priority and urgency
+    PRIORITY_LEVELS = [
+        ('LOW', 'Low Priority'),
+        ('MEDIUM', 'Medium Priority'),
+        ('HIGH', 'High Priority'),
+        ('CRITICAL', 'Critical Priority'),
+    ]
+    priority = models.CharField(max_length=20, choices=PRIORITY_LEVELS)
+    
+    URGENCY_LEVELS = [
+        ('LOW', 'Low Urgency'),
+        ('MEDIUM', 'Medium Urgency'),
+        ('HIGH', 'High Urgency'),
+        ('IMMEDIATE', 'Immediate'),
+    ]
+    urgency = models.CharField(max_length=20, choices=URGENCY_LEVELS)
+    
+    # Recommendation details
+    affected_transactions = models.JSONField(default=list, help_text='Transaction IDs affected by this recommendation')
+    estimated_impact = models.CharField(max_length=100, help_text='Estimated impact of implementing this recommendation')
+    implementation_effort = models.CharField(max_length=100, help_text='Estimated effort to implement')
+    
+    # AI confidence
+    ai_confidence = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text='AI confidence in this recommendation'
+    )
+    
+    # Status tracking
+    RECOMMENDATION_STATUS = [
+        ('PENDING', 'Pending'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('IMPLEMENTED', 'Implemented'),
+        ('REJECTED', 'Rejected'),
+        ('ON_HOLD', 'On Hold'),
+    ]
+    status = models.CharField(max_length=20, choices=RECOMMENDATION_STATUS, default='PENDING')
+    
+    # Implementation tracking
+    assigned_to = models.CharField(max_length=100, blank=True, null=True, help_text='Person assigned to implement')
+    due_date = models.DateField(blank=True, null=True, help_text='Due date for implementation')
+    implemented_date = models.DateField(blank=True, null=True, help_text='Date when implemented')
+    implementation_notes = models.TextField(blank=True, null=True, help_text='Notes about implementation')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    # Associations
+    data_file = models.ForeignKey('DataFile', on_delete=models.CASCADE, related_name='ai_recommendations')
+    ai_assessment = models.ForeignKey('AIRiskAssessment', on_delete=models.CASCADE, related_name='recommendations')
+    
+    class Meta:
+        db_table = 'ai_risk_recommendations'
+        verbose_name = 'AI Risk Recommendation'
+        verbose_name_plural = 'AI Risk Recommendations'
+        ordering = ['-priority', '-urgency', '-created_at']
+        indexes = [
+            models.Index(fields=['category', 'priority']),
+            models.Index(fields=['status', 'due_date']),
+            models.Index(fields=['data_file', 'category']),
+        ]
+    
+    def __str__(self):
+        return f"{self.recommendation_title} - {self.priority}"
+
+
+class RiskTrend(models.Model):
+    """
+    Model to store risk trends and patterns over time
+    """
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Trend identification
+    trend_name = models.CharField(max_length=255, help_text='Name of the risk trend')
+    trend_type = models.CharField(max_length=100, help_text='Type of risk trend')
+    trend_period = models.CharField(max_length=50, help_text='Period for trend analysis (daily, weekly, monthly)')
+    
+    # Trend data
+    trend_data = models.JSONField(default=dict, help_text='Trend data points')
+    trend_direction = models.CharField(max_length=20, choices=[
+        ('INCREASING', 'Increasing'),
+        ('DECREASING', 'Decreasing'),
+        ('STABLE', 'Stable'),
+        ('VOLATILE', 'Volatile'),
+    ])
+    
+    # Trend analysis
+    trend_significance = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text='Statistical significance of the trend'
+    )
+    trend_confidence = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text='Confidence in trend analysis'
+    )
+    
+    # Trend metadata
+    start_date = models.DateField(help_text='Start date of trend period')
+    end_date = models.DateField(help_text='End date of trend period')
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    # Associations
+    data_file = models.ForeignKey('DataFile', on_delete=models.CASCADE, related_name='risk_trends')
+    ai_assessment = models.ForeignKey('AIRiskAssessment', on_delete=models.CASCADE, related_name='trends')
+    
+    class Meta:
+        db_table = 'risk_trends'
+        verbose_name = 'Risk Trend'
+        verbose_name_plural = 'Risk Trends'
+        ordering = ['-end_date', '-trend_significance']
+        indexes = [
+            models.Index(fields=['trend_type', 'trend_direction']),
+            models.Index(fields=['start_date', 'end_date']),
+            models.Index(fields=['data_file', 'trend_type']),
+        ]
+    
+    def __str__(self):
+        return f"{self.trend_name} - {self.trend_direction}"
+
+
+class ModelPerformance(models.Model):
+    """
+    Model to track ML model performance and accuracy
+    """
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # Model identification
+    model_name = models.CharField(max_length=100, help_text='Name of the ML model')
+    model_version = models.CharField(max_length=20, help_text='Version of the model')
+    model_type = models.CharField(max_length=50, help_text='Type of model (classification, regression, clustering)')
+    
+    # Performance metrics
+    accuracy = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        null=True, blank=True,
+        help_text='Model accuracy score'
+    )
+    precision = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        null=True, blank=True,
+        help_text='Model precision score'
+    )
+    recall = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        null=True, blank=True,
+        help_text='Model recall score'
+    )
+    f1_score = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        null=True, blank=True,
+        help_text='Model F1 score'
+    )
+    
+    # Additional metrics
+    performance_metrics = models.JSONField(default=dict, help_text='Additional performance metrics')
+    confusion_matrix = models.JSONField(default=dict, help_text='Confusion matrix for classification models')
+    
+    # Training information
+    training_data_size = models.IntegerField(help_text='Size of training dataset')
+    training_duration = models.FloatField(help_text='Training duration in seconds')
+    training_timestamp = models.DateTimeField(help_text='When the model was trained')
+    
+    # Model metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=True, help_text='Whether this model is currently active')
+    
+    # Associations
+    data_file = models.ForeignKey('DataFile', on_delete=models.CASCADE, related_name='model_performances')
+    ai_assessment = models.ForeignKey('AIRiskAssessment', on_delete=models.CASCADE, related_name='model_performances')
+    
+    class Meta:
+        db_table = 'model_performances'
+        verbose_name = 'Model Performance'
+        verbose_name_plural = 'Model Performances'
+        ordering = ['-training_timestamp', '-accuracy']
+        indexes = [
+            models.Index(fields=['model_name', 'model_version']),
+            models.Index(fields=['accuracy', 'training_timestamp']),
+            models.Index(fields=['data_file', 'is_active']),
+        ]
+    
+    def __str__(self):
+        return f"{self.model_name} v{self.model_version} - {self.accuracy:.3f} accuracy"
+
+
+class ManualEntryAnalysisResult(BaseAnalysisResult):
+    """Results from manual entry analysis (High Risk for Management Override)"""
+    
+    analysis_type = 'manual_entry_analysis'
+    
+    # Manual entry-specific fields
+    manual_entries = models.JSONField(default=list, help_text='List of manual journal entries detected')
+    manual_entry_risk_distribution = models.JSONField(default=dict, help_text='Risk distribution by manual entry type')
+    manual_entry_amount_analysis = models.JSONField(default=dict, help_text='Amount analysis for manual entries')
+    manual_entry_user_analysis = models.JSONField(default=dict, help_text='User analysis for manual entries')
+    manual_entry_account_analysis = models.JSONField(default=dict, help_text='Account analysis for manual entries')
+    period_end_adjustments = models.JSONField(default=list, help_text='Period-end adjustment entries')
+    management_override_indicators = models.JSONField(default=list, help_text='Specific indicators of potential management override')
+    
+    class Meta:
+        db_table = 'manual_entry_analysis_results'
+        verbose_name = 'Manual Entry Analysis Result'
+        verbose_name_plural = 'Manual Entry Analysis Results'
+
+class ManualEntryAnalysisModelTraining(BaseModelTraining):
+    """Model to store Manual Entry Analysis Model Training results"""
+    
+    # Training session information
+    session_name = models.CharField(max_length=255, help_text='Name of the training session')
+    description = models.TextField(blank=True, help_text='Description of the training session')
+    model_type = models.CharField(max_length=50, default='manual_entry_analysis', help_text='Type of model trained')
+    
+    # Training data information
+    training_data_size = models.IntegerField(default=0, help_text='Number of transactions used for training')
+    training_data_date_range = models.JSONField(default=dict, help_text='Date range of training data')
+    
+    # Training results
+    training_results = models.JSONField(default=dict, help_text='Detailed training results for manual entry detection')
+    performance_metrics = models.JSONField(default=dict, help_text='Performance metrics from training')
+    
+    # Training metadata
+    started_at = models.DateTimeField(auto_now_add=True, help_text='When training started')
+    completed_at = models.DateTimeField(null=True, blank=True, help_text='When training completed')
+    training_duration = models.FloatField(default=0.0, help_text='Training duration in seconds')
+    
+    # Status
+    status = models.CharField(max_length=20, choices=[
+        ('PENDING', 'Pending'),
+        ('TRAINING', 'Training'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed')
+    ], default='PENDING', help_text='Training status')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, help_text='Error message if training failed')
+    
+    class Meta:
+        db_table = 'manual_entry_analysis_model_training'
         ordering = ['-started_at']
     
     def __str__(self):

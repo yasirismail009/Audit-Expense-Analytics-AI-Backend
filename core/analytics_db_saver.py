@@ -385,15 +385,16 @@ class AnalyticsDBSaver:
             ).first()
             
             if existing_analysis:
-                # Update existing analysis
-                existing_analysis.analysis_info = summary
+                # Update existing analysis using new unified structure
+                existing_analysis.analysis_summary = summary
+                existing_analysis.anomaly_list = backdated_entries
+                existing_analysis.audit_recommendations = audit_recommendations
+                existing_analysis.compliance_assessment = compliance_assessment
+                existing_analysis.financial_statement_impact = financial_statement_impact
                 existing_analysis.backdated_entries = backdated_entries
                 existing_analysis.backdated_by_document = backdated_by_document
                 existing_analysis.backdated_by_account = backdated_by_account
                 existing_analysis.backdated_by_user = backdated_by_user
-                existing_analysis.audit_recommendations = audit_recommendations
-                existing_analysis.compliance_assessment = compliance_assessment
-                existing_analysis.financial_statement_impact = financial_statement_impact
                 existing_analysis.processing_job = self.processing_job
                 existing_analysis.processing_duration = (timezone.now() - self.processing_job.started_at).total_seconds() if self.processing_job.started_at else None
                 existing_analysis.status = 'COMPLETED'
@@ -402,18 +403,22 @@ class AnalyticsDBSaver:
                 print(f"🔍 DEBUG: Updated existing BackdatedAnalysisResult with ID: {existing_analysis.id}")
                 backdated_analysis = existing_analysis
             else:
-                # Create new analysis
+                # Create new analysis using new unified structure
                 backdated_analysis = BackdatedAnalysisResult.objects.create(
                     data_file=self.data_file,
                     analysis_type='enhanced_backdated',
-                    analysis_version='1.0.0',
-                    analysis_info=summary,
+                    analysis_version='2.0.0',
+                    analysis_summary=summary,
+                    anomaly_list=backdated_entries,
+                    chart_data=chart_data if 'chart_data' in locals() else {},
+                    risk_assessment=risk_assessment if 'risk_assessment' in locals() else {},
+                    audit_recommendations=audit_recommendations,
+                    compliance_assessment=compliance_assessment,
+                    export_data=export_data if 'export_data' in locals() else [],
                     backdated_entries=backdated_entries,
                     backdated_by_document=backdated_by_document,
                     backdated_by_account=backdated_by_account,
                     backdated_by_user=backdated_by_user,
-                    audit_recommendations=audit_recommendations,
-                    compliance_assessment=compliance_assessment,
                     financial_statement_impact=financial_statement_impact,
                     processing_job=self.processing_job,
                     processing_duration=(timezone.now() - self.processing_job.started_at).total_seconds() if self.processing_job.started_at else None,

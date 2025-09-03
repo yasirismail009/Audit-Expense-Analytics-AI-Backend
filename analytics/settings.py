@@ -202,64 +202,11 @@ CORS_ALLOW_HEADERS = [
 ]
 
 # Celery Configuration
-# https://docs.celeryproject.org/en/stable/django/first-steps-with-django.html
+# All Celery settings are now handled in analytics/celery.py for consistency
+# This prevents conflicts between settings.py and celery.py configurations
 
-# Celery broker settings - Using Redis for better performance
-# Celery Configuration
-CELERY_BROKER_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-CELERY_RESULT_BACKEND = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'UTC'
-
-# Force Redis transport and disable AMQP
-CELERY_BROKER_TRANSPORT = 'redis'
-CELERY_RESULT_BACKEND_TRANSPORT = 'redis'
-CELERY_BROKER_TRANSPORT_OPTIONS = {
-    'visibility_timeout': 3600,
-    'fanout_prefix': True,
-    'fanout_patterns': True,
-}
-CELERY_TASK_ALWAYS_EAGER = False
-CELERY_TASK_EAGER_PROPAGATES = True
-
-# Disable AMQP transport completely
-CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
-CELERY_BROKER_CONNECTION_MAX_RETRIES = 10
-CELERY_BROKER_CONNECTION_RETRY = True
-
-# Celery task routing
-CELERY_TASK_ROUTES = {
-    'core.tasks.process_file_with_anomalies': {'queue': 'analytics'},
-    'core.tasks.train_ml_models': {'queue': 'ml_training'},
-    'core.tasks.retrain_ml_models': {'queue': 'ml_training'},
-    'core.tasks.train_enhanced_ml_models': {'queue': 'ml_training'},
-    'core.tasks.monitor_processing_jobs': {'queue': 'maintenance'},
-    'core.tasks.monitor_ml_model_performance': {'queue': 'maintenance'},
-}
-
-# Celery task default settings
-CELERY_TASK_DEFAULT_QUEUE = 'analytics'
-CELERY_TASK_DEFAULT_EXCHANGE = 'analytics'
-CELERY_TASK_DEFAULT_ROUTING_KEY = 'analytics'
-
-# Celery worker settings
-CELERY_WORKER_CONCURRENCY = 4
-CELERY_WORKER_MAX_TASKS_PER_CHILD = 1000
-CELERY_WORKER_PREFETCH_MULTIPLIER = 1
-
-# Celery beat settings (for periodic tasks)
-CELERY_BEAT_SCHEDULE = {
-    'monitor-processing-jobs': {
-        'task': 'core.tasks.monitor_processing_jobs',
-        'schedule': 300.0,  # Run every 5 minutes
-    },
-    'process-queued-jobs': {
-        'task': 'core.tasks.process_queued_jobs',
-        'schedule': 60.0,  # Run every minute
-    },
-}
+# Redis URL for other services that might need it
+redis_url = os.environ.get('REDIS_URL', 'redis://redis:6379/0')
 
 # File upload settings
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB
@@ -278,15 +225,6 @@ BACKGROUND_PROCESSING_TIMEOUT = 300  # 5 minutes
 
 # Celery fallback settings
 ENABLE_SYNC_FALLBACK = True  # Enable synchronous processing when Celery is not available
-CELERY_CONNECTION_TIMEOUT = 5  # Timeout for Celery connection test (seconds)
-
-# Celery task timeout and retry settings
-
-# Celery task timeout and retry settings
-CELERY_TASK_TIME_LIMIT = 300  # 5 minutes
-CELERY_TASK_SOFT_TIME_LIMIT = 240  # 4 minutes
-CELERY_TASK_MAX_RETRIES = 3
-CELERY_TASK_RETRY_DELAY = 60  # 1 minute
 
 # REST Framework Settings
 REST_FRAMEWORK = {

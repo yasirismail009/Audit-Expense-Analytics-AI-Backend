@@ -52,10 +52,15 @@ urlpatterns = [
     path('holiday-analysis/<uuid:file_id>/', views.HolidayAnalysisView.as_view(), name='holiday-analysis'),
     # Holiday entries listing endpoint
     path('holiday-entries-list/<uuid:file_id>/', views.HolidayListView.as_view(), name='holiday-entries-list'),
+    # Manual entry analysis endpoint (Management Override Risk)
+    path('manual-entry-analysis/<uuid:file_id>/', views.ManualEntryAnalysisView.as_view(), name='manual-entry-analysis'),
     # File GL accounts endpoint
     path('file-gl-accounts/<uuid:file_id>/', views.FileGLAccountsView.as_view(), name='file-gl-accounts'),
     # Excel export endpoint
     path('excel-export/<uuid:file_id>/', views.ExcelExportView.as_view(), name='excel-export'),
     # Analysis export endpoint
     path('analysis-export/<uuid:file_id>/<str:analysis_type>/', views.AnalysisExportView.as_view(), name='analysis-export'),
+    
+    # AI Risk Recommendation URLs
+    path('ai-risk/', include('core.ai_risk_urls')),
 ] 

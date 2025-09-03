@@ -1,5 +1,12 @@
 from rest_framework import serializers
-from .models import SAPGLPosting, DataFile, AnalysisSession, TransactionAnalysis, GLAccount, FileProcessingJob, MLModelTraining
+from .models import (
+    SAPGLPosting, DataFile, AnalysisSession, TransactionAnalysis, GLAccount, 
+    FileProcessingJob, MLModelTraining, OverallAnalysisResult, RiskScoringDocument, 
+    DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, 
+    ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult, HolidayAnalysisResult, 
+    GeneralAnalysisResult, AIRiskAssessment, RiskPattern, AnomalyCluster, 
+    AIRiskRecommendation, RiskTrend, ModelPerformance
+)
 from decimal import Decimal
 import uuid
 
@@ -1132,3 +1139,68 @@ class HolidayListSerializer(serializers.Serializer):
             return 'MEDIUM'
         else:  # < 1M
             return 'LOW' 
+
+
+# ============================================================================
+# AI RISK ASSESSMENT SERIALIZERS
+# ============================================================================
+
+class AIRiskAssessmentSerializer(serializers.ModelSerializer):
+    """Serializer for AI Risk Assessment model"""
+    
+    class Meta:
+        model = AIRiskAssessment
+        fields = '__all__'
+        read_only_fields = ('id', 'analysis_date', 'created_at', 'updated_at')
+    
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['risk_summary'] = instance.get_risk_summary()
+        data['key_recommendations'] = instance.get_key_recommendations()
+        data['investigation_priorities'] = instance.get_investigation_priorities()
+        return data
+
+
+class RiskPatternSerializer(serializers.ModelSerializer):
+    """Serializer for Risk Pattern model"""
+    
+    class Meta:
+        model = RiskPattern
+        fields = '__all__'
+        read_only_fields = ('id', 'first_detected', 'last_updated')
+
+
+class AnomalyClusterSerializer(serializers.ModelSerializer):
+    """Serializer for Anomaly Cluster model"""
+    
+    class Meta:
+        model = AnomalyCluster
+        fields = '__all__'
+        read_only_fields = ('id', 'created_at', 'updated_at')
+
+
+class AIRiskRecommendationSerializer(serializers.ModelSerializer):
+    """Serializer for AI Risk Recommendation model"""
+    
+    class Meta:
+        model = AIRiskRecommendation
+        fields = '__all__'
+        read_only_fields = ('id', 'created_at', 'updated_at')
+
+
+class RiskTrendSerializer(serializers.ModelSerializer):
+    """Serializer for Risk Trend model"""
+    
+    class Meta:
+        model = RiskTrend
+        fields = '__all__'
+        read_only_fields = ('id', 'created_at')
+
+
+class ModelPerformanceSerializer(serializers.ModelSerializer):
+    """Serializer for Model Performance model"""
+    
+    class Meta:
+        model = ModelPerformance
+        fields = '__all__'
+        read_only_fields = ('id', 'created_at')

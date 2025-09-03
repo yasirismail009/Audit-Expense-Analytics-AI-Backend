@@ -153,7 +153,7 @@ def run_general_analysis_sync(job_id):
         return {'error': error_msg}
 
 def run_duplicate_analysis_sync(job_id):
-    """Run Duplicate Analysis synchronously and save to database"""
+    """Run Duplicate Analysis synchronously and save to database with ML integration"""
     
     # Setup Django
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'analytics.settings')
@@ -173,39 +173,196 @@ def run_duplicate_analysis_sync(job_id):
         
         logger.info(f"Running Duplicate Analysis for {len(transactions)} transactions")
         
-        # Run basic duplicate analysis without ML orchestrator
+        # Run basic duplicate analysis
         duplicate_pairs = []
         duplicates_found = 0
         
-        # Simple duplicate detection based on amount and date
+        # Enhanced duplicate detection based on amount, date, account, and credit/debit validation
         transaction_dict = {}
         for t in transactions:
-            key = (float(t.amount_local_currency), t.posting_date, t.gl_account)
+            # Create a more comprehensive key that includes transaction type for credit/debit validation
+            key = (float(t.amount_local_currency), t.posting_date, t.gl_account, t.transaction_type)
             if key in transaction_dict:
-                # Found a potential duplicate
-                duplicate_pairs.append({
-                    'transaction1': {
-                        'id': str(transaction_dict[key].id),
-                        'document_number': transaction_dict[key].document_number,
-                        'amount': float(transaction_dict[key].amount_local_currency),
-                        'posting_date': transaction_dict[key].posting_date.isoformat() if transaction_dict[key].posting_date else None,
-                        'user': transaction_dict[key].user_name,
-                        'account': transaction_dict[key].gl_account
-                    },
-                    'transaction2': {
-                        'id': str(t.id),
-                        'document_number': t.document_number,
-                        'amount': float(t.amount_local_currency),
-                        'posting_date': t.posting_date.isoformat() if t.posting_date else None,
-                        'user': t.user_name,
-                        'account': t.gl_account
-                    },
-                    'similarity_score': 1.0,
-                    'risk_level': 'HIGH'
-                })
-                duplicates_found += 1
+                # Found a potential duplicate - validate both transactions exist
+                transaction1 = transaction_dict[key]
+                transaction2 = t
+                
+                # Ensure both transactions are valid and not None
+                if transaction1 and transaction2:
+                    # Validate credit/debit consistency
+                    if transaction1.transaction_type == transaction2.transaction_type:
+                        # Same transaction type - this is a true duplicate
+                        duplicate_pairs.append({
+                            'transaction1': {
+                                'id': str(transaction1.id),
+                                'document_number': transaction1.document_number,
+                                'amount': float(transaction1.amount_local_currency),
+                                'posting_date': transaction1.posting_date.isoformat() if transaction1.posting_date else None,
+                                'user': transaction1.user_name,
+                                'account': transaction1.gl_account,
+                                'transaction_type': transaction1.transaction_type,
+                                'debit_credit': 'DEBIT' if transaction1.transaction_type == 'DEBIT' else 'CREDIT'
+                            },
+                            'transaction2': {
+                                'id': str(transaction2.id),
+                                'document_number': transaction2.document_number,
+                                'amount': float(transaction2.amount_local_currency),
+                                'posting_date': transaction2.posting_date.isoformat() if transaction2.posting_date else None,
+                                'user': transaction2.user_name,
+                                'account': transaction2.gl_account,
+                                'transaction_type': transaction2.transaction_type,
+                                'debit_credit': 'DEBIT' if transaction2.transaction_type == 'DEBIT' else 'CREDIT'
+                            },
+                            'similarity_score': 1.0,
+                            'risk_level': 'HIGH',
+                            'duplicate_type': 'exact_match',
+                            'credit_debit_consistent': True,
+                            'validation_notes': 'Both transactions are same type (DEBIT/CREDIT)'
+                        })
+                        duplicates_found += 1
+                    else:
+                        # Different transaction types - this might be a legitimate offsetting entry
+                        # Log as potential anomaly but not as duplicate
+                        logger.info(f"Potential offsetting entries found: {transaction1.transaction_type} vs {transaction2.transaction_type} for account {t.gl_account}")
+                else:
+                    logger.warning(f"Invalid transaction found during duplicate detection: transaction1={transaction1}, transaction2={transaction2}")
             else:
                 transaction_dict[key] = t
+        
+        # =============================================================================
+        # ML MODEL INTEGRATION - Run ML predictions during analysis
+        # =============================================================================
+        
+        ml_predictions = {}
+        ml_confidence_scores = []
+        ml_detection_method = 'rule_based'
+        
+        try:
+            # Import ML trainer
+            from core.ml_models import MLModelTrainer
+            
+            # Initialize ML trainer
+            ml_trainer = MLModelTrainer()
+            logger.info("ML Model Trainer initialized successfully")
+            
+            # Run ML duplicate prediction
+            ml_results = ml_trainer.predict_duplicates(transactions)
+            
+            if ml_results and 'error' not in ml_results:
+                ml_predictions = ml_results
+                ml_detection_method = 'ml_enhanced'
+                
+                # Extract ML confidence scores
+                if 'confidence_scores' in ml_results:
+                    ml_confidence_scores = ml_results['confidence_scores']
+                
+                # Update duplicate pairs with ML insights
+                if 'duplicate_transactions' in ml_results and ml_results['duplicate_transactions']:
+                    ml_duplicates = ml_results['duplicate_transactions']
+                    
+                    # Merge ML predictions with rule-based results
+                    for ml_dup in ml_duplicates:
+                        # Check if this ML duplicate is already in our rule-based results
+                        existing = False
+                        for existing_dup in duplicate_pairs:
+                            if (existing_dup['transaction1']['id'] == ml_dup['transaction_id'] or 
+                                existing_dup['transaction2']['id'] == ml_dup['transaction_id']):
+                                existing = True
+                                # Enhance existing duplicate with ML confidence
+                                existing_dup['ml_confidence'] = ml_dup.get('confidence', 0.8)
+                                existing_dup['ml_detected'] = True
+                                break
+                        
+                        if not existing:
+                            # For ML-detected duplicates, we need to find a matching transaction
+                            # Look for transactions with similar characteristics
+                            matching_transaction = None
+                            for t in transactions:
+                                if (str(t.id) != ml_dup['transaction_id'] and 
+                                    abs(float(t.amount_local_currency or 0) - ml_dup['amount']) < 0.01 and
+                                    t.gl_account == ml_dup['gl_account'] and
+                                    t.posting_date and ml_dup['posting_date'] and
+                                    t.posting_date.strftime('%Y-%m-%d') == ml_dup['posting_date']):
+                                    matching_transaction = t
+                                    break
+                            
+                            if matching_transaction:
+                                # Add new ML-detected duplicate with both transactions
+                                # Validate credit/debit consistency
+                                transaction1_type = ml_dup.get('transaction_type', 'DEBIT')  # Default to DEBIT if not specified
+                                transaction2_type = matching_transaction.transaction_type
+                                
+                                if transaction1_type == transaction2_type:
+                                    # Same transaction type - this is a true duplicate
+                                    duplicate_pairs.append({
+                                        'transaction1': {
+                                            'id': ml_dup['transaction_id'],
+                                            'amount': ml_dup['amount'],
+                                            'gl_account': ml_dup['gl_account'],
+                                            'user_name': ml_dup['user_name'],
+                                            'posting_date': ml_dup['posting_date'],
+                                            'transaction_type': transaction1_type,
+                                            'debit_credit': 'DEBIT' if transaction1_type == 'DEBIT' else 'CREDIT'
+                                        },
+                                        'transaction2': {
+                                            'id': str(matching_transaction.id),
+                                            'amount': float(matching_transaction.amount_local_currency or 0),
+                                            'gl_account': matching_transaction.gl_account,
+                                            'user_name': matching_transaction.user_name,
+                                            'posting_date': matching_transaction.posting_date.isoformat() if matching_transaction.posting_date else None,
+                                            'transaction_type': transaction2_type,
+                                            'debit_credit': 'DEBIT' if transaction2_type == 'DEBIT' else 'CREDIT'
+                                        },
+                                        'similarity_score': ml_dup.get('confidence', 0.8),
+                                        'risk_level': 'MEDIUM' if ml_dup.get('confidence', 0.8) < 0.9 else 'HIGH',
+                                        'ml_detected': True,
+                                        'ml_confidence': ml_dup.get('confidence', 0.8),
+                                        'duplicate_type': 'ml_detected',
+                                        'credit_debit_consistent': True,
+                                        'validation_notes': 'ML-detected duplicate with consistent credit/debit types'
+                                    })
+                                    duplicates_found += 1
+                                else:
+                                    # Different transaction types - log as potential anomaly but not as duplicate
+                                    logger.info(f"ML detected potential offsetting entries: {transaction1_type} vs {transaction2_type} for account {ml_dup['gl_account']}")
+                            else:
+                                # If no matching transaction found, log this as a potential anomaly but don't add to duplicates
+                                logger.warning(f"ML detected potential duplicate for transaction {ml_dup['transaction_id']} but no matching transaction found")
+                
+                logger.info(f"ML duplicate detection completed: {ml_results.get('duplicate_count', 0)} ML-detected duplicates")
+                
+            else:
+                logger.warning("ML duplicate detection failed, using rule-based results only")
+                
+        except Exception as e:
+            logger.error(f"ML duplicate detection error: {e}")
+            # Continue with rule-based results
+            ml_detection_method = 'rule_based_fallback'
+        
+        # Validate all duplicate pairs before finalizing
+        validated_duplicate_pairs = []
+        for dup in duplicate_pairs:
+            # Ensure both transactions exist and are not None
+            if (dup.get('transaction1') and dup.get('transaction2') and 
+                dup['transaction1'] is not None and dup['transaction2'] is not None):
+                
+                # Validate credit/debit consistency
+                transaction1_type = dup['transaction1'].get('transaction_type', 'DEBIT')
+                transaction2_type = dup['transaction2'].get('transaction_type', 'DEBIT')
+                
+                if transaction1_type == transaction2_type:
+                    # Valid duplicate - add to validated list
+                    validated_duplicate_pairs.append(dup)
+                else:
+                    # Different transaction types - log as potential offsetting entry
+                    logger.info(f"Filtering out potential offsetting entry: {transaction1_type} vs {transaction2_type}")
+            else:
+                # Invalid duplicate - log warning
+                logger.warning(f"Filtering out invalid duplicate with missing transactions: {dup}")
+        
+        # Update duplicates_found count with validated pairs
+        duplicates_found = len(validated_duplicate_pairs)
+        duplicate_pairs = validated_duplicate_pairs
         
         duplicate_results = {
             'duplicates_found': duplicates_found,
@@ -232,20 +389,41 @@ def run_duplicate_analysis_sync(job_id):
                 }
             },
             'export_data': duplicate_pairs,
-            'processing_duration': (timezone.now() - start_time).total_seconds()
+            'processing_duration': (timezone.now() - start_time).total_seconds(),
+            # =============================================================================
+            # ML ENHANCED FEATURES
+            # =============================================================================
+            'ml_insights': {
+                'detection_method': ml_detection_method,
+                'ml_predictions': ml_predictions,
+                'confidence_scores': ml_confidence_scores,
+                'ml_enhanced_duplicates': len([d for d in duplicate_pairs if d.get('ml_detected', False)]),
+                'rule_based_duplicates': len([d for d in duplicate_pairs if not d.get('ml_detected', False)]),
+                'ml_model_accuracy': ml_predictions.get('model_accuracy', 0.0) if ml_predictions else 0.0
+            },
+            'false_positive_indicators': ml_predictions.get('false_positive_indicators', []) if ml_predictions else [],
+            'confidence_scores': ml_confidence_scores if ml_confidence_scores else [1.0] * duplicates_found,
+            'detection_methods': {
+                'primary_method': ml_detection_method,
+                'ml_available': bool(ml_predictions),
+                'rule_based_fallback': ml_detection_method in ['rule_based', 'rule_based_fallback']
+            }
         }
         
-        # Save to DuplicateAnalysisResult table
+        # Save to DuplicateAnalysisResult table using new unified structure
         duplicate_analysis_result = DuplicateAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
             analysis_type='enhanced_duplicate',
-            analysis_version='1.0.0',
-            analysis_info={
+            analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': len(transactions),
                 'duplicates_found': duplicate_results.get('duplicates_found', 0),
-                'duplicate_percentage': duplicate_results.get('compliance_assessment', {}).get('duplicate_percentage', 0)
+                'duplicate_percentage': duplicate_results.get('compliance_assessment', {}).get('duplicate_percentage', 0),
+                'ml_enhanced': duplicate_results.get('ml_insights', {}).get('ml_available', False),
+                'detection_method': duplicate_results.get('ml_insights', {}).get('detection_method', 'rule_based')
             },
+            anomaly_list=duplicate_results.get('duplicate_pairs', []),
             duplicate_list=duplicate_results.get('duplicate_pairs', []),
             breakdowns={
                 'duplicate_by_document': duplicate_results.get('duplicate_by_amount', []),
@@ -253,13 +431,62 @@ def run_duplicate_analysis_sync(job_id):
                 'duplicate_by_user': duplicate_results.get('duplicate_by_user', []),
                 'audit_recommendations': duplicate_results.get('audit_recommendations', []),
                 'compliance_assessment': duplicate_results.get('compliance_assessment', {}),
-                'financial_statement_impact': duplicate_results.get('financial_statement_impact', {})
+                'financial_statement_impact': duplicate_results.get('financial_statement_impact', {}),
+                'ml_insights': duplicate_results.get('ml_insights', {}),
+                'detection_methods': duplicate_results.get('detection_methods', {})
             },
             chart_data=duplicate_results.get('chart_data', {}),
             export_data=duplicate_results.get('export_data', []),
             processing_duration=duplicate_results.get('processing_duration', 0),
             status='COMPLETED'
         )
+        
+        # Update SAPGLPosting records with duplicate flags and anomaly analysis
+        duplicate_transaction_ids = set()
+        for dup in duplicate_pairs:
+            if dup.get('transaction1', {}).get('id'):
+                duplicate_transaction_ids.add(dup['transaction1']['id'])
+            if dup.get('transaction2', {}).get('id'):
+                duplicate_transaction_ids.add(dup['transaction2']['id'])
+        
+        # Update SAPGLPosting records
+        updated_count = 0
+        for transaction_id in duplicate_transaction_ids:
+            try:
+                posting = SAPGLPosting.objects.get(id=transaction_id)
+                posting.is_duplicate = True
+                posting.duplicate_type = 'exact_match'
+                posting.duplicate_risk_score = 85.0  # High risk for duplicates
+                
+                # Update anomaly analysis summary
+                if not posting.anomaly_analysis_summary:
+                    posting.anomaly_analysis_summary = {}
+                
+                posting.anomaly_analysis_summary.update({
+                    'duplicate_detected': True,
+                    'duplicate_analysis_id': str(duplicate_analysis_result.id),
+                    'duplicate_risk_level': 'HIGH',
+                    'duplicate_confidence': 1.0,
+                    'credit_debit_consistent': True,
+                    'last_updated': timezone.now().isoformat()
+                })
+                
+                # Add to anomaly types if not already present
+                if 'duplicate' not in posting.anomaly_types:
+                    posting.anomaly_types.append('duplicate')
+                
+                # Update overall risk score
+                posting.overall_risk_score = min(100.0, posting.overall_risk_score + 25.0)
+                
+                posting.save()
+                updated_count += 1
+                
+            except SAPGLPosting.DoesNotExist:
+                logger.warning(f"SAPGLPosting with ID {transaction_id} not found for duplicate update")
+            except Exception as e:
+                logger.error(f"Error updating SAPGLPosting {transaction_id}: {e}")
+        
+        logger.info(f"Updated {updated_count} SAPGLPosting records with duplicate flags")
         
         processing_duration = (timezone.now() - start_time).total_seconds()
         
@@ -277,13 +504,13 @@ def run_duplicate_analysis_sync(job_id):
         error_msg = f"Error in Duplicate Analysis: {str(e)}"
         logger.error(error_msg)
         
-        # Save failed result to database
+        # Save failed result to database using new unified structure
         try:
             DuplicateAnalysisResult.objects.create(
                 data_file=data_file,
                 processing_job=job,
                 analysis_type='enhanced_duplicate',
-                analysis_version='1.0.0',
+                analysis_version='2.0.0',
                 status='FAILED',
                 error_message=error_msg
             )
@@ -313,7 +540,60 @@ def run_backdated_analysis_sync(job_id):
         
         logger.info(f"Running Backdated Analysis for {len(transactions)} transactions")
         
-        # Run basic backdated analysis without ML orchestrator
+        # =============================================================================
+        # ML MODEL INTEGRATION - Run ML predictions during analysis
+        # =============================================================================
+        
+        ml_predictions = {}
+        ml_detection_method = 'rule_based'
+        ml_detected_backdated = []
+        
+        try:
+            # Import ML trainer
+            from core.ml_models import MLModelTrainer
+            
+            # Initialize ML trainer
+            ml_trainer = MLModelTrainer()
+            logger.info("ML Model Trainer initialized successfully for backdated analysis")
+            
+            # Run ML backdated prediction
+            ml_results = ml_trainer.predict_backdated(transactions)
+            
+            if ml_results and 'error' not in ml_results:
+                ml_predictions = ml_results
+                ml_detection_method = 'ml_enhanced'
+                
+                # Extract ML detected backdated transactions
+                if 'backdated_transactions' in ml_results:
+                    ml_backdated = ml_results['backdated_transactions']
+                    
+                    # Process ML detected backdated transactions
+                    for ml_back in ml_backdated:
+                        ml_detected_backdated.append({
+                            'transaction_id': ml_back['transaction_id'],
+                            'document_number': ml_back.get('document_number', ''),
+                            'amount': ml_back.get('amount', 0),
+                            'document_date': ml_back.get('document_date', ''),
+                            'posting_date': ml_back.get('posting_date', ''),
+                            'days_difference': ml_back.get('delay_days', 0),
+                            'user': ml_back.get('user_name', ''),
+                            'account': ml_back.get('gl_account', ''),
+                            'risk_level': 'HIGH' if ml_back.get('confidence', 0) > 0.8 else 'MEDIUM',
+                            'ml_detected': True,
+                            'ml_confidence': ml_back.get('confidence', 0.8)
+                        })
+                    
+                    logger.info(f"ML backdated detection completed: {len(ml_detected_backdated)} ML-detected backdated transactions")
+                    
+            else:
+                logger.warning("ML backdated detection failed, using rule-based results only")
+                
+        except Exception as e:
+            logger.error(f"ML backdated detection error: {e}")
+            # Continue with rule-based results
+            ml_detection_method = 'rule_based_fallback'
+        
+        # Run basic backdated analysis (rule-based)
         from datetime import timedelta
         
         backdated_transactions = []
@@ -349,6 +629,9 @@ def run_backdated_analysis_sync(job_id):
                         backdated_by_account[t.gl_account] = []
                     backdated_by_account[t.gl_account].append(t)
         
+        # Merge ML and rule-based results
+        backdated_transactions.extend(ml_detected_backdated)
+        
         backdated_results = {
             'backdated_transactions': backdated_transactions,
             'backdated_by_user': {user: len(transactions) for user, transactions in backdated_by_user.items()},
@@ -373,20 +656,36 @@ def run_backdated_analysis_sync(job_id):
                 }
             },
             'export_data': backdated_transactions,
-            'processing_duration': (timezone.now() - start_time).total_seconds()
+            'processing_duration': (timezone.now() - start_time).total_seconds(),
+            # =============================================================================
+            # ML ENHANCED FEATURES
+            # =============================================================================
+            'ml_insights': {
+                'detection_method': ml_detection_method,
+                'ml_predictions': ml_predictions,
+                'ml_detected_backdated': len(ml_detected_backdated),
+                'rule_based_backdated': len(backdated_transactions) - len(ml_detected_backdated),
+                'ml_model_accuracy': ml_predictions.get('model_accuracy', 0.0) if ml_predictions else 0.0
+            },
+            'detection_methods': {
+                'primary_method': ml_detection_method,
+                'ml_available': bool(ml_predictions),
+                'rule_based_fallback': ml_detection_method in ['rule_based', 'rule_based_fallback']
+            }
         }
         
-        # Save to BackdatedAnalysisResult table
+        # Save to BackdatedAnalysisResult table using new unified structure
         backdated_analysis_result = BackdatedAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
             analysis_type='enhanced_backdated',
-            analysis_version='1.0.0',
-            analysis_info={
+            analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': len(transactions),
                 'backdated_entries_found': backdated_results.get('backdated_entries_found', 0),
                 'backdated_percentage': backdated_results.get('compliance_assessment', {}).get('backdated_percentage', 0)
             },
+            anomaly_list=backdated_results.get('backdated_transactions', []),
             backdated_entries=backdated_results.get('backdated_transactions', []),
             backdated_by_document=backdated_results.get('backdated_by_document', []),
             backdated_by_account=backdated_results.get('backdated_by_account', []),
@@ -416,13 +715,13 @@ def run_backdated_analysis_sync(job_id):
         error_msg = f"Error in Backdated Analysis: {str(e)}"
         logger.error(error_msg)
         
-        # Save failed result to database
+        # Save failed result to database using new unified structure
         try:
             BackdatedAnalysisResult.objects.create(
                 data_file=data_file,
                 processing_job=job,
                 analysis_type='enhanced_backdated',
-                analysis_version='1.0.0',
+                analysis_version='2.0.0',
                 status='FAILED',
                 error_message=error_msg
             )
@@ -485,6 +784,67 @@ def run_user_analysis_sync(job_id):
                     'details': f"User has {data['transaction_count']} transactions totaling {data['total_amount']}"
                 })
         
+        # =============================================================================
+        # ML MODEL INTEGRATION - Run ML predictions during analysis
+        # =============================================================================
+        
+        ml_predictions = {}
+        ml_detection_method = 'rule_based'
+        ml_detected_anomalies = []
+        anomaly_severity_breakdown = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+        
+        try:
+            # Import ML trainer
+            from core.ml_models import MLModelTrainer
+            
+            # Initialize ML trainer
+            ml_trainer = MLModelTrainer()
+            logger.info("ML Model Trainer initialized successfully for user analysis")
+            
+            # Run ML user anomaly prediction
+            ml_results = ml_trainer.predict_user_anomalies(transactions)
+            
+            if ml_results and 'error' not in ml_results:
+                ml_predictions = ml_results
+                ml_detection_method = 'ml_enhanced'
+                
+                # Extract ML detected anomalies
+                if 'user_anomalies' in ml_results:
+                    ml_user_anomalies = ml_results['user_anomalies']
+                    
+                    # Process ML detected anomalies
+                    for user, ml_data in ml_user_anomalies.items():
+                        if ml_data.get('anomaly_score', 0) > 0.7:  # High confidence anomalies
+                            ml_detected_anomalies.append({
+                                'user': user,
+                                'anomaly_type': 'ML_DETECTED',
+                                'risk_level': 'HIGH' if ml_data.get('anomaly_score', 0) > 0.8 else 'MEDIUM',
+                                'details': f"ML detected anomaly: {ml_data.get('transaction_count', 0)} transactions, {ml_data.get('total_amount', 0)} total",
+                                'ml_confidence': ml_data.get('anomaly_score', 0),
+                                'ml_detected': True
+                            })
+                            
+                            # Update severity breakdown
+                            if ml_data.get('anomaly_score', 0) > 0.9:
+                                anomaly_severity_breakdown['HIGH'] += 1
+                            elif ml_data.get('anomaly_score', 0) > 0.7:
+                                anomaly_severity_breakdown['MEDIUM'] += 1
+                            else:
+                                anomaly_severity_breakdown['LOW'] += 1
+                
+                # Merge ML anomalies with rule-based anomalies
+                user_anomalies.extend(ml_detected_anomalies)
+                
+                logger.info(f"ML user anomaly detection completed: {len(ml_detected_anomalies)} ML-detected anomalies")
+                
+            else:
+                logger.warning("ML user anomaly detection failed, using rule-based results only")
+                
+        except Exception as e:
+            logger.error(f"ML user anomaly detection error: {e}")
+            # Continue with rule-based results
+            ml_detection_method = 'rule_based_fallback'
+        
         user_results = {
             'total_users': len(user_summary),
             'user_transaction_summary': list(user_summary.values()),
@@ -508,21 +868,41 @@ def run_user_analysis_sync(job_id):
                 'user_summary': list(user_summary.values())
             },
             'export_data': list(user_summary.values()),
-            'processing_duration': (timezone.now() - start_time).total_seconds()
+            'processing_duration': (timezone.now() - start_time).total_seconds(),
+            # =============================================================================
+            # ML ENHANCED FEATURES
+            # =============================================================================
+            'ml_insights': {
+                'detection_method': ml_detection_method,
+                'ml_predictions': ml_predictions,
+                'ml_detected_anomalies': ml_detected_anomalies,
+                'anomaly_severity_breakdown': anomaly_severity_breakdown,
+                'ml_model_accuracy': ml_predictions.get('model_accuracy', 0.0) if ml_predictions else 0.0
+            },
+            'ml_detected_anomalies': ml_detected_anomalies,
+            'anomaly_severity_breakdown': anomaly_severity_breakdown,
+            'detection_methods': {
+                'primary_method': ml_detection_method,
+                'ml_available': bool(ml_predictions),
+                'rule_based_fallback': ml_detection_method in ['rule_based', 'rule_based_fallback']
+            }
         }
         
-        # Save to UserAnalysisResult table
+        # Save to UserAnalysisResult table using new unified structure
         user_analysis_result = UserAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
             analysis_type='user_analysis',
-            analysis_version='1.0.0',
-            analysis_info={
+            analysis_version='2.0.0',
+            analysis_summary={
                 'total_users': user_results.get('total_users', 0),
                 'total_transactions': len(transactions),
                 'high_risk_users': user_results.get('statistical_summary', {}).get('high_risk_users', 0),
-                'users_with_anomalies': user_results.get('statistical_summary', {}).get('users_with_anomalies', 0)
+                'users_with_anomalies': user_results.get('statistical_summary', {}).get('users_with_anomalies', 0),
+                'ml_enhanced': user_results.get('ml_insights', {}).get('ml_available', False),
+                'detection_method': user_results.get('ml_insights', {}).get('detection_method', 'rule_based')
             },
+            anomaly_list=user_results.get('user_anomalies', []),
             user_transaction_summary=user_results.get('user_transaction_summary', []),
             user_debit_analysis=user_results.get('user_debit_analysis', []),
             user_account_distribution=user_results.get('user_account_distribution', []),
@@ -534,6 +914,12 @@ def run_user_analysis_sync(job_id):
             chart_data=user_results.get('chart_data', {}),
             export_data=user_results.get('export_data', []),
             processing_duration=user_results.get('processing_duration', 0),
+            breakdowns={
+                'ml_insights': user_results.get('ml_insights', {}),
+                'ml_detected_anomalies': user_results.get('ml_detected_anomalies', []),
+                'anomaly_severity_breakdown': user_results.get('anomaly_severity_breakdown', {}),
+                'detection_methods': user_results.get('detection_methods', {})
+            },
             status='COMPLETED'
         )
         
@@ -553,13 +939,13 @@ def run_user_analysis_sync(job_id):
         error_msg = f"Error in User Analysis: {str(e)}"
         logger.error(error_msg)
         
-        # Save failed result to database
+        # Save failed result to database using new unified structure
         try:
             UserAnalysisResult.objects.create(
                 data_file=data_file,
                 processing_job=job,
                 analysis_type='user_analysis',
-                analysis_version='1.0.0',
+                analysis_version='2.0.0',
                 status='FAILED',
                 error_message=error_msg
             )
@@ -1065,7 +1451,59 @@ def run_unusual_days_analysis_sync(job_id):
         
         logger.info(f"Running Unusual Days Analysis for {len(transactions)} transactions")
         
-        # Run basic unusual days analysis without ML orchestrator
+        # =============================================================================
+        # ML MODEL INTEGRATION - Run ML predictions during analysis
+        # =============================================================================
+        
+        ml_predictions = {}
+        ml_detection_method = 'rule_based'
+        ml_detected_unusual = []
+        
+        try:
+            # Import ML trainer
+            from core.ml_models import MLModelTrainer
+            
+            # Initialize ML trainer
+            ml_trainer = MLModelTrainer()
+            logger.info("ML Model Trainer initialized successfully for unusual days analysis")
+            
+            # Run ML unusual days prediction
+            ml_results = ml_trainer.predict_unusual_days(transactions)
+            
+            if ml_results and 'error' not in ml_results:
+                ml_predictions = ml_results
+                ml_detection_method = 'ml_enhanced'
+                
+                # Extract ML detected unusual day transactions
+                if 'unusual_transactions' in ml_results:
+                    ml_unusual = ml_results['unusual_transactions']
+                    
+                    # Process ML detected unusual transactions
+                    for ml_unusual_tx in ml_unusual:
+                        ml_detected_unusual.append({
+                            'transaction_id': ml_unusual_tx['transaction_id'],
+                            'document_number': ml_unusual_tx.get('document_number', ''),
+                            'amount': ml_unusual_tx.get('amount', 0),
+                            'posting_date': ml_unusual_tx.get('posting_date', ''),
+                            'day_of_week': ml_unusual_tx.get('day_of_week', ''),
+                            'user': ml_unusual_tx.get('user', ''),
+                            'account': ml_unusual_tx.get('account', ''),
+                            'risk_level': ml_unusual_tx.get('risk_level', 'MEDIUM'),
+                            'ml_detected': True,
+                            'ml_confidence': ml_unusual_tx.get('confidence', 0.8)
+                        })
+                    
+                    logger.info(f"ML unusual days detection completed: {len(ml_detected_unusual)} ML-detected unusual transactions")
+                    
+            else:
+                logger.warning("ML unusual days detection failed, using rule-based results only")
+                
+        except Exception as e:
+            logger.error(f"ML unusual days detection error: {e}")
+            # Continue with rule-based results
+            ml_detection_method = 'rule_based_fallback'
+        
+        # Run basic unusual days analysis (rule-based)
         from datetime import datetime, timedelta
         
         unusual_days_transactions = []
@@ -1096,6 +1534,9 @@ def run_unusual_days_analysis_sync(job_id):
                     if t.gl_account not in unusual_days_by_account:
                         unusual_days_by_account[t.gl_account] = []
                     unusual_days_by_account[t.gl_account].append(t)
+        
+        # Merge ML and rule-based results
+        unusual_days_transactions.extend(ml_detected_unusual)
         
         unusual_days_results = {
             'unusual_days_transactions': unusual_days_transactions,
@@ -1131,25 +1572,45 @@ def run_unusual_days_analysis_sync(job_id):
                 }
             },
             'export_data': unusual_days_transactions,
-            'processing_duration': (timezone.now() - start_time).total_seconds()
+            'processing_duration': (timezone.now() - start_time).total_seconds(),
+            # =============================================================================
+            # ML ENHANCED FEATURES
+            # =============================================================================
+            'ml_insights': {
+                'detection_method': ml_detection_method,
+                'ml_predictions': ml_predictions,
+                'ml_detected_unusual': len(ml_detected_unusual),
+                'rule_based_unusual': len(unusual_days_transactions) - len(ml_detected_unusual),
+                'ml_model_accuracy': ml_predictions.get('model_accuracy', 0.0) if ml_predictions else 0.0
+            },
+            'detection_methods': {
+                'primary_method': ml_detection_method,
+                'ml_available': bool(ml_predictions),
+                'rule_based_fallback': ml_detection_method in ['rule_based', 'rule_based_fallback']
+            }
         }
         
-        # Save to UnusualDaysAnalysisResult table
+        # Save to UnusualDaysAnalysisResult table using new unified structure
         unusual_days_analysis_result = UnusualDaysAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
             analysis_type='unusual_days_analysis',
-            analysis_version='1.0.0',
-            analysis_info={
+            analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': len(transactions),
                 'unusual_days_count': len(unusual_days_transactions)
             },
+            anomaly_list=unusual_days_transactions,
             weekend_postings=unusual_days_transactions,
             unusual_days=unusual_days_transactions,
             audit_recommendations=unusual_days_results.get('audit_recommendations', {}),
             compliance_assessment=unusual_days_results.get('compliance_assessment', {}),
             financial_statement_impact=unusual_days_results.get('financial_statement_impact', {}),
             chart_data=unusual_days_results.get('chart_data', {}),
+            breakdowns={
+                'ml_insights': unusual_days_results.get('ml_insights', {}),
+                'detection_methods': unusual_days_results.get('detection_methods', {})
+            },
             export_data=unusual_days_results.get('export_data', []),
             processing_duration=unusual_days_results.get('processing_duration', 0),
             status='COMPLETED'
@@ -1171,13 +1632,13 @@ def run_unusual_days_analysis_sync(job_id):
         error_msg = f"Error in Unusual Days Analysis: {str(e)}"
         logger.error(error_msg)
         
-        # Save failed result to database
+        # Save failed result to database using new unified structure
         try:
             UnusualDaysAnalysisResult.objects.create(
                 data_file=data_file,
                 processing_job=job,
                 analysis_type='unusual_days_analysis',
-                analysis_version='1.0.0',
+                analysis_version='2.0.0',
                 status='FAILED',
                 error_message=error_msg
             )
@@ -1209,7 +1670,59 @@ def run_closing_entries_analysis_sync(job_id):
         
         logger.info(f"Running Closing Entries Analysis for {len(transactions)} transactions")
         
-        # Run basic closing entries analysis without ML orchestrator
+        # =============================================================================
+        # ML MODEL INTEGRATION - Run ML predictions during analysis
+        # =============================================================================
+        
+        ml_predictions = {}
+        ml_detection_method = 'rule_based'
+        ml_detected_closing = []
+        
+        try:
+            # Import ML trainer
+            from core.ml_models import MLModelTrainer
+            
+            # Initialize ML trainer
+            ml_trainer = MLModelTrainer()
+            logger.info("ML Model Trainer initialized successfully for closing entries analysis")
+            
+            # Run ML closing entries prediction
+            ml_results = ml_trainer.predict_closing_entries(transactions)
+            
+            if ml_results and 'error' not in ml_results:
+                ml_predictions = ml_results
+                ml_detection_method = 'ml_enhanced'
+                
+                # Extract ML detected closing entry transactions
+                if 'closing_transactions' in ml_results:
+                    ml_closing = ml_results['closing_transactions']
+                    
+                    # Process ML detected closing transactions
+                    for ml_closing_tx in ml_closing:
+                        ml_detected_closing.append({
+                            'transaction_id': ml_closing_tx['transaction_id'],
+                            'document_number': ml_closing_tx.get('document_number', ''),
+                            'amount': ml_closing_tx.get('amount', 0),
+                            'posting_date': ml_closing_tx.get('posting_date', ''),
+                            'days_from_month_end': ml_closing_tx.get('days_from_month_end', 0),
+                            'user': ml_closing_tx.get('user', ''),
+                            'account': ml_closing_tx.get('account', ''),
+                            'risk_level': ml_closing_tx.get('risk_level', 'MEDIUM'),
+                            'ml_detected': True,
+                            'ml_confidence': ml_closing_tx.get('confidence', 0.8)
+                        })
+                    
+                    logger.info(f"ML closing entries detection completed: {len(ml_detected_closing)} ML-detected closing transactions")
+                    
+            else:
+                logger.warning("ML closing entries detection failed, using rule-based results only")
+                
+        except Exception as e:
+            logger.error(f"ML closing entries detection error: {e}")
+            # Continue with rule-based results
+            ml_detection_method = 'rule_based_fallback'
+        
+        # Run basic closing entries analysis (rule-based)
         from datetime import datetime, timedelta
         
         closing_entries_transactions = []
@@ -1244,6 +1757,9 @@ def run_closing_entries_analysis_sync(job_id):
                         closing_by_account[t.gl_account] = []
                     closing_by_account[t.gl_account].append(t)
         
+        # Merge ML and rule-based results
+        closing_entries_transactions.extend(ml_detected_closing)
+        
         closing_entries_results = {
             'closing_entries_transactions': closing_entries_transactions,
             'closing_by_user': {user: len(transactions) for user, transactions in closing_by_user.items()},
@@ -1268,24 +1784,44 @@ def run_closing_entries_analysis_sync(job_id):
                 }
             },
             'export_data': closing_entries_transactions,
-            'processing_duration': (timezone.now() - start_time).total_seconds()
+            'processing_duration': (timezone.now() - start_time).total_seconds(),
+            # =============================================================================
+            # ML ENHANCED FEATURES
+            # =============================================================================
+            'ml_insights': {
+                'detection_method': ml_detection_method,
+                'ml_predictions': ml_predictions,
+                'ml_detected_closing': len(ml_detected_closing),
+                'rule_based_closing': len(closing_entries_transactions) - len(ml_detected_closing),
+                'ml_model_accuracy': ml_predictions.get('model_accuracy', 0.0) if ml_predictions else 0.0
+            },
+            'detection_methods': {
+                'primary_method': ml_detection_method,
+                'ml_available': bool(ml_predictions),
+                'rule_based_fallback': ml_detection_method in ['rule_based', 'rule_based_fallback']
+            }
         }
         
-        # Save to ClosingEntriesAnalysisResult table
+        # Save to ClosingEntriesAnalysisResult table using new unified structure
         closing_entries_analysis_result = ClosingEntriesAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
             analysis_type='closing_entries_analysis',
-            analysis_version='1.0.0',
-            analysis_info={
+            analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': len(transactions),
                 'closing_entries_count': len(closing_entries_transactions)
             },
+            anomaly_list=closing_entries_transactions,
             closing_entries=closing_entries_transactions,
             audit_recommendations=closing_entries_results.get('audit_recommendations', {}),
             compliance_assessment=closing_entries_results.get('compliance_assessment', {}),
             financial_statement_impact=closing_entries_results.get('financial_statement_impact', {}),
             chart_data=closing_entries_results.get('chart_data', {}),
+            breakdowns={
+                'ml_insights': closing_entries_results.get('ml_insights', {}),
+                'detection_methods': closing_entries_results.get('detection_methods', {})
+            },
             export_data=closing_entries_results.get('export_data', []),
             processing_duration=closing_entries_results.get('processing_duration', 0),
             status='COMPLETED'
@@ -1307,13 +1843,13 @@ def run_closing_entries_analysis_sync(job_id):
         error_msg = f"Error in Closing Entries Analysis: {str(e)}"
         logger.error(error_msg)
         
-        # Save failed result to database
+        # Save failed result to database using new unified structure
         try:
             ClosingEntriesAnalysisResult.objects.create(
                 data_file=data_file,
                 processing_job=job,
                 analysis_type='closing_entries_analysis',
-                analysis_version='1.0.0',
+                analysis_version='2.0.0',
                 status='FAILED',
                 error_message=error_msg
             )
@@ -1345,7 +1881,59 @@ def run_holiday_analysis_sync(job_id):
         
         logger.info(f"Running Holiday Analysis for {len(transactions)} transactions")
         
-        # Run basic holiday analysis without ML orchestrator
+        # =============================================================================
+        # ML MODEL INTEGRATION - Run ML predictions during analysis
+        # =============================================================================
+        
+        ml_predictions = {}
+        ml_detection_method = 'rule_based'
+        ml_detected_holidays = []
+        
+        try:
+            # Import ML trainer
+            from core.ml_models import MLModelTrainer
+            
+            # Initialize ML trainer
+            ml_trainer = MLModelTrainer()
+            logger.info("ML Model Trainer initialized successfully for holiday analysis")
+            
+            # Run ML holiday prediction
+            ml_results = ml_trainer.predict_holidays(transactions)
+            
+            if ml_results and 'error' not in ml_results:
+                ml_predictions = ml_results
+                ml_detection_method = 'ml_enhanced'
+                
+                # Extract ML detected holiday transactions
+                if 'holiday_transactions' in ml_results:
+                    ml_holidays = ml_results['holiday_transactions']
+                    
+                    # Process ML detected holiday transactions
+                    for ml_holiday_tx in ml_holidays:
+                        ml_detected_holidays.append({
+                            'transaction_id': ml_holiday_tx['transaction_id'],
+                            'document_number': ml_holiday_tx.get('document_number', ''),
+                            'amount': ml_holiday_tx.get('amount', 0),
+                            'posting_date': ml_holiday_tx.get('posting_date', ''),
+                            'holiday_name': ml_holiday_tx.get('holiday_name', 'ML Detected Holiday'),
+                            'user': ml_holiday_tx.get('user', ''),
+                            'account': ml_holiday_tx.get('account', ''),
+                            'risk_level': ml_holiday_tx.get('risk_level', 'HIGH'),
+                            'ml_detected': True,
+                            'ml_confidence': ml_holiday_tx.get('confidence', 0.8)
+                        })
+                    
+                    logger.info(f"ML holiday detection completed: {len(ml_detected_holidays)} ML-detected holiday transactions")
+                    
+            else:
+                logger.warning("ML holiday detection failed, using rule-based results only")
+                
+        except Exception as e:
+            logger.error(f"ML holiday detection error: {e}")
+            # Continue with rule-based results
+            ml_detection_method = 'rule_based_fallback'
+        
+        # Run basic holiday analysis (rule-based)
         from datetime import datetime, timedelta
         
         # Use holiday_utils to get dynamic Saudi Arabian holidays
@@ -1401,6 +1989,9 @@ def run_holiday_analysis_sync(job_id):
                         holiday_by_account[t.gl_account] = []
                     holiday_by_account[t.gl_account].append(t)
         
+        # Merge ML and rule-based results
+        holiday_transactions.extend(ml_detected_holidays)
+        
         holiday_results = {
             'holiday_transactions': holiday_transactions,
             'holiday_by_user': {user: len(transactions) for user, transactions in holiday_by_user.items()},
@@ -1440,7 +2031,22 @@ def run_holiday_analysis_sync(job_id):
                 }
             },
             'export_data': holiday_transactions,
-            'processing_duration': (timezone.now() - start_time).total_seconds()
+            'processing_duration': (timezone.now() - start_time).total_seconds(),
+            # =============================================================================
+            # ML ENHANCED FEATURES
+            # =============================================================================
+            'ml_insights': {
+                'detection_method': ml_detection_method,
+                'ml_predictions': ml_predictions,
+                'ml_detected_holidays': len(ml_detected_holidays),
+                'rule_based_holidays': len(holiday_transactions) - len(ml_detected_holidays),
+                'ml_model_accuracy': ml_predictions.get('model_accuracy', 0.0) if ml_predictions else 0.0
+            },
+            'detection_methods': {
+                'primary_method': ml_detection_method,
+                'ml_available': bool(ml_predictions),
+                'rule_based_fallback': ml_detection_method in ['rule_based', 'rule_based_fallback']
+            }
         }
         
         # Calculate overall risk score based on holiday transactions
@@ -1450,13 +2056,13 @@ def run_holiday_analysis_sync(job_id):
         # Risk score calculation: higher score for more holiday transactions and higher amounts
         risk_score = min(100.0, (len(holiday_transactions) * 10) + (holiday_percentage * 2) + (total_amount / 1000000))
         
-        # Save to HolidayAnalysisResult table
+        # Save to HolidayAnalysisResult table using new unified structure
         holiday_analysis_result = HolidayAnalysisResult.objects.create(
             data_file=data_file,
             processing_job=job,
             analysis_type='holiday_analysis',
-            analysis_version='1.0.0',
-            analysis_info={
+            analysis_version='2.0.0',
+            analysis_summary={
                 'total_transactions': len(transactions),
                 'holiday_transactions_count': len(holiday_transactions),
                 'holiday_breakdown': _generate_holiday_breakdown(holiday_transactions),
@@ -1465,8 +2071,13 @@ def run_holiday_analysis_sync(job_id):
                 'overall_risk_score': risk_score,
                 'holiday_percentage': holiday_percentage
             },
+            anomaly_list=holiday_transactions,
             holiday_postings=holiday_transactions,
             chart_data=holiday_results.get('chart_data', {}),
+            breakdowns={
+                'ml_insights': holiday_results.get('ml_insights', {}),
+                'detection_methods': holiday_results.get('detection_methods', {})
+            },
             export_data=holiday_results.get('export_data', []),
             processing_duration=holiday_results.get('processing_duration', 0),
             status='COMPLETED'
@@ -1488,13 +2099,13 @@ def run_holiday_analysis_sync(job_id):
         error_msg = f"Error in Holiday Analysis: {str(e)}"
         logger.error(error_msg)
         
-        # Save failed result to database
+        # Save failed result to database using new unified structure
         try:
             HolidayAnalysisResult.objects.create(
                 data_file=data_file,
                 processing_job=job,
                 analysis_type='holiday_analysis',
-                analysis_version='1.0.0',
+                analysis_version='2.0.0',
                 status='FAILED',
                 error_message=error_msg
             )

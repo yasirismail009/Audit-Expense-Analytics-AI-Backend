@@ -15,11 +15,11 @@ class Command(BaseCommand):
         
         # Basic statistics
         self.stdout.write(f"\n📊 BASIC STATISTICS:")
-        self.stdout.write(f"   Total Holiday Transactions: {holiday_analysis.analysis_info.get('holiday_transactions_count', 0)}")
-        self.stdout.write(f"   Total Holiday Amount: ${holiday_analysis.analysis_info.get('total_holiday_amount', 0):,.2f}")
+        self.stdout.write(f"   Total Holiday Transactions: {holiday_analysis.analysis_summary.get('holiday_transactions_count', 0)}")
+        self.stdout.write(f"   Total Holiday Amount: ${holiday_analysis.analysis_summary.get('total_holiday_amount', 0):,.2f}")
         
         # Holiday breakdown
-        holiday_breakdown = holiday_analysis.analysis_info.get('holiday_breakdown', [])
+        holiday_breakdown = holiday_analysis.analysis_summary.get('holiday_breakdown', [])
         if holiday_breakdown:
             self.stdout.write(f"\n🎁 HOLIDAY BREAKDOWN:")
             for holiday_name, count in holiday_breakdown:
@@ -50,7 +50,7 @@ class Command(BaseCommand):
         
         # Risk assessment
         self.stdout.write(f"\n⚠️  RISK ASSESSMENT:")
-        self.stdout.write(f"   Risk Level: {holiday_analysis.analysis_info.get('compliance_assessment', {}).get('risk_level', 'Unknown')}")
-        self.stdout.write(f"   Holiday Percentage: {holiday_analysis.analysis_info.get('compliance_assessment', {}).get('holiday_percentage', 0):.2f}%")
+        self.stdout.write(f"   Risk Level: {holiday_analysis.analysis_summary.get('compliance_assessment', {}).get('risk_level', 'Unknown')}")
+        self.stdout.write(f"   Holiday Percentage: {holiday_analysis.analysis_summary.get('compliance_assessment', {}).get('holiday_percentage', 0):.2f}%")
         
         self.stdout.write("\n" + "=" * 50) 

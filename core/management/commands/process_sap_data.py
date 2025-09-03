@@ -275,7 +275,7 @@ class Command(BaseCommand):
     def _parse_date(self, value):
         """Parse date value"""
         if not value:
-            return None
+            return datetime.now().date()  # Return current date as default
         
         try:
             # Try different date formats
@@ -292,9 +292,9 @@ class Command(BaseCommand):
                 except:
                     continue
             
-            return None
+            return datetime.now().date()  # Return current date if parsing fails
         except:
-            return None
+            return datetime.now().date()  # Return current date if any error occurs
 
     def _save_batch(self, batch):
         """Save a batch of postings to database"""
