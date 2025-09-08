@@ -6797,3 +6797,552 @@ def predict_anomalies_ml(self, job_id, model_type='all'):
             'success': False,
             'error': str(e)
         }
+
+
+# ============================================================================
+# FILE PROCESSING TASKS (GL, TB, CHART OF ACCOUNTS)
+# ============================================================================
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=600, soft_time_limit=480)
+def extract_gl_list(self, task_id):
+    """
+    Extract and save General Ledger list from uploaded file
+    
+    Args:
+        task_id: UUID of FileProcessingTask record
+        
+    Returns:
+        dict: Processing results
+    """
+    task_name = "extract_gl_list"
+    start_time = timezone.now()
+    
+    try:
+        from .models import FileProcessingTask, SAPGLPosting
+        
+        # Get the task record
+        try:
+            task = FileProcessingTask.objects.get(id=task_id)
+        except FileProcessingTask.DoesNotExist:
+            return {'success': False, 'error': f'Task {task_id} not found'}
+        
+        # Update task status
+        task.status = 'IN_PROGRESS'
+        task.started_at = start_time
+        task.celery_task_id = self.request.id
+        task.save()
+        
+        debug_task_state(task_name, str(task_id), "STARTED", f"Starting GL list extraction for file: {task.data_file.filename}")
+        
+        # Get all SAPGLPosting records for this file (these are already processed GL entries)
+        gl_postings = SAPGLPosting.objects.filter(data_file=task.data_file)
+        
+        # Extract GL list data
+        gl_list_data = []
+        for posting in gl_postings:
+            gl_entry = {
+                'posting_date': posting.posting_date.isoformat() if posting.posting_date else None,
+                'gl_account': posting.gl_account,
+                'gl_account_description': posting.gl_account_description,
+                'debit_amount': float(posting.debit_amount) if posting.debit_amount else 0.0,
+                'credit_amount': float(posting.credit_amount) if posting.credit_amount else 0.0,
+                'document_number': posting.document_number,
+                'reference': posting.reference,
+                'text': posting.text,
+                'user_name': posting.user_name,
+                'company_code': posting.company_code,
+                'fiscal_year': posting.fiscal_year,
+                'posting_period': posting.posting_period,
+                'document_type': posting.document_type,
+                'currency': posting.currency,
+                'local_currency': posting.local_currency,
+                'exchange_rate': float(posting.exchange_rate) if posting.exchange_rate else 1.0,
+                'local_debit_amount': float(posting.local_debit_amount) if posting.local_debit_amount else 0.0,
+                'local_credit_amount': float(posting.local_credit_amount) if posting.local_credit_amount else 0.0,
+            }
+            gl_list_data.append(gl_entry)
+        
+        # Calculate metadata
+        total_debit = sum(float(p.debit_amount or 0) for p in gl_postings)
+        total_credit = sum(float(p.credit_amount or 0) for p in gl_postings)
+        unique_accounts = gl_postings.values_list('gl_account', flat=True).distinct().count()
+        
+        processing_metadata = {
+            'total_entries': len(gl_list_data),
+            'total_debit': total_debit,
+            'total_credit': total_credit,
+            'unique_gl_accounts': unique_accounts,
+            'date_range': {
+                'min_date': gl_postings.aggregate(min_date=models.Min('posting_date'))['min_date'],
+                'max_date': gl_postings.aggregate(max_date=models.Max('posting_date'))['max_date']
+            }
+        }
+        
+        # Update task with results
+        task.extracted_data = {
+            'gl_list': gl_list_data,
+            'summary': {
+                'total_entries': len(gl_list_data),
+                'total_debit': total_debit,
+                'total_credit': total_credit,
+                'balance': total_debit - total_credit
+            }
+        }
+        task.processing_metadata = processing_metadata
+        task.status = 'SUCCESS'
+        task.completed_at = timezone.now()
+        task.save()
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        debug_task_state(task_name, str(task_id), "COMPLETED", 
+                        f"GL list extraction completed. {len(gl_list_data)} entries processed in {processing_duration:.2f} seconds")
+        
+        # Check if all tasks are complete and trigger completeness job
+        _check_and_trigger_completeness_job(task.data_file.id)
+        
+        return {
+            'success': True,
+            'task_id': str(task_id),
+            'entries_processed': len(gl_list_data),
+            'processing_duration': processing_duration
+        }
+        
+    except Exception as e:
+        # Update task status on error
+        try:
+            task = FileProcessingTask.objects.get(id=task_id)
+            task.status = 'FAILED'
+            task.error_message = str(e)
+            task.completed_at = timezone.now()
+            task.save()
+        except:
+            pass
+            
+        debug_task_exception(task_name, str(task_id), e, "GL list extraction failed")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=600, soft_time_limit=480)
+def extract_tb_list(self, task_id):
+    """
+    Extract and save Trial Balance list from uploaded file
+    
+    Args:
+        task_id: UUID of FileProcessingTask record
+        
+    Returns:
+        dict: Processing results
+    """
+    task_name = "extract_tb_list"
+    start_time = timezone.now()
+    
+    try:
+        from .models import FileProcessingTask, SAPGLPosting
+        
+        # Get the task record
+        try:
+            task = FileProcessingTask.objects.get(id=task_id)
+        except FileProcessingTask.DoesNotExist:
+            return {'success': False, 'error': f'Task {task_id} not found'}
+        
+        # Update task status
+        task.status = 'IN_PROGRESS'
+        task.started_at = start_time
+        task.celery_task_id = self.request.id
+        task.save()
+        
+        debug_task_state(task_name, str(task_id), "STARTED", f"Starting TB list extraction for file: {task.data_file.filename}")
+        
+        # Get all SAPGLPosting records for this file
+        gl_postings = SAPGLPosting.objects.filter(data_file=task.data_file)
+        
+        # Group by GL Account to create Trial Balance
+        from django.db.models import Sum, Count
+        tb_data = gl_postings.values('gl_account', 'gl_account_description').annotate(
+            total_debit=Sum('debit_amount'),
+            total_credit=Sum('credit_amount'),
+            entry_count=Count('id')
+        ).order_by('gl_account')
+        
+        # Convert to list format
+        tb_list_data = []
+        total_debit = 0
+        total_credit = 0
+        
+        for account in tb_data:
+            debit_amount = float(account['total_debit'] or 0)
+            credit_amount = float(account['total_credit'] or 0)
+            balance = debit_amount - credit_amount
+            
+            tb_entry = {
+                'gl_account': account['gl_account'],
+                'gl_account_description': account['gl_account_description'],
+                'debit_amount': debit_amount,
+                'credit_amount': credit_amount,
+                'balance': balance,
+                'entry_count': account['entry_count']
+            }
+            tb_list_data.append(tb_entry)
+            
+            total_debit += debit_amount
+            total_credit += credit_amount
+        
+        # Calculate metadata
+        processing_metadata = {
+            'total_accounts': len(tb_list_data),
+            'total_debit': total_debit,
+            'total_credit': total_credit,
+            'trial_balance': total_debit - total_credit,
+            'total_entries': sum(entry['entry_count'] for entry in tb_list_data)
+        }
+        
+        # Update task with results
+        task.extracted_data = {
+            'tb_list': tb_list_data,
+            'summary': {
+                'total_accounts': len(tb_list_data),
+                'total_debit': total_debit,
+                'total_credit': total_credit,
+                'trial_balance': total_debit - total_credit
+            }
+        }
+        task.processing_metadata = processing_metadata
+        task.status = 'SUCCESS'
+        task.completed_at = timezone.now()
+        task.save()
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        debug_task_state(task_name, str(task_id), "COMPLETED", 
+                        f"TB list extraction completed. {len(tb_list_data)} accounts processed in {processing_duration:.2f} seconds")
+        
+        # Check if all tasks are complete and trigger completeness job
+        _check_and_trigger_completeness_job(task.data_file.id)
+        
+        return {
+            'success': True,
+            'task_id': str(task_id),
+            'accounts_processed': len(tb_list_data),
+            'processing_duration': processing_duration
+        }
+        
+    except Exception as e:
+        # Update task status on error
+        try:
+            task = FileProcessingTask.objects.get(id=task_id)
+            task.status = 'FAILED'
+            task.error_message = str(e)
+            task.completed_at = timezone.now()
+            task.save()
+        except:
+            pass
+            
+        debug_task_exception(task_name, str(task_id), e, "TB list extraction failed")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=600, soft_time_limit=480)
+def extract_chart_of_accounts(self, task_id):
+    """
+    Extract and save Chart of Accounts from uploaded file
+    
+    Args:
+        task_id: UUID of FileProcessingTask record
+        
+    Returns:
+        dict: Processing results
+    """
+    task_name = "extract_chart_of_accounts"
+    start_time = timezone.now()
+    
+    try:
+        from .models import FileProcessingTask, SAPGLPosting, GLAccount
+        
+        # Get the task record
+        try:
+            task = FileProcessingTask.objects.get(id=task_id)
+        except FileProcessingTask.DoesNotExist:
+            return {'success': False, 'error': f'Task {task_id} not found'}
+        
+        # Update task status
+        task.status = 'IN_PROGRESS'
+        task.started_at = start_time
+        task.celery_task_id = self.request.id
+        task.save()
+        
+        debug_task_state(task_name, str(task_id), "STARTED", f"Starting Chart of Accounts extraction for file: {task.data_file.filename}")
+        
+        # Get all unique GL accounts from SAPGLPosting records
+        gl_postings = SAPGLPosting.objects.filter(data_file=task.data_file)
+        unique_accounts = gl_postings.values('gl_account', 'gl_account_description').distinct()
+        
+        # Create or update GLAccount records
+        chart_of_accounts_data = []
+        accounts_created = 0
+        accounts_updated = 0
+        
+        for account_data in unique_accounts:
+            gl_account_code = account_data['gl_account']
+            gl_account_desc = account_data['gl_account_description']
+            
+            # Get or create GLAccount record
+            gl_account, created = GLAccount.objects.get_or_create(
+                account_code=gl_account_code,
+                defaults={
+                    'account_description': gl_account_desc,
+                    'data_file': task.data_file
+                }
+            )
+            
+            if not created:
+                # Update existing account if description changed
+                if gl_account.account_description != gl_account_desc:
+                    gl_account.account_description = gl_account_desc
+                    gl_account.save()
+                    accounts_updated += 1
+            else:
+                accounts_created += 1
+            
+            # Calculate account statistics
+            account_postings = gl_postings.filter(gl_account=gl_account_code)
+            total_debit = sum(float(p.debit_amount or 0) for p in account_postings)
+            total_credit = sum(float(p.credit_amount or 0) for p in account_postings)
+            entry_count = account_postings.count()
+            
+            chart_entry = {
+                'account_code': gl_account_code,
+                'account_description': gl_account_desc,
+                'total_debit': total_debit,
+                'total_credit': total_credit,
+                'balance': total_debit - total_credit,
+                'entry_count': entry_count,
+                'account_type': gl_account.account_type,
+                'is_active': gl_account.is_active
+            }
+            chart_of_accounts_data.append(chart_entry)
+        
+        # Calculate metadata
+        processing_metadata = {
+            'total_accounts': len(chart_of_accounts_data),
+            'accounts_created': accounts_created,
+            'accounts_updated': accounts_updated,
+            'total_entries': sum(entry['entry_count'] for entry in chart_of_accounts_data)
+        }
+        
+        # Update task with results
+        task.extracted_data = {
+            'chart_of_accounts': chart_of_accounts_data,
+            'summary': {
+                'total_accounts': len(chart_of_accounts_data),
+                'accounts_created': accounts_created,
+                'accounts_updated': accounts_updated
+            }
+        }
+        task.processing_metadata = processing_metadata
+        task.status = 'SUCCESS'
+        task.completed_at = timezone.now()
+        task.save()
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        debug_task_state(task_name, str(task_id), "COMPLETED", 
+                        f"Chart of Accounts extraction completed. {len(chart_of_accounts_data)} accounts processed in {processing_duration:.2f} seconds")
+        
+        # Check if all tasks are complete and trigger completeness job
+        _check_and_trigger_completeness_job(task.data_file.id)
+        
+        return {
+            'success': True,
+            'task_id': str(task_id),
+            'accounts_processed': len(chart_of_accounts_data),
+            'processing_duration': processing_duration
+        }
+        
+    except Exception as e:
+        # Update task status on error
+        try:
+            task = FileProcessingTask.objects.get(id=task_id)
+            task.status = 'FAILED'
+            task.error_message = str(e)
+            task.completed_at = timezone.now()
+            task.save()
+        except:
+            pass
+            
+        debug_task_exception(task_name, str(task_id), e, "Chart of Accounts extraction failed")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=600, soft_time_limit=480)
+def run_completeness_job(self, job_id):
+    """
+    Run completeness job after all file processing tasks are complete
+    
+    Args:
+        job_id: UUID of CompletenessJob record
+        
+    Returns:
+        dict: Processing results
+    """
+    task_name = "run_completeness_job"
+    start_time = timezone.now()
+    
+    try:
+        from .models import CompletenessJob, FileProcessingTask, SAPGLPosting
+        
+        # Get the completeness job record
+        try:
+            completeness_job = CompletenessJob.objects.get(id=job_id)
+        except CompletenessJob.DoesNotExist:
+            return {'success': False, 'error': f'Completeness job {job_id} not found'}
+        
+        # Update job status
+        completeness_job.status = 'IN_PROGRESS'
+        completeness_job.started_at = start_time
+        completeness_job.celery_task_id = self.request.id
+        completeness_job.save()
+        
+        debug_task_state(task_name, str(job_id), "STARTED", f"Starting completeness job for file: {completeness_job.data_file.filename}")
+        
+        # Get all related processing tasks
+        gl_task = completeness_job.gl_task
+        tb_task = completeness_job.tb_task
+        chart_task = completeness_job.chart_task
+        
+        # Collect all debit and credit entries from GL postings
+        gl_postings = SAPGLPosting.objects.filter(data_file=completeness_job.data_file)
+        
+        # Calculate debit and credit summary
+        total_debit = sum(float(p.debit_amount or 0) for p in gl_postings)
+        total_credit = sum(float(p.credit_amount or 0) for p in gl_postings)
+        total_balance = total_debit - total_credit
+        
+        debit_credit_summary = {
+            'total_debit': total_debit,
+            'total_credit': total_credit,
+            'total_balance': total_balance,
+            'total_entries': gl_postings.count(),
+            'debit_entries': gl_postings.filter(debit_amount__gt=0).count(),
+            'credit_entries': gl_postings.filter(credit_amount__gt=0).count()
+        }
+        
+        # Run basic completeness tests (audit-style checks)
+        audit_checks = {
+            'trial_balance_check': {
+                'description': 'Trial Balance should equal zero',
+                'expected': 0,
+                'actual': total_balance,
+                'passed': abs(total_balance) < 0.01  # Allow for small rounding differences
+            },
+            'debit_credit_balance': {
+                'description': 'Total debits should equal total credits',
+                'expected': total_credit,
+                'actual': total_debit,
+                'passed': abs(total_debit - total_credit) < 0.01
+            },
+            'data_integrity': {
+                'description': 'All entries should have valid amounts',
+                'expected': 'No zero amounts',
+                'actual': gl_postings.filter(debit_amount=0, credit_amount=0).count(),
+                'passed': gl_postings.filter(debit_amount=0, credit_amount=0).count() == 0
+            }
+        }
+        
+        # For now, just create a placeholder record with status = CREATED
+        completeness_results = {
+            'status': 'CREATED',
+            'message': 'Completeness job completed successfully. Full audit logic to be implemented later.',
+            'debit_credit_summary': debit_credit_summary,
+            'audit_checks': audit_checks,
+            'processing_tasks_status': {
+                'gl_task': gl_task.status if gl_task else 'N/A',
+                'tb_task': tb_task.status if tb_task else 'N/A',
+                'chart_task': chart_task.status if chart_task else 'N/A'
+            }
+        }
+        
+        # Update completeness job with results
+        completeness_job.completeness_results = completeness_results
+        completeness_job.debit_credit_summary = debit_credit_summary
+        completeness_job.audit_checks = audit_checks
+        completeness_job.status = 'CREATED'  # As requested, set status to CREATED
+        completeness_job.completed_at = timezone.now()
+        completeness_job.save()
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        debug_task_state(task_name, str(job_id), "COMPLETED", 
+                        f"Completeness job completed. Status: CREATED. Processing duration: {processing_duration:.2f} seconds")
+        
+        return {
+            'success': True,
+            'job_id': str(job_id),
+            'status': 'CREATED',
+            'processing_duration': processing_duration,
+            'debit_credit_summary': debit_credit_summary,
+            'audit_checks_passed': sum(1 for check in audit_checks.values() if check['passed'])
+        }
+        
+    except Exception as e:
+        # Update job status on error
+        try:
+            completeness_job = CompletenessJob.objects.get(id=job_id)
+            completeness_job.status = 'FAILED'
+            completeness_job.error_message = str(e)
+            completeness_job.completed_at = timezone.now()
+            completeness_job.save()
+        except:
+            pass
+            
+        debug_task_exception(task_name, str(job_id), e, "Completeness job failed")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+def _check_and_trigger_completeness_job(data_file_id):
+    """
+    Helper function to check if all processing tasks are complete and trigger completeness job
+    
+    Args:
+        data_file_id: UUID of DataFile
+    """
+    try:
+        from .models import FileProcessingTask, CompletenessJob
+        
+        # Get all processing tasks for this file
+        tasks = FileProcessingTask.objects.filter(data_file_id=data_file_id)
+        
+        # Check if all tasks are successful
+        all_successful = all(task.status == 'SUCCESS' for task in tasks)
+        
+        if all_successful and tasks.count() == 3:  # All three tasks (GL, TB, Chart) are complete
+            # Check if completeness job already exists
+            if not CompletenessJob.objects.filter(data_file_id=data_file_id).exists():
+                # Create completeness job
+                gl_task = tasks.filter(task_type='GL_LIST').first()
+                tb_task = tasks.filter(task_type='TB_LIST').first()
+                chart_task = tasks.filter(task_type='CHART_OF_ACCOUNTS').first()
+                
+                completeness_job = CompletenessJob.objects.create(
+                    data_file_id=data_file_id,
+                    gl_task=gl_task,
+                    tb_task=tb_task,
+                    chart_task=chart_task,
+                    status='PENDING'
+                )
+                
+                # Trigger completeness job task
+                run_completeness_job.delay(str(completeness_job.id))
+                
+                logger.info(f"Completeness job triggered for file {data_file_id}")
+                
+    except Exception as e:
+        logger.error(f"Error checking and triggering completeness job: {e}")

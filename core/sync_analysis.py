@@ -106,6 +106,11 @@ def run_general_analysis_sync(job_id):
         general_results = analysis_results
         general_results['processing_duration'] = (timezone.now() - start_time).total_seconds()
         
+        # Create comprehensive statistics for general analysis
+        general_stats = create_general_analysis_statistics(
+            general_results, transactions, data_file
+        )
+        
         # Save to GeneralAnalysisResult table
         general_analysis_result = GeneralAnalysisResult.objects.create(
             data_file=data_file,
@@ -119,6 +124,12 @@ def run_general_analysis_sync(job_id):
             chart_data=general_results['chart_data'],
             export_data=general_results['export_data'],
             processing_duration=general_results['processing_duration'],
+            analysis_summary={
+                'total_transactions': len(transactions),
+                'total_users': len(set(t.user_name for t in transactions)),
+                'total_accounts': len(set(t.gl_account for t in transactions)),
+                'statistics': general_stats  # Add comprehensive statistics
+            },
             status='COMPLETED'
         )
         
@@ -151,6 +162,519 @@ def run_general_analysis_sync(job_id):
             pass
         
         return {'error': error_msg}
+
+def create_duplicate_analysis_statistics(duplicate_results, transactions, data_file, duplicate_pairs):
+    """Create comprehensive statistics for duplicate analysis"""
+    from decimal import Decimal
+    
+    stats = {
+        'analysis_type': 'duplicate_analysis',
+        'timestamp': timezone.now().isoformat(),
+        'summary_metrics': {},
+        'risk_metrics': {},
+        'financial_metrics': {},
+        'compliance_metrics': {},
+        'ml_metrics': {},
+        'performance_metrics': {}
+    }
+    
+    # Basic summary metrics
+    total_transactions = len(transactions)
+    duplicates_found = len(duplicate_pairs)
+    
+    stats['summary_metrics'] = {
+        'total_transactions': total_transactions,
+        'duplicates_found': duplicates_found,
+        'duplicate_percentage': (duplicates_found / total_transactions * 100) if total_transactions > 0 else 0,
+        'unique_duplicate_transactions': len(set(
+            dup['transaction1']['id'] for dup in duplicate_pairs
+        ).union(set(
+            dup['transaction2']['id'] for dup in duplicate_pairs
+        )))
+    }
+    
+    # Financial metrics
+    total_duplicate_amount = sum(
+        abs(dup['transaction1']['amount']) for dup in duplicate_pairs
+    )
+    
+    stats['financial_metrics'] = {
+        'total_amount_involved': total_duplicate_amount,
+        'average_duplicate_amount': total_duplicate_amount / duplicates_found if duplicates_found > 0 else 0,
+        'material_impact': total_duplicate_amount > 1000000,  # Over 1M SAR
+        'impact_percentage': (total_duplicate_amount / abs(float(sum(t.amount_local_currency for t in transactions))) * 100) if transactions else 0,
+        'high_value_duplicates': len([dup for dup in duplicate_pairs if abs(dup['transaction1']['amount']) > 100000])
+    }
+    
+    # Risk metrics
+    high_risk_duplicates = len([dup for dup in duplicate_pairs if dup.get('risk_level') == 'HIGH'])
+    critical_risk_duplicates = len([dup for dup in duplicate_pairs if dup.get('risk_level') == 'CRITICAL'])
+    
+    stats['risk_metrics'] = {
+        'high_risk_count': high_risk_duplicates,
+        'critical_risk_count': critical_risk_duplicates,
+        'overall_risk_score': min(100, (high_risk_duplicates * 10 + critical_risk_duplicates * 20)),
+        'risk_distribution': {
+            'low': len([dup for dup in duplicate_pairs if dup.get('risk_level') == 'LOW']),
+            'medium': len([dup for dup in duplicate_pairs if dup.get('risk_level') == 'HIGH']),
+            'high': high_risk_duplicates,
+            'critical': critical_risk_duplicates
+        }
+    }
+    
+    # Compliance metrics
+    stats['compliance_metrics'] = {
+        'compliance_score': max(0, 100 - (duplicates_found * 5)),
+        'regulatory_concerns': ['Duplicate transaction controls', 'Data integrity', 'Transaction monitoring'] if duplicates_found > 0 else [],
+        'control_deficiencies': duplicates_found > 10,
+        'audit_implications': 'High' if duplicates_found > 20 else 'Medium' if duplicates_found > 5 else 'Low'
+    }
+    
+    # ML metrics (if available)
+    if duplicate_results.get('ml_insights'):
+        ml_insights = duplicate_results['ml_insights']
+        stats['ml_metrics'] = {
+            'ml_available': ml_insights.get('ml_available', False),
+            'detection_method': ml_insights.get('detection_method', 'rule_based'),
+            'ml_accuracy': ml_insights.get('ml_model_accuracy', 0.0),
+            'ml_enhanced_duplicates': ml_insights.get('ml_enhanced_duplicates', 0),
+            'rule_based_duplicates': ml_insights.get('rule_based_duplicates', 0)
+        }
+    
+    # Performance metrics
+    stats['performance_metrics'] = {
+        'processing_efficiency': 'High' if duplicates_found < 10 else 'Medium' if duplicates_found < 50 else 'Low',
+        'data_quality_score': max(0, 100 - (duplicates_found * 2)),
+        'recommendation_priority': 'High' if duplicates_found > 20 else 'Medium' if duplicates_found > 5 else 'Low'
+    }
+    
+    return stats
+
+def create_backdated_analysis_statistics(backdated_results, transactions, data_file, backdated_entries):
+    """Create comprehensive statistics for backdated analysis"""
+    
+    stats = {
+        'analysis_type': 'backdated_analysis',
+        'timestamp': timezone.now().isoformat(),
+        'summary_metrics': {},
+        'risk_metrics': {},
+        'financial_metrics': {},
+        'compliance_metrics': {},
+        'temporal_metrics': {},
+        'performance_metrics': {}
+    }
+    
+    # Basic summary metrics
+    total_transactions = len(transactions)
+    backdated_found = len(backdated_entries)
+    
+    stats['summary_metrics'] = {
+        'total_transactions': total_transactions,
+        'backdated_found': backdated_found,
+        'backdated_percentage': (backdated_found / total_transactions * 100) if total_transactions > 0 else 0,
+        'unique_backdated_transactions': len(set(
+            entry.get('transaction_id') for entry in backdated_entries if entry.get('transaction_id')
+        ))
+    }
+    
+    # Financial metrics
+    total_backdated_amount = sum(
+        abs(entry.get('amount', 0)) for entry in backdated_entries
+    )
+    
+    stats['financial_metrics'] = {
+        'total_amount_involved': total_backdated_amount,
+        'average_backdated_amount': total_backdated_amount / backdated_found if backdated_found > 0 else 0,
+        'material_impact': total_backdated_amount > 1000000,  # Over 1M SAR
+        'impact_percentage': (total_backdated_amount / abs(float(sum(t.amount_local_currency for t in transactions))) * 100) if transactions else 0,
+        'high_value_backdated': len([entry for entry in backdated_entries if abs(entry.get('amount', 0)) > 100000])
+    }
+    
+    # Risk metrics
+    high_risk_backdated = len([entry for entry in backdated_entries if entry.get('risk_level') == 'HIGH'])
+    critical_risk_backdated = len([entry for entry in backdated_entries if entry.get('risk_level') == 'CRITICAL'])
+    
+    stats['risk_metrics'] = {
+        'high_risk_count': high_risk_backdated,
+        'critical_risk_count': critical_risk_backdated,
+        'overall_risk_score': min(100, (high_risk_backdated * 15 + critical_risk_backdated * 25)),
+        'risk_distribution': {
+            'low': len([entry for entry in backdated_entries if entry.get('risk_level') == 'LOW']),
+            'medium': len([entry for entry in backdated_entries if entry.get('risk_level') == 'MEDIUM']),
+            'high': high_risk_backdated,
+            'critical': critical_risk_backdated
+        }
+    }
+    
+    # Temporal metrics
+    if backdated_entries:
+        backdated_days = [entry.get('backdated_days', 0) for entry in backdated_entries]
+        stats['temporal_metrics'] = {
+            'average_backdated_days': sum(backdated_days) / len(backdated_days) if backdated_days else 0,
+            'max_backdated_days': max(backdated_days) if backdated_days else 0,
+            'min_backdated_days': min(backdated_days) if backdated_days else 0,
+            'critical_backdated_entries': len([days for days in backdated_days if days > 30])
+        }
+    
+    # Compliance metrics
+    stats['compliance_metrics'] = {
+        'compliance_score': max(0, 100 - (backdated_found * 8)),
+        'regulatory_concerns': ['Timely posting controls', 'Document date validation', 'Audit trail integrity'] if backdated_found > 0 else [],
+        'control_deficiencies': backdated_found > 5,
+        'audit_implications': 'High' if backdated_found > 15 else 'Medium' if backdated_found > 3 else 'Low'
+    }
+    
+    # Performance metrics
+    stats['performance_metrics'] = {
+        'processing_efficiency': 'High' if backdated_found < 5 else 'Medium' if backdated_found < 20 else 'Low',
+        'data_quality_score': max(0, 100 - (backdated_found * 3)),
+        'recommendation_priority': 'High' if backdated_found > 15 else 'Medium' if backdated_found > 3 else 'Low'
+    }
+    
+    return stats
+
+def create_user_analysis_statistics(user_results, transactions, data_file, user_anomalies):
+    """Create comprehensive statistics for user analysis"""
+    
+    stats = {
+        'analysis_type': 'user_analysis',
+        'timestamp': timezone.now().isoformat(),
+        'summary_metrics': {},
+        'risk_metrics': {},
+        'user_metrics': {},
+        'compliance_metrics': {},
+        'performance_metrics': {}
+    }
+    
+    # Basic summary metrics
+    total_transactions = len(transactions)
+    total_users = user_results.get('total_users', 0)
+    anomalies_count = len(user_anomalies)
+    
+    stats['summary_metrics'] = {
+        'total_transactions': total_transactions,
+        'total_users': total_users,
+        'anomalies_count': anomalies_count,
+        'anomaly_percentage': (anomalies_count / total_users * 100) if total_users > 0 else 0,
+        'average_transactions_per_user': total_transactions / total_users if total_users > 0 else 0
+    }
+    
+    # User metrics
+    user_summary = user_results.get('user_transaction_summary', [])
+    high_activity_users = len([u for u in user_summary if u.get('total_amount', 0) > 1000000 or u.get('transaction_count', 0) > 100])
+    
+    stats['user_metrics'] = {
+        'high_activity_users': high_activity_users,
+        'high_activity_percentage': (high_activity_users / total_users * 100) if total_users > 0 else 0,
+        'users_with_anomalies': anomalies_count,
+        'average_user_amount': sum(u.get('total_amount', 0) for u in user_summary) / total_users if total_users > 0 else 0,
+        'max_user_amount': max((u.get('total_amount', 0) for u in user_summary), default=0),
+        'min_user_amount': min((u.get('total_amount', 0) for u in user_summary), default=0)
+    }
+    
+    # Risk metrics
+    high_risk_anomalies = len([a for a in user_anomalies if a.get('risk_level') == 'HIGH'])
+    critical_risk_anomalies = len([a for a in user_anomalies if a.get('risk_level') == 'CRITICAL'])
+    
+    stats['risk_metrics'] = {
+        'high_risk_count': high_risk_anomalies,
+        'critical_risk_count': critical_risk_anomalies,
+        'overall_risk_score': min(100, (high_risk_anomalies * 15 + critical_risk_anomalies * 25)),
+        'risk_distribution': {
+            'low': len([a for a in user_anomalies if a.get('risk_level') == 'LOW']),
+            'medium': len([a for a in user_anomalies if a.get('risk_level') == 'MEDIUM']),
+            'high': high_risk_anomalies,
+            'critical': critical_risk_anomalies
+        }
+    }
+    
+    # Compliance metrics
+    stats['compliance_metrics'] = {
+        'compliance_score': max(0, 100 - (anomalies_count * 5)),
+        'regulatory_concerns': ['User access controls', 'Segregation of duties', 'Transaction monitoring'] if anomalies_count > 0 else [],
+        'control_deficiencies': anomalies_count > 5,
+        'audit_implications': 'High' if anomalies_count > 10 else 'Medium' if anomalies_count > 3 else 'Low'
+    }
+    
+    # Performance metrics
+    stats['performance_metrics'] = {
+        'processing_efficiency': 'High' if anomalies_count < 5 else 'Medium' if anomalies_count < 15 else 'Low',
+        'data_quality_score': max(0, 100 - (anomalies_count * 3)),
+        'recommendation_priority': 'High' if anomalies_count > 10 else 'Medium' if anomalies_count > 3 else 'Low'
+    }
+    
+    return stats
+
+def create_unusual_days_analysis_statistics(unusual_days_results, transactions, data_file, unusual_days_transactions):
+    """Create comprehensive statistics for unusual days analysis"""
+    
+    stats = {
+        'analysis_type': 'unusual_days_analysis',
+        'timestamp': timezone.now().isoformat(),
+        'summary_metrics': {},
+        'risk_metrics': {},
+        'temporal_metrics': {},
+        'compliance_metrics': {},
+        'performance_metrics': {}
+    }
+    
+    # Basic summary metrics
+    total_transactions = len(transactions)
+    unusual_days_count = len(unusual_days_transactions)
+    
+    stats['summary_metrics'] = {
+        'total_transactions': total_transactions,
+        'unusual_days_count': unusual_days_count,
+        'unusual_days_percentage': (unusual_days_count / total_transactions * 100) if total_transactions > 0 else 0,
+        'weekend_transactions_count': len([t for t in unusual_days_transactions if t.get('day_of_week') in ['Friday', 'Saturday']])
+    }
+    
+    # Temporal metrics
+    if unusual_days_transactions:
+        weekend_count = len([t for t in unusual_days_transactions if t.get('day_of_week') in ['Friday', 'Saturday']])
+        stats['temporal_metrics'] = {
+            'weekend_transactions': weekend_count,
+            'weekend_percentage': (weekend_count / unusual_days_count * 100) if unusual_days_count > 0 else 0,
+            'other_unusual_days': unusual_days_count - weekend_count,
+            'most_unusual_day': max(set(t.get('day_of_week') for t in unusual_days_transactions), key=lambda x: len([t for t in unusual_days_transactions if t.get('day_of_week') == x])) if unusual_days_transactions else None
+        }
+    
+    # Risk metrics
+    high_risk_unusual = len([t for t in unusual_days_transactions if t.get('risk_level') == 'HIGH'])
+    critical_risk_unusual = len([t for t in unusual_days_transactions if t.get('risk_level') == 'CRITICAL'])
+    
+    stats['risk_metrics'] = {
+        'high_risk_count': high_risk_unusual,
+        'critical_risk_count': critical_risk_unusual,
+        'overall_risk_score': min(100, (high_risk_unusual * 15 + critical_risk_unusual * 25)),
+        'risk_distribution': {
+            'low': len([t for t in unusual_days_transactions if t.get('risk_level') == 'LOW']),
+            'medium': len([t for t in unusual_days_transactions if t.get('risk_level') == 'MEDIUM']),
+            'high': high_risk_unusual,
+            'critical': critical_risk_unusual
+        }
+    }
+    
+    # Compliance metrics
+    stats['compliance_metrics'] = {
+        'compliance_score': max(0, 100 - (unusual_days_count * 8)),
+        'regulatory_concerns': ['Weekend posting controls', 'Business hour validation', 'Transaction timing controls'] if unusual_days_count > 0 else [],
+        'control_deficiencies': unusual_days_count > 5,
+        'audit_implications': 'High' if unusual_days_count > 15 else 'Medium' if unusual_days_count > 3 else 'Low'
+    }
+    
+    # Performance metrics
+    stats['performance_metrics'] = {
+        'processing_efficiency': 'High' if unusual_days_count < 5 else 'Medium' if unusual_days_count < 20 else 'Low',
+        'data_quality_score': max(0, 100 - (unusual_days_count * 3)),
+        'recommendation_priority': 'High' if unusual_days_count > 15 else 'Medium' if unusual_days_count > 3 else 'Low'
+    }
+    
+    return stats
+
+def create_closing_entries_analysis_statistics(closing_entries_results, transactions, data_file, closing_entries_transactions):
+    """Create comprehensive statistics for closing entries analysis"""
+    
+    stats = {
+        'analysis_type': 'closing_entries_analysis',
+        'timestamp': timezone.now().isoformat(),
+        'summary_metrics': {},
+        'risk_metrics': {},
+        'temporal_metrics': {},
+        'compliance_metrics': {},
+        'performance_metrics': {}
+    }
+    
+    # Basic summary metrics
+    total_transactions = len(transactions)
+    closing_entries_count = len(closing_entries_transactions)
+    
+    stats['summary_metrics'] = {
+        'total_transactions': total_transactions,
+        'closing_entries_count': closing_entries_count,
+        'closing_entries_percentage': (closing_entries_count / total_transactions * 100) if total_transactions > 0 else 0,
+        'post_close_entries_count': len([t for t in closing_entries_transactions if t.get('days_from_month_end', 0) <= 1])
+    }
+    
+    # Temporal metrics
+    if closing_entries_transactions:
+        days_from_month_end = [t.get('days_from_month_end', 0) for t in closing_entries_transactions]
+        stats['temporal_metrics'] = {
+            'average_days_from_month_end': sum(days_from_month_end) / len(days_from_month_end) if days_from_month_end else 0,
+            'max_days_from_month_end': max(days_from_month_end) if days_from_month_end else 0,
+            'min_days_from_month_end': min(days_from_month_end) if days_from_month_end else 0,
+            'critical_closing_entries': len([days for days in days_from_month_end if days <= 1])
+        }
+    
+    # Risk metrics
+    high_risk_closing = len([t for t in closing_entries_transactions if t.get('risk_level') == 'HIGH'])
+    critical_risk_closing = len([t for t in closing_entries_transactions if t.get('risk_level') == 'CRITICAL'])
+    
+    stats['risk_metrics'] = {
+        'high_risk_count': high_risk_closing,
+        'critical_risk_count': critical_risk_closing,
+        'overall_risk_score': min(100, (high_risk_closing * 15 + critical_risk_closing * 25)),
+        'risk_distribution': {
+            'low': len([t for t in closing_entries_transactions if t.get('risk_level') == 'LOW']),
+            'medium': len([t for t in closing_entries_transactions if t.get('risk_level') == 'MEDIUM']),
+            'high': high_risk_closing,
+            'critical': critical_risk_closing
+        }
+    }
+    
+    # Compliance metrics
+    stats['compliance_metrics'] = {
+        'compliance_score': max(0, 100 - (closing_entries_count * 6)),
+        'regulatory_concerns': ['Month-end closing controls', 'Financial statement integrity', 'Closing entry documentation'] if closing_entries_count > 0 else [],
+        'control_deficiencies': closing_entries_count > 3,
+        'audit_implications': 'High' if closing_entries_count > 10 else 'Medium' if closing_entries_count > 3 else 'Low'
+    }
+    
+    # Performance metrics
+    stats['performance_metrics'] = {
+        'processing_efficiency': 'High' if closing_entries_count < 3 else 'Medium' if closing_entries_count < 10 else 'Low',
+        'data_quality_score': max(0, 100 - (closing_entries_count * 4)),
+        'recommendation_priority': 'High' if closing_entries_count > 10 else 'Medium' if closing_entries_count > 3 else 'Low'
+    }
+    
+    return stats
+
+def create_holiday_analysis_statistics(holiday_results, transactions, data_file, holiday_transactions):
+    """Create comprehensive statistics for holiday analysis"""
+    
+    stats = {
+        'analysis_type': 'holiday_analysis',
+        'timestamp': timezone.now().isoformat(),
+        'summary_metrics': {},
+        'risk_metrics': {},
+        'temporal_metrics': {},
+        'compliance_metrics': {},
+        'performance_metrics': {}
+    }
+    
+    # Basic summary metrics
+    total_transactions = len(transactions)
+    holiday_count = len(holiday_transactions)
+    
+    stats['summary_metrics'] = {
+        'total_transactions': total_transactions,
+        'holiday_transactions_count': holiday_count,
+        'holiday_percentage': (holiday_count / total_transactions * 100) if total_transactions > 0 else 0,
+        'unique_holidays': len(set(t.get('holiday_name') for t in holiday_transactions if t.get('holiday_name')))
+    }
+    
+    # Financial metrics
+    total_holiday_amount = sum(abs(t.get('amount', 0)) for t in holiday_transactions)
+    
+    stats['financial_metrics'] = {
+        'total_amount_involved': total_holiday_amount,
+        'average_holiday_amount': total_holiday_amount / holiday_count if holiday_count > 0 else 0,
+        'material_impact': total_holiday_amount > 1000000,  # Over 1M SAR
+        'impact_percentage': (total_holiday_amount / abs(float(sum(t.amount_local_currency for t in transactions))) * 100) if transactions else 0,
+        'high_value_holiday_transactions': len([t for t in holiday_transactions if abs(t.get('amount', 0)) > 100000])
+    }
+    
+    # Risk metrics
+    high_risk_holiday = len([t for t in holiday_transactions if t.get('risk_level') == 'HIGH'])
+    critical_risk_holiday = len([t for t in holiday_transactions if t.get('risk_level') == 'CRITICAL'])
+    
+    stats['risk_metrics'] = {
+        'high_risk_count': high_risk_holiday,
+        'critical_risk_count': critical_risk_holiday,
+        'overall_risk_score': min(100, (high_risk_holiday * 15 + critical_risk_holiday * 25)),
+        'risk_distribution': {
+            'low': len([t for t in holiday_transactions if t.get('risk_level') == 'LOW']),
+            'medium': len([t for t in holiday_transactions if t.get('risk_level') == 'MEDIUM']),
+            'high': high_risk_holiday,
+            'critical': critical_risk_holiday
+        }
+    }
+    
+    # Compliance metrics
+    stats['compliance_metrics'] = {
+        'compliance_score': max(0, 100 - (holiday_count * 8)),
+        'regulatory_concerns': ['Holiday posting controls', 'Business day validation', 'Transaction timing controls'] if holiday_count > 0 else [],
+        'control_deficiencies': holiday_count > 5,
+        'audit_implications': 'High' if holiday_count > 15 else 'Medium' if holiday_count > 3 else 'Low'
+    }
+    
+    # Performance metrics
+    stats['performance_metrics'] = {
+        'processing_efficiency': 'High' if holiday_count < 5 else 'Medium' if holiday_count < 20 else 'Low',
+        'data_quality_score': max(0, 100 - (holiday_count * 3)),
+        'recommendation_priority': 'High' if holiday_count > 15 else 'Medium' if holiday_count > 3 else 'Low'
+    }
+    
+    return stats
+
+def create_general_analysis_statistics(general_results, transactions, data_file):
+    """Create comprehensive statistics for general analysis"""
+    
+    stats = {
+        'analysis_type': 'general_analysis',
+        'timestamp': timezone.now().isoformat(),
+        'summary_metrics': {},
+        'financial_metrics': {},
+        'account_metrics': {},
+        'user_metrics': {},
+        'performance_metrics': {}
+    }
+    
+    # Basic summary metrics
+    total_transactions = len(transactions)
+    unique_users = len(set(t.user_name for t in transactions))
+    unique_accounts = len(set(t.gl_account for t in transactions))
+    
+    stats['summary_metrics'] = {
+        'total_transactions': total_transactions,
+        'unique_users': unique_users,
+        'unique_accounts': unique_accounts,
+        'average_transactions_per_user': total_transactions / unique_users if unique_users > 0 else 0,
+        'average_transactions_per_account': total_transactions / unique_accounts if unique_accounts > 0 else 0
+    }
+    
+    # Financial metrics
+    trial_balance = general_results.get('trial_balance_summary', {})
+    total_amount = trial_balance.get('total_amount', 0)
+    
+    stats['financial_metrics'] = {
+        'total_amount': total_amount,
+        'total_debits': trial_balance.get('total_debits', 0),
+        'total_credits': trial_balance.get('total_credits', 0),
+        'balance': trial_balance.get('balance', 0),
+        'is_balanced': trial_balance.get('is_balanced', False),
+        'balance_percentage': trial_balance.get('balance_percentage', 0),
+        'average_transaction_amount': total_amount / total_transactions if total_transactions > 0 else 0
+    }
+    
+    # Account metrics
+    gl_account_summaries = general_results.get('gl_account_summaries', [])
+    if gl_account_summaries:
+        stats['account_metrics'] = {
+            'total_gl_accounts': len(gl_account_summaries),
+            'high_volume_accounts': len([a for a in gl_account_summaries if a.get('transaction_count', 0) > 50]),
+            'high_value_accounts': len([a for a in gl_account_summaries if abs(a.get('total_amount', 0)) > 1000000]),
+            'average_account_balance': sum(abs(a.get('total_amount', 0)) for a in gl_account_summaries) / len(gl_account_summaries) if gl_account_summaries else 0
+        }
+    
+    # User metrics
+    user_summaries = general_results.get('user_summaries', [])
+    if user_summaries:
+        stats['user_metrics'] = {
+            'total_users': len(user_summaries),
+            'high_activity_users': len([u for u in user_summaries if u.get('transaction_count', 0) > 100]),
+            'high_value_users': len([u for u in user_summaries if abs(u.get('total_amount', 0)) > 1000000]),
+            'average_user_activity': sum(u.get('transaction_count', 0) for u in user_summaries) / len(user_summaries) if user_summaries else 0
+        }
+    
+    # Performance metrics
+    stats['performance_metrics'] = {
+        'data_completeness': 'High' if unique_accounts > 0 and unique_users > 0 else 'Medium' if unique_accounts > 0 or unique_users > 0 else 'Low',
+        'data_quality_score': min(100, (unique_accounts * 2 + unique_users * 2)),
+        'recommendation_priority': 'High' if not trial_balance.get('is_balanced', True) else 'Medium' if unique_accounts < 10 else 'Low'
+    }
+    
+    return stats
 
 def run_duplicate_analysis_sync(job_id):
     """Run Duplicate Analysis synchronously and save to database with ML integration"""
@@ -410,6 +934,11 @@ def run_duplicate_analysis_sync(job_id):
             }
         }
         
+        # Create comprehensive statistics for duplicate analysis
+        duplicate_stats = create_duplicate_analysis_statistics(
+            duplicate_results, transactions, data_file, duplicate_pairs
+        )
+        
         # Save to DuplicateAnalysisResult table using new unified structure
         duplicate_analysis_result = DuplicateAnalysisResult.objects.create(
             data_file=data_file,
@@ -421,7 +950,8 @@ def run_duplicate_analysis_sync(job_id):
                 'duplicates_found': duplicate_results.get('duplicates_found', 0),
                 'duplicate_percentage': duplicate_results.get('compliance_assessment', {}).get('duplicate_percentage', 0),
                 'ml_enhanced': duplicate_results.get('ml_insights', {}).get('ml_available', False),
-                'detection_method': duplicate_results.get('ml_insights', {}).get('detection_method', 'rule_based')
+                'detection_method': duplicate_results.get('ml_insights', {}).get('detection_method', 'rule_based'),
+                'statistics': duplicate_stats  # Add comprehensive statistics
             },
             anomaly_list=duplicate_results.get('duplicate_pairs', []),
             duplicate_list=duplicate_results.get('duplicate_pairs', []),
@@ -433,7 +963,8 @@ def run_duplicate_analysis_sync(job_id):
                 'compliance_assessment': duplicate_results.get('compliance_assessment', {}),
                 'financial_statement_impact': duplicate_results.get('financial_statement_impact', {}),
                 'ml_insights': duplicate_results.get('ml_insights', {}),
-                'detection_methods': duplicate_results.get('detection_methods', {})
+                'detection_methods': duplicate_results.get('detection_methods', {}),
+                'statistics': duplicate_stats  # Add statistics to breakdowns as well
             },
             chart_data=duplicate_results.get('chart_data', {}),
             export_data=duplicate_results.get('export_data', []),
@@ -632,6 +1163,7 @@ def run_backdated_analysis_sync(job_id):
         # Merge ML and rule-based results
         backdated_transactions.extend(ml_detected_backdated)
         
+        # Create backdated_results first
         backdated_results = {
             'backdated_transactions': backdated_transactions,
             'backdated_by_user': {user: len(transactions) for user, transactions in backdated_by_user.items()},
@@ -674,6 +1206,11 @@ def run_backdated_analysis_sync(job_id):
             }
         }
         
+        # Create comprehensive statistics for backdated analysis
+        backdated_stats = create_backdated_analysis_statistics(
+            backdated_results, transactions, data_file, backdated_transactions
+        )
+        
         # Save to BackdatedAnalysisResult table using new unified structure
         backdated_analysis_result = BackdatedAnalysisResult.objects.create(
             data_file=data_file,
@@ -682,8 +1219,9 @@ def run_backdated_analysis_sync(job_id):
             analysis_version='2.0.0',
             analysis_summary={
                 'total_transactions': len(transactions),
-                'backdated_entries_found': backdated_results.get('backdated_entries_found', 0),
-                'backdated_percentage': backdated_results.get('compliance_assessment', {}).get('backdated_percentage', 0)
+                'backdated_entries_found': len(backdated_transactions),
+                'backdated_percentage': backdated_results.get('compliance_assessment', {}).get('backdated_percentage', 0),
+                'statistics': backdated_stats  # Add comprehensive statistics
             },
             anomaly_list=backdated_results.get('backdated_transactions', []),
             backdated_entries=backdated_results.get('backdated_transactions', []),
@@ -696,6 +1234,11 @@ def run_backdated_analysis_sync(job_id):
             chart_data=backdated_results.get('chart_data', {}),
             export_data=backdated_results.get('export_data', []),
             processing_duration=backdated_results.get('processing_duration', 0),
+            breakdowns={
+                'ml_insights': backdated_results.get('ml_insights', {}),
+                'detection_methods': backdated_results.get('detection_methods', {}),
+                'statistics': backdated_stats  # Add statistics to breakdowns
+            },
             status='COMPLETED'
         )
         
@@ -729,6 +1272,309 @@ def run_backdated_analysis_sync(job_id):
             pass
         
         return {'error': error_msg}
+
+def run_manual_entry_analysis_sync(job_id):
+    """Run Manual Entry Analysis synchronously and save to database"""
+    
+    # Setup Django
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'analytics.settings')
+    django.setup()
+    
+    from core.models import FileProcessingJob, SAPGLPosting, ManualEntryAnalysisResult
+    
+    start_time = timezone.now()
+    
+    try:
+        # Get the processing job and data file
+        job = FileProcessingJob.objects.get(id=job_id)
+        data_file = job.data_file
+        
+        logger.info(f"Running Manual Entry Analysis for file: {data_file.file_name}")
+        
+        # Get transactions for this file
+        transactions = SAPGLPosting.objects.filter(data_file=data_file)
+        
+        logger.info(f"Running Manual Entry Analysis for {len(transactions)} transactions")
+        
+        # Initialize analysis results
+        manual_entries = []
+        period_end_adjustments = []
+        management_override_indicators = []
+        
+        # Analyze each transaction for manual entry indicators
+        for transaction in transactions:
+            manual_entry_data = {}
+            
+            # Check if it's a manual entry
+            if transaction.is_manual_entry:
+                manual_entry_data = {
+                    'transaction_id': str(transaction.id),
+                    'document_number': transaction.document_number,
+                    'posting_date': transaction.posting_date.isoformat() if transaction.posting_date else None,
+                    'document_date': transaction.document_date.isoformat() if transaction.document_date else None,
+                    'gl_account': transaction.gl_account,
+                    'amount': float(transaction.amount_local_currency),
+                    'user_name': transaction.user_name,
+                    'text': transaction.text,
+                    'document_type': transaction.document_type,
+                    'manual_entry_type': _determine_manual_entry_type(transaction),
+                    'risk_score': _calculate_manual_entry_risk_score(transaction),
+                    'risk_level': _determine_risk_level(_calculate_manual_entry_risk_score(transaction)),
+                    'management_override_indicators': _identify_management_override_indicators(transaction)
+                }
+                
+                manual_entries.append(manual_entry_data)
+                
+                # Check for period-end adjustments
+                if transaction.is_period_end_adjustment:
+                    period_end_adjustments.append(manual_entry_data)
+                
+                # Check for management override indicators
+                override_indicators = _identify_management_override_indicators(transaction)
+                if override_indicators:
+                    management_override_indicators.append({
+                        'transaction_id': str(transaction.id),
+                        'indicators': override_indicators,
+                        'risk_score': manual_entry_data['risk_score']
+                    })
+        
+        logger.info(f"Found {len(manual_entries)} manual entries")
+        logger.info(f"Found {len(period_end_adjustments)} period-end adjustments")
+        logger.info(f"Found {len(management_override_indicators)} management override indicators")
+        
+        # Calculate risk distribution
+        risk_distribution = _calculate_manual_entry_risk_distribution(manual_entries)
+        
+        # Calculate amount analysis
+        amount_analysis = _calculate_manual_entry_amount_analysis(manual_entries)
+        
+        # Calculate user analysis
+        user_analysis = _calculate_manual_entry_user_analysis(manual_entries)
+        
+        # Calculate account analysis
+        account_analysis = _calculate_manual_entry_account_analysis(manual_entries)
+        
+        # Create analysis result
+        manual_entry_analysis = ManualEntryAnalysisResult.objects.create(
+            data_file=data_file,
+            processing_job=job,
+            analysis_summary={
+                'total_transactions': len(transactions),
+                'manual_entries_count': len(manual_entries),
+                'period_end_adjustments_count': len(period_end_adjustments),
+                'management_override_indicators_count': len(management_override_indicators),
+                'high_risk_manual_entries': len([e for e in manual_entries if e['risk_level'] in ['HIGH', 'CRITICAL']])
+            },
+            anomaly_list=manual_entries,
+            chart_data={
+                'risk_distribution': risk_distribution,
+                'amount_analysis': amount_analysis,
+                'user_analysis': user_analysis,
+                'account_analysis': account_analysis
+            },
+            risk_assessment={
+                'overall_risk_score': _calculate_overall_manual_entry_risk_score(manual_entries),
+                'risk_distribution': risk_distribution,
+                'high_risk_entries': len([e for e in manual_entries if e['risk_level'] in ['HIGH', 'CRITICAL']])
+            },
+            audit_recommendations={
+                'high_priority': [e for e in manual_entries if e['risk_level'] == 'CRITICAL'],
+                'medium_priority': [e for e in manual_entries if e['risk_level'] == 'HIGH'],
+                'low_priority': [e for e in manual_entries if e['risk_level'] in ['MEDIUM', 'LOW']]
+            },
+            compliance_assessment={
+                'management_override_risk': 'HIGH' if management_override_indicators else 'LOW',
+                'period_end_adjustment_risk': 'HIGH' if period_end_adjustments else 'LOW',
+                'manual_entry_compliance': _assess_manual_entry_compliance(manual_entries)
+            },
+            export_data=manual_entries,
+            # Manual entry specific fields
+            manual_entries=manual_entries,
+            manual_entry_risk_distribution=risk_distribution,
+            manual_entry_amount_analysis=amount_analysis,
+            manual_entry_user_analysis=user_analysis,
+            manual_entry_account_analysis=account_analysis,
+            period_end_adjustments=period_end_adjustments,
+            management_override_indicators=management_override_indicators,
+            status='COMPLETED'
+        )
+        
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        
+        logger.info(f"Manual Entry Analysis completed and saved to database in {processing_duration:.2f} seconds")
+        
+        return {
+            'analysis_id': str(manual_entry_analysis.id),
+            'status': 'COMPLETED',
+            'processing_duration': processing_duration,
+            'manual_entries_found': len(manual_entries),
+            'table': 'ManualEntryAnalysisResult'
+        }
+        
+    except Exception as e:
+        error_msg = f"Error in Manual Entry Analysis: {str(e)}"
+        logger.error(error_msg)
+        
+        # Save failed result to database
+        try:
+            ManualEntryAnalysisResult.objects.create(
+                data_file=data_file,
+                processing_job=job,
+                analysis_type='manual_entry_analysis',
+                analysis_version='2.0.0',
+                status='FAILED',
+                error_message=error_msg
+            )
+        except:
+            pass
+        
+        return {'error': error_msg}
+
+def _determine_manual_entry_type(transaction):
+    """Determine the type of manual entry"""
+    if transaction.document_type:
+        doc_type = transaction.document_type.upper()
+        if 'MANUAL' in doc_type:
+            return 'MANUAL'
+        elif 'ADJUSTMENT' in doc_type:
+            return 'ADJUSTMENT'
+        elif 'CORRECTION' in doc_type:
+            return 'CORRECTION'
+        elif 'REVERSAL' in doc_type:
+            return 'REVERSAL'
+    
+    if transaction.text:
+        text = transaction.text.lower()
+        if 'manual' in text:
+            return 'MANUAL'
+        elif 'adjustment' in text:
+            return 'ADJUSTMENT'
+        elif 'correction' in text:
+            return 'CORRECTION'
+        elif 'reversal' in text:
+            return 'REVERSAL'
+    
+    return 'UNKNOWN'
+
+def _calculate_manual_entry_risk_score(transaction):
+    """Calculate risk score for manual entry"""
+    risk_score = 50  # Base score for manual entries
+    
+    # Increase risk for high amounts
+    if abs(transaction.amount_local_currency) > 1000000:
+        risk_score += 30
+    elif abs(transaction.amount_local_currency) > 100000:
+        risk_score += 20
+    
+    # Increase risk for period-end adjustments
+    if transaction.is_period_end_adjustment:
+        risk_score += 25
+    
+    # Increase risk for specific account types
+    if transaction.gl_account in ['999999', '888888', '777777', '666666']:
+        risk_score += 20
+    
+    return min(risk_score, 100)
+
+def _determine_risk_level(risk_score):
+    """Determine risk level based on score"""
+    if risk_score >= 80:
+        return 'CRITICAL'
+    elif risk_score >= 60:
+        return 'HIGH'
+    elif risk_score >= 40:
+        return 'MEDIUM'
+    else:
+        return 'LOW'
+
+def _identify_management_override_indicators(transaction):
+    """Identify management override indicators"""
+    indicators = []
+    
+    # High amount manual entries
+    if abs(transaction.amount_local_currency) > 1000000:
+        indicators.append('HIGH_AMOUNT_MANUAL_ENTRY')
+    
+    # Period-end adjustments
+    if transaction.is_period_end_adjustment:
+        indicators.append('PERIOD_END_ADJUSTMENT')
+    
+    # Specific manual entry accounts
+    if transaction.gl_account in ['999999', '888888', '777777', '666666']:
+        indicators.append('SUSPICIOUS_ACCOUNT')
+    
+    # Manual entries without proper documentation
+    if not transaction.text or len(transaction.text.strip()) < 10:
+        indicators.append('INSUFFICIENT_DOCUMENTATION')
+    
+    return indicators
+
+def _calculate_manual_entry_risk_distribution(manual_entries):
+    """Calculate risk distribution for manual entries"""
+    distribution = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+    
+    for entry in manual_entries:
+        risk_level = entry.get('risk_level', 'LOW')
+        distribution[risk_level] += 1
+    
+    return distribution
+
+def _calculate_manual_entry_amount_analysis(manual_entries):
+    """Calculate amount analysis for manual entries"""
+    if not manual_entries:
+        return {'total_amount': 0, 'average_amount': 0, 'max_amount': 0, 'min_amount': 0}
+    
+    amounts = [abs(entry['amount']) for entry in manual_entries]
+    
+    return {
+        'total_amount': sum(amounts),
+        'average_amount': sum(amounts) / len(amounts),
+        'max_amount': max(amounts),
+        'min_amount': min(amounts)
+    }
+
+def _calculate_manual_entry_user_analysis(manual_entries):
+    """Calculate user analysis for manual entries"""
+    user_counts = {}
+    
+    for entry in manual_entries:
+        user = entry.get('user_name', 'Unknown')
+        user_counts[user] = user_counts.get(user, 0) + 1
+    
+    return user_counts
+
+def _calculate_manual_entry_account_analysis(manual_entries):
+    """Calculate account analysis for manual entries"""
+    account_counts = {}
+    
+    for entry in manual_entries:
+        account = entry.get('gl_account', 'Unknown')
+        account_counts[account] = account_counts.get(account, 0) + 1
+    
+    return account_counts
+
+def _calculate_overall_manual_entry_risk_score(manual_entries):
+    """Calculate overall risk score for manual entries"""
+    if not manual_entries:
+        return 0
+    
+    total_risk = sum(entry.get('risk_score', 0) for entry in manual_entries)
+    return min(total_risk / len(manual_entries), 100)
+
+def _assess_manual_entry_compliance(manual_entries):
+    """Assess compliance for manual entries"""
+    if not manual_entries:
+        return 'COMPLIANT'
+    
+    high_risk_count = len([e for e in manual_entries if e.get('risk_level') in ['HIGH', 'CRITICAL']])
+    total_count = len(manual_entries)
+    
+    if high_risk_count / total_count > 0.3:
+        return 'NON_COMPLIANT'
+    elif high_risk_count / total_count > 0.1:
+        return 'NEEDS_ATTENTION'
+    else:
+        return 'COMPLIANT'
 
 def run_user_analysis_sync(job_id):
     """Run User Analysis synchronously and save to database"""
@@ -888,6 +1734,11 @@ def run_user_analysis_sync(job_id):
             }
         }
         
+        # Create comprehensive statistics for user analysis
+        user_stats = create_user_analysis_statistics(
+            user_results, transactions, data_file, user_anomalies
+        )
+        
         # Save to UserAnalysisResult table using new unified structure
         user_analysis_result = UserAnalysisResult.objects.create(
             data_file=data_file,
@@ -900,7 +1751,8 @@ def run_user_analysis_sync(job_id):
                 'high_risk_users': user_results.get('statistical_summary', {}).get('high_risk_users', 0),
                 'users_with_anomalies': user_results.get('statistical_summary', {}).get('users_with_anomalies', 0),
                 'ml_enhanced': user_results.get('ml_insights', {}).get('ml_available', False),
-                'detection_method': user_results.get('ml_insights', {}).get('detection_method', 'rule_based')
+                'detection_method': user_results.get('ml_insights', {}).get('detection_method', 'rule_based'),
+                'statistics': user_stats  # Add comprehensive statistics
             },
             anomaly_list=user_results.get('user_anomalies', []),
             user_transaction_summary=user_results.get('user_transaction_summary', []),
@@ -918,7 +1770,8 @@ def run_user_analysis_sync(job_id):
                 'ml_insights': user_results.get('ml_insights', {}),
                 'ml_detected_anomalies': user_results.get('ml_detected_anomalies', []),
                 'anomaly_severity_breakdown': user_results.get('anomaly_severity_breakdown', {}),
-                'detection_methods': user_results.get('detection_methods', {})
+                'detection_methods': user_results.get('detection_methods', {}),
+                'statistics': user_stats  # Add statistics to breakdowns
             },
             status='COMPLETED'
         )
@@ -1962,11 +2815,11 @@ def run_holiday_analysis_sync(job_id):
         for t in transactions:
             if t.posting_date:
                 # Check if posting is on a Saudi Arabian holiday using pre-fetched holiday data
-                posting_date_str = t.posting_date.strftime('%Y-%m-%d')
+                posting_date = t.posting_date.date() if hasattr(t.posting_date, 'date') else t.posting_date
                 
                 # Check if the posting date is in our pre-fetched holiday dates
-                if posting_date_str in holiday_dates:
-                    holiday_name = holiday_info.get(posting_date_str, {}).get('name', 'Saudi Holiday')
+                if posting_date in holiday_dates:
+                    holiday_name = holiday_info.get(posting_date, {}).get('name', 'Saudi Holiday')
                     
                     holiday_transactions.append({
                         'transaction_id': str(t.id),
@@ -2073,7 +2926,18 @@ def run_holiday_analysis_sync(job_id):
             },
             anomaly_list=holiday_transactions,
             holiday_postings=holiday_transactions,
+            holiday_by_fs_line=holiday_results.get('holiday_by_fs_line', []),
+            holiday_by_account=holiday_results.get('holiday_by_account', []),
+            holiday_by_user=holiday_results.get('holiday_by_user', []),
+            holiday_by_holiday_type=holiday_results.get('holiday_by_holiday_type', []),
+            gl_activity_by_holiday=holiday_results.get('gl_activity_by_holiday', []),
+            holiday_breakdown=holiday_results.get('holiday_breakdown', []),
+            holiday_patterns=holiday_results.get('holiday_patterns', {}),
+            financial_statement_impact=holiday_results.get('financial_statement_impact', {}),
             chart_data=holiday_results.get('chart_data', {}),
+            risk_assessment=holiday_results.get('risk_assessment', {}),
+            audit_recommendations=holiday_results.get('audit_recommendations', []),
+            compliance_assessment=holiday_results.get('compliance_assessment', {}),
             breakdowns={
                 'ml_insights': holiday_results.get('ml_insights', {}),
                 'detection_methods': holiday_results.get('detection_methods', {})

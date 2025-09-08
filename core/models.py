@@ -474,17 +474,68 @@ class SAPGLPosting(models.Model):
         
         return 'Other Expenses'
     
+    def get_proper_transaction_type(self):
+        """Get the proper transaction type considering account type and amount sign"""
+        if not self.gl_account:
+            return self.transaction_type
+        
+        amount = self.amount_local_currency
+        
+        # Asset accounts (1xxx) - normally have debit balances
+        if self.gl_account.startswith('1'):
+            return 'DEBIT' if amount >= 0 else 'CREDIT'
+        
+        # Liability accounts (2xxx) - normally have credit balances
+        elif self.gl_account.startswith('2'):
+            return 'CREDIT' if amount >= 0 else 'DEBIT'
+        
+        # Equity accounts (3xxx) - normally have credit balances
+        elif self.gl_account.startswith('3'):
+            return 'CREDIT' if amount >= 0 else 'DEBIT'
+        
+        # Revenue accounts (4xxx) - normally have credit balances
+        elif self.gl_account.startswith('4'):
+            return 'CREDIT' if amount >= 0 else 'DEBIT'
+        
+        # Expense accounts (5xxx, 6xxx, 7xxx) - normally have debit balances
+        elif self.gl_account.startswith(('5', '6', '7')):
+            return 'DEBIT' if amount >= 0 else 'CREDIT'
+        
+        # Default to current transaction type if account pattern not recognized
+        return self.transaction_type
+    
     def save(self, *args, **kwargs):
-        # Auto-determine transaction type based on GL account if not set
+        # Auto-determine transaction type based on GL account AND amount
         if not self.transaction_type and self.gl_account:
-            # Asset and expense accounts normally have debit balances
+            amount = self.amount_local_currency
+            
+            # Asset and expense accounts (1xxx, 5xxx, 6xxx, 7xxx)
             if self.gl_account.startswith(('1', '5', '6', '7')):
-                self.transaction_type = 'DEBIT'
-            # Liability, equity, and revenue accounts normally have credit balances
+                # Positive amount = DEBIT (normal balance), Negative amount = CREDIT (opposite)
+                self.transaction_type = 'DEBIT' if amount >= 0 else 'CREDIT'
+            # Liability, equity, and revenue accounts (2xxx, 3xxx, 4xxx)
             elif self.gl_account.startswith(('2', '3', '4')):
-                self.transaction_type = 'CREDIT'
+                # Positive amount = CREDIT (normal balance), Negative amount = DEBIT (opposite)
+                self.transaction_type = 'CREDIT' if amount >= 0 else 'DEBIT'
         
         super().save(*args, **kwargs)
+    
+    def recalculate_transaction_type(self):
+        """Recalculate and update transaction type based on current account and amount"""
+        proper_type = self.get_proper_transaction_type()
+        if proper_type != self.transaction_type:
+            self.transaction_type = proper_type
+            self.save(update_fields=['transaction_type'])
+        return self.transaction_type
+    
+    @classmethod
+    def recalculate_all_transaction_types(cls):
+        """Recalculate transaction types for all records"""
+        updated_count = 0
+        for posting in cls.objects.all():
+            if posting.recalculate_transaction_type():
+                updated_count += 1
+        return updated_count
 
 class DataFile(models.Model):
     """Model to track uploaded data files"""
@@ -891,10 +942,14 @@ class HolidayAnalysisResult(BaseAnalysisResult):
     
     # Additional holiday-specific fields
     holiday_postings = models.JSONField(default=list, help_text='List of holiday postings detected')
+    holiday_by_fs_line = models.JSONField(default=list, help_text='Holiday postings grouped by financial statement line')
+    holiday_by_account = models.JSONField(default=list, help_text='Holiday postings grouped by account')
+    holiday_by_user = models.JSONField(default=list, help_text='Holiday postings grouped by user')
+    holiday_by_holiday_type = models.JSONField(default=list, help_text='Holiday postings grouped by holiday type')
+    gl_activity_by_holiday = models.JSONField(default=list, help_text='GL activity by holiday')
     holiday_breakdown = models.JSONField(default=list, help_text='Breakdown by holiday type')
     holiday_patterns = models.JSONField(default=dict, help_text='Holiday posting patterns and trends')
     financial_statement_impact = models.JSONField(default=dict, help_text='Financial statement impact analysis')
-    breakdowns = models.JSONField(default=dict, help_text='Various breakdowns including ML insights')
     breakdowns = models.JSONField(default=dict, help_text='Various breakdowns including ML insights')
     
     class Meta:
@@ -914,7 +969,7 @@ class HolidayAnalysisResult(BaseAnalysisResult):
         """Get count of unique holidays"""
         if not self.holiday_breakdown:
             return 0
-        return len([h for h in self.holiday_breakdown if h and len(h) > 1 and h[1] > 0])
+        return len([h for h in self.holiday_breakdown if h and len(h) > 1 and h[1] is not None and h[1] > 0])
     
     def get_overall_risk_score(self):
         """Get overall risk score"""
@@ -2197,3 +2252,111 @@ class ManualEntryAnalysisModelTraining(BaseModelTraining):
     
     def __str__(self):
         return f"{self.session_name} - {self.status}"
+
+
+class FileProcessingTask(models.Model):
+    """Model to track individual file processing tasks (GL, TB, Chart of Accounts)"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File information
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='processing_tasks', help_text='Reference to the uploaded data file')
+    
+    # Task information
+    TASK_TYPE_CHOICES = [
+        ('GL_LIST', 'General Ledger List'),
+        ('TB_LIST', 'Trial Balance List'),
+        ('CHART_OF_ACCOUNTS', 'Chart of Accounts'),
+    ]
+    task_type = models.CharField(max_length=20, choices=TASK_TYPE_CHOICES, help_text='Type of processing task')
+    
+    # Processing status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('SUCCESS', 'Success'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    
+    # Celery task information
+    celery_task_id = models.CharField(max_length=255, null=True, blank=True, help_text='Celery task ID for tracking')
+    
+    # Processing results
+    extracted_data = models.JSONField(default=dict, help_text='Extracted and processed data from the file')
+    processing_metadata = models.JSONField(default=dict, help_text='Metadata about the processing (row counts, etc.)')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if processing failed')
+    
+    # Timestamps
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'file_processing_tasks'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['data_file', 'task_type']),
+            models.Index(fields=['status']),
+            models.Index(fields=['created_at']),
+        ]
+        unique_together = ['data_file', 'task_type']
+    
+    def __str__(self):
+        return f"{self.data_file.filename} - {self.get_task_type_display()} - {self.status}"
+
+
+class CompletenessJob(models.Model):
+    """Model to track completeness job execution after all file processing tasks complete"""
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    # File information
+    data_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='completeness_jobs', help_text='Reference to the uploaded data file')
+    
+    # Related processing tasks
+    gl_task = models.ForeignKey(FileProcessingTask, on_delete=models.CASCADE, related_name='gl_completeness_jobs', null=True, blank=True)
+    tb_task = models.ForeignKey(FileProcessingTask, on_delete=models.CASCADE, related_name='tb_completeness_jobs', null=True, blank=True)
+    chart_task = models.ForeignKey(FileProcessingTask, on_delete=models.CASCADE, related_name='chart_completeness_jobs', null=True, blank=True)
+    
+    # Processing status
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('CREATED', 'Created'),
+        ('SUCCESS', 'Success'),
+        ('FAILED', 'Failed'),
+    ]
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    
+    # Celery task information
+    celery_task_id = models.CharField(max_length=255, null=True, blank=True, help_text='Celery task ID for tracking')
+    
+    # Completeness results
+    completeness_results = models.JSONField(default=dict, help_text='Results from completeness analysis')
+    debit_credit_summary = models.JSONField(default=dict, help_text='Summary of debit and credit entries')
+    audit_checks = models.JSONField(default=dict, help_text='Results of audit-style completeness checks')
+    
+    # Error handling
+    error_message = models.TextField(blank=True, null=True, help_text='Error message if processing failed')
+    
+    # Timestamps
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'completeness_jobs'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['data_file']),
+            models.Index(fields=['status']),
+            models.Index(fields=['created_at']),
+        ]
+    
+    def __str__(self):
+        return f"Completeness Job - {self.data_file.filename} - {self.status}"

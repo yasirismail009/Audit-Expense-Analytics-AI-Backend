@@ -6,7 +6,7 @@ from rest_framework import viewsets, status, generics, serializers
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
-from django.db import transaction
+from django.db import transaction, models
 from django.db.models import Sum, Count, Avg, Min, Max, Q
 from django.utils import timezone
 import pandas as pd
@@ -24,7 +24,2099 @@ from .models import (
     RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, 
     ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult, HolidayAnalysisResult, 
     GeneralAnalysisResult, AIRiskAssessment, RiskPattern, AnomalyCluster, 
-    AIRiskRecommendation, RiskTrend, ModelPerformance
+    AIRiskRecommendation, RiskTrend, ModelPerformance, ProcessingJobTracker,
+    ManualEntryAnalysisResult
+)
+from .serializers import (
+    DataFileSerializer, DataFileUploadSerializer, DataUploadResponseSerializer,
+    FileProcessingJobSerializer, MLModelTrainingSerializer, TargetedAnomalyUploadSerializer,
+    SAPGLPostingListSerializer, ClosingEntriesListSerializer, BackdatedEntriesListSerializer,
+    UnusualDaysListSerializer,HolidayListSerializer, DuplicateListSerializer, UserListSerializer
+)
+from .tasks import run_restructured_analysis
+from .excel_export import AuditExcelExporter
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# UPLOAD AND FILE MANAGEMENT
+# ============================================================================
+
+class DataFileViewSet(viewsets.ModelViewSet):
+    """ViewSet for uploaded data files"""
+    
+    queryset = DataFile.objects.all()
+    serializer_class = DataFileSerializer
+    parser_classes = (MultiPartParser, FormParser)
+    
+    @action(detail=False, methods=['post'])
+    def upload(self, request):
+        """Upload and process CSV file"""
+        try:
+            file_obj = request.FILES.get('file')
+            if not file_obj:
+                return Response(
+                    {'error': 'No file provided'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get additional fields from request data
+            engagement_id = request.data.get('engagement_id', '')
+            client_name = request.data.get('client_name', '')
+            company_name = request.data.get('company_name', '')
+            fiscal_year = request.data.get('fiscal_year', 2025)
+            audit_start_date = request.data.get('audit_start_date')
+            audit_end_date = request.data.get('audit_end_date')
+            
+            # Validate file type
+            if not file_obj.name.endswith('.csv'):
+                return Response(
+                    {'error': 'Only CSV files are supported'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create DataFile record with new fields
+            data_file = DataFile.objects.create(
+                file_name=file_obj.name,
+                file_size=file_obj.size,
+                engagement_id=engagement_id,
+                client_name=client_name,
+                company_name=company_name,
+                fiscal_year=fiscal_year,
+                audit_start_date=audit_start_date,
+                audit_end_date=audit_end_date,
+                status='PENDING'
+            )
+            
+            # Process file in background (for now, process synchronously)
+            result = self._process_csv_file(data_file, file_obj)
+            
+            if result['success']:
+                return Response(
+                    DataUploadResponseSerializer(data_file).data,
+                    status=status.HTTP_201_CREATED
+                )
+            else:
+                return Response(
+                    {'error': result['error']}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+        except Exception as e:
+            logger.error(f"Error uploading file: {e}")
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    def _process_csv_file(self, data_file, file_obj):
+        """Process uploaded CSV file"""
+        try:
+            # Update status
+            data_file.status = 'PROCESSING'
+            data_file.save()
+            
+            # Read CSV file
+            content = file_obj.read().decode('utf-8')
+            csv_reader = csv.DictReader(io.StringIO(content))
+            
+            # Process rows
+            processed_count = 0
+            failed_count = 0
+            min_date = None
+            max_date = None
+            min_amount = None
+            max_amount = None
+            
+            # Use bulk_create for better performance
+            postings_to_create = []
+            
+            for row in csv_reader:
+                try:
+                    # Map CSV columns to model fields
+                    posting = self._create_posting_from_row(row, data_file)
+                    if posting:
+                        postings_to_create.append(posting)
+                        processed_count += 1
+                        
+                        # Update date and amount ranges
+                        if posting.posting_date:
+                            if min_date is None or posting.posting_date < min_date:
+                                min_date = posting.posting_date
+                            if max_date is None or posting.posting_date > max_date:
+                                max_date = posting.posting_date
+                        
+                        if min_amount is None or posting.amount_local_currency < min_amount:
+                            min_amount = posting.amount_local_currency
+                        if max_amount is None or posting.amount_local_currency > max_amount:
+                            max_amount = posting.amount_local_currency
+                except Exception as e:
+                    logger.error(f"Error processing row: {e}")
+                    failed_count += 1
+            
+            # Bulk create all postings
+            if postings_to_create:
+                SAPGLPosting.objects.bulk_create(postings_to_create, batch_size=1000)
+                logger.info(f"Successfully saved {len(postings_to_create)} postings to database")
+            
+            # Update DataFile record
+            data_file.total_records = processed_count + failed_count
+            data_file.processed_records = processed_count
+            data_file.failed_records = failed_count
+            data_file.status = 'COMPLETED' if failed_count == 0 else 'PARTIAL'
+            data_file.processed_at = timezone.now()
+            data_file.min_date = min_date
+            data_file.max_date = max_date
+            data_file.min_amount = min_amount
+            data_file.max_amount = max_amount
+            data_file.save()
+            
+            # Create processing job to trigger analysis
+            self._create_processing_job(data_file)
+            
+            return {'success': True}
+            
+        except Exception as e:
+            logger.error(f"Error processing CSV file: {e}")
+            data_file.status = 'FAILED'
+            data_file.error_message = str(e)
+            data_file.processed_at = timezone.now()
+            data_file.save()
+            return {'success': False, 'error': str(e)}
+    
+    def _create_posting_from_row(self, row, data_file):
+        """Create SAPGLPosting from CSV row"""
+        try:
+            # Map CSV columns to model fields
+            posting = SAPGLPosting(
+                data_file=data_file,  # Associate with the uploaded file
+                document_number=row.get('Document', ''),
+                document_type=row.get('Document type', ''),
+                amount_local_currency=Decimal(row.get('Amount in Local Currency', '0').replace(',', '')),
+                local_currency=row.get('Local Currency', 'SAR'),
+                gl_account=row.get('G/L Account', ''),
+                profit_center=row.get('Profit Center', ''),
+                user_name=row.get('User Name', ''),
+                fiscal_year=int(row.get('Fiscal Year', '2025')),
+                posting_period=int(row.get('Posting period', '1')),
+                text=row.get('Text', ''),
+                segment=row.get('Segment', ''),
+                clearing_document=row.get('Clearing Document', ''),
+                offsetting_account=row.get('Offsetting', ''),
+                invoice_reference=row.get('Invoice Reference', ''),
+                sales_document=row.get('Sales Document', ''),
+                assignment=row.get('Assignment', ''),
+                year_month=row.get('Year/Month', '')
+            )
+            
+            # Parse dates
+            posting_date_str = row.get('Posting Date', '')
+            if posting_date_str:
+                try:
+                    parsed_date = datetime.strptime(posting_date_str, '%m/%d/%Y').date()
+                    posting.posting_date = parsed_date
+                except:
+                    # Set a default date if parsing fails
+                    posting.posting_date = datetime.now().date()
+            else:
+                # Set a default date if no posting date provided
+                posting.posting_date = datetime.now().date()
+            
+            document_date_str = row.get('Document Date', '')
+            if document_date_str:
+                try:
+                    parsed_date = datetime.strptime(document_date_str, '%m/%d/%Y').date()
+                    posting.document_date = parsed_date
+                except:
+                    pass
+            
+            entry_date_str = row.get('Entry Date', '')
+            if entry_date_str:
+                try:
+                    parsed_date = datetime.strptime(entry_date_str, '%m/%d/%Y').date()
+                    posting.entry_date = parsed_date
+                except:
+                    pass
+            
+            return posting
+            
+        except Exception as e:
+            logger.error(f"Error creating posting from row: {e}")
+            return None
+    
+    def _create_processing_job(self, data_file):
+        """Create a processing job to trigger analysis"""
+        try:
+            # Calculate file hash for duplicate detection
+            import hashlib
+            file_hash = hashlib.sha256(f"{data_file.file_name}{data_file.file_size}{data_file.uploaded_at}".encode()).hexdigest()
+            
+            # Create processing job
+            processing_job = FileProcessingJob.objects.create(
+                data_file=data_file,
+                file_hash=file_hash,
+                run_anomalies=True,  # Enable anomaly detection by default
+                requested_anomalies=['duplicate', 'backdated', 'high_value', 'unusual_patterns'],
+                status='PENDING'
+            )
+            
+            # Trigger the analysis task
+            from .tasks import run_restructured_analysis
+            run_restructured_analysis.delay(str(processing_job.id))
+            
+            logger.info(f"Created processing job {processing_job.id} for file {data_file.file_name}")
+            
+        except Exception as e:
+            logger.error(f"Error creating processing job: {e}")
+            # Don't fail the upload if job creation fails
+            pass
+
+# ============================================================================
+# PROCESSING JOBS
+# ============================================================================
+
+class FileProcessingJobViewSet(viewsets.ReadOnlyModelViewSet):
+    """ViewSet for file processing jobs"""
+    
+    queryset = FileProcessingJob.objects.all()
+    serializer_class = FileProcessingJobSerializer
+    
+    @action(detail=True, methods=['get'])
+    def status(self, request, pk=None):
+        """Get processing job status"""
+        try:
+            job = self.get_object()
+            return Response({
+                'job_id': str(job.id),
+                'status': job.status,
+                'started_at': job.started_at,
+                'completed_at': job.completed_at,
+                'processing_duration': job.processing_duration,
+                'error_message': job.error_message,
+                'analytics_results': job.analytics_results
+            })
+        except Exception as e:
+            logger.error(f"Error getting job status: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+# ============================================================================
+# ML MODEL TRAINING
+# ============================================================================
+
+class MLModelTrainingViewSet(viewsets.ModelViewSet):
+    """ViewSet for ML model training"""
+    
+    queryset = MLModelTraining.objects.all()
+    serializer_class = MLModelTrainingSerializer
+    
+    @action(detail=False, methods=['post'])
+    def train_models(self, request):
+        """Train ML models"""
+        try:
+            # Get the latest processing job or create a dummy one
+            latest_job = FileProcessingJob.objects.filter(status='COMPLETED').order_by('-created_at').first()
+            
+            if not latest_job:
+                return Response(
+                    {'error': 'No completed processing jobs found. Please upload and process a file first.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Trigger ML model training
+            from .tasks import train_ml_models
+            result = train_ml_models.delay(str(latest_job.id))
+            
+            return Response({
+                'message': 'ML model training started',
+                'status': 'PENDING',
+                'task_id': str(result.id),
+                'job_id': str(latest_job.id)
+            })
+        except Exception as e:
+            logger.error(f"Error training models: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def retrain_models(self, request):
+        """Retrain ML models"""
+        try:
+            # Get the latest processing job or create a dummy one
+            latest_job = FileProcessingJob.objects.filter(status='COMPLETED').order_by('-created_at').first()
+            
+            if not latest_job:
+                return Response(
+                    {'error': 'No completed processing jobs found. Please upload and process a file first.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Trigger ML model retraining
+            from .tasks import retrain_ml_models
+            result = retrain_ml_models.delay(str(latest_job.id))
+            
+            return Response({
+                'message': 'ML model retraining started',
+                'status': 'PENDING',
+                'task_id': str(result.id),
+                'job_id': str(latest_job.id)
+            })
+        except Exception as e:
+            logger.error(f"Error retraining models: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['get'])
+    def model_info(self, request):
+        """Get model information"""
+        try:
+            # Implementation for getting model info
+            return Response({
+                'models': [],
+                'latest_version': '1.0.0'
+            })
+        except Exception as e:
+            logger.error(f"Error getting model info: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def predict_anomalies(self, request):
+        """Predict anomalies"""
+        try:
+            # Implementation for predicting anomalies
+            return Response({
+                'predictions': [],
+                'status': 'completed'
+            })
+        except Exception as e:
+            logger.error(f"Error predicting anomalies: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=True, methods=['get'])
+    def status(self, request, pk=None):
+        """Get training status"""
+        try:
+            training = self.get_object()
+            return Response({
+                'training_id': str(training.id),
+                'status': training.status,
+                'started_at': training.started_at,
+                'completed_at': training.completed_at,
+                'training_duration': training.training_duration,
+                'error_message': training.error_message
+            })
+        except Exception as e:
+            logger.error(f"Error getting training status: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def train_holiday_model(self, request):
+        """Train holiday analysis ML model specifically"""
+        try:
+            # Get the latest processing job or create a dummy one
+            latest_job = FileProcessingJob.objects.filter(status='COMPLETED').order_by('-created_at').first()
+            
+            if not latest_job:
+                return Response(
+                    {'error': 'No completed processing jobs found. Please upload and process a file first.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get transactions for training
+            from .models import SAPGLPosting
+            transactions = list(SAPGLPosting.objects.filter(data_file=latest_job.data_file))
+            
+            if not transactions:
+                return Response(
+                    {'error': 'No transactions found for training.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create training session
+            training_session = MLModelTraining.objects.create(
+                session_name=f"Holiday Model Training {latest_job.id}",
+                description="Holiday analysis ML model training session",
+                model_type='holiday',
+                training_data_size=len(transactions),
+                training_data_date_range={
+                    'min_date': min(t.posting_date for t in transactions if t.posting_date).isoformat(),
+                    'max_date': max(t.posting_date for t in transactions if t.posting_date).isoformat()
+                },
+                status='TRAINING',
+                started_at=timezone.now()
+            )
+            
+            # Train holiday model
+            from .specialized_analysis_models import AnalysisModelManager
+            model_manager = AnalysisModelManager()
+            
+            # Generate holiday labels using holiday_utils
+            labels = []
+            try:
+                from .holiday_utils import is_holiday
+                # Default to Saudi Arabian holidays
+                country_code = 'saudiarabian'
+                for t in transactions:
+                    if t.posting_date:
+                        is_holiday_posting = is_holiday(country_code, t.posting_date)
+                        labels.append(1 if is_holiday_posting else 0)
+                    else:
+                        labels.append(0)
+                logger.info(f"Generated {sum(labels)} holiday labels from {len(transactions)} transactions")
+            except Exception as e:
+                logger.warning(f"Could not generate holiday labels using holiday_utils: {e}")
+                # Fallback to simple heuristic
+                for t in transactions:
+                    is_anomaly = (t.posting_date and t.posting_date.weekday() >= 5)  # Weekend
+                    labels.append(1 if is_anomaly else 0)
+                logger.info(f"Generated {sum(labels)} holiday labels using fallback heuristic")
+            
+            # Train the holiday model
+            success = model_manager.ensure_model_trained('holiday', transactions, labels)
+            
+            # Update training session
+            training_session.status = 'COMPLETED' if success else 'FAILED'
+            training_session.completed_at = timezone.now()
+            training_session.training_duration = (timezone.now() - training_session.started_at).total_seconds()
+            
+            if success:
+                # Get model performance metrics
+                holiday_model = model_manager.get_model('holiday')
+                if holiday_model and holiday_model.is_trained:
+                    training_session.performance_metrics = {
+                        'model_type': 'holiday',
+                        'training_success': True,
+                        'feature_count': 12,  # Standard feature count for holiday model
+                        'positive_cases': sum(labels),
+                        'total_cases': len(transactions),
+                        'positive_rate': (sum(labels) / len(transactions)) * 100 if transactions else 0
+                    }
+                training_session.save()
+                
+                return Response({
+                    'message': 'Holiday model training completed successfully',
+                    'status': 'COMPLETED',
+                    'training_id': str(training_session.id),
+                    'job_id': str(latest_job.id),
+                    'training_duration': training_session.training_duration,
+                    'performance_metrics': training_session.performance_metrics
+                })
+            else:
+                training_session.error_message = "Failed to train holiday model"
+                training_session.save()
+                
+                return Response({
+                    'error': 'Failed to train holiday model',
+                    'status': 'FAILED',
+                    'training_id': str(training_session.id)
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+        except Exception as e:
+            logger.error(f"Error training holiday model: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+# ============================================================================
+# DEBUG AND MONITORING
+# ============================================================================
+
+class CeleryDebugViewSet(viewsets.ViewSet):
+    """ViewSet for Celery debugging and monitoring"""
+    
+    @action(detail=False, methods=['get'])
+    def health_check(self, request):
+        """Health check for Celery workers"""
+        try:
+            return Response({
+                'status': 'healthy',
+                'timestamp': timezone.now()
+            })
+        except Exception as e:
+            logger.error(f"Error in health check: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['get'])
+    def list_queued_tasks(self, request):
+        """List all queued tasks"""
+        try:
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            queued_tasks = []
+            
+            # Get all queued task keys
+            pattern = "queued_task:*"
+            keys = r.keys(pattern)
+            
+            for key in keys:
+                task_data = r.get(key)
+                if task_data:
+                    task_info = json.loads(task_data)
+                    queued_tasks.append(task_info)
+            
+            return Response({
+                'status': 'success',
+                'queued_tasks': queued_tasks,
+                'count': len(queued_tasks)
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'])
+    def execute_queued_task(self, request):
+        """Execute a specific queued task"""
+        try:
+            job_id = request.data.get('job_id')
+            if not job_id:
+                return Response({
+                    'status': 'error',
+                    'message': 'job_id is required'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            queue_key = f"queued_task:{job_id}"
+            
+            # Get task info from Redis
+            task_data = r.get(queue_key)
+            if not task_data:
+                return Response({
+                    'status': 'error',
+                    'message': f'No queued task found for job_id: {job_id}'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            task_info = json.loads(task_data)
+            
+            # Execute the task
+            from .tasks import run_restructured_analysis
+            result = run_restructured_analysis.delay(job_id)
+            
+            # Remove from queue
+            r.delete(queue_key)
+            
+            # Update job status
+            from .models import FileProcessingJob
+            try:
+                job = FileProcessingJob.objects.get(id=job_id)
+                job.status = 'PROCESSING'
+                job.save()
+            except FileProcessingJob.DoesNotExist:
+                pass
+            
+            return Response({
+                'status': 'success',
+                'message': f'Task executed for job_id: {job_id}',
+                'task_id': result.id
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'])
+    def execute_all_queued_tasks(self, request):
+        """Execute all queued tasks"""
+        try:
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            pattern = "queued_task:*"
+            keys = r.keys(pattern)
+            
+            executed_tasks = []
+            
+            for key in keys:
+                task_data = r.get(key)
+                if task_data:
+                    task_info = json.loads(task_data)
+                    job_id = task_info['job_id']
+                    
+                    # Execute the task
+                    from .tasks import run_restructured_analysis
+                    result = run_restructured_analysis.delay(job_id)
+                    
+                    # Remove from queue
+                    r.delete(key)
+                    
+                    # Update job status
+                    from .models import FileProcessingJob
+                    try:
+                        job = FileProcessingJob.objects.get(id=job_id)
+                        job.status = 'PROCESSING'
+                        job.save()
+                    except FileProcessingJob.DoesNotExist:
+                        pass
+                    
+                    executed_tasks.append({
+                        'job_id': job_id,
+                        'task_id': result.id
+                    })
+            
+            return Response({
+                'status': 'success',
+                'message': f'Executed {len(executed_tasks)} tasks',
+                'executed_tasks': executed_tasks
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# ============================================================================
+"""
+Clean views file with only the views used in the current URLs
+"""
+
+from rest_framework import viewsets, status, generics, serializers
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.parsers import MultiPartParser, FormParser
+from django.db import transaction, models
+from django.db.models import Sum, Count, Avg, Min, Max, Q
+from django.utils import timezone
+import pandas as pd
+import csv
+import io
+import logging
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from rest_framework.pagination import PageNumberPagination
+from django.db.models import Q
+from rest_framework.views import APIView
+
+from .models import (
+    SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, 
+    RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, 
+    ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult, HolidayAnalysisResult, 
+    GeneralAnalysisResult, AIRiskAssessment, RiskPattern, AnomalyCluster, 
+    AIRiskRecommendation, RiskTrend, ModelPerformance, ProcessingJobTracker,
+    ManualEntryAnalysisResult
+)
+from .serializers import (
+    DataFileSerializer, DataFileUploadSerializer, DataUploadResponseSerializer,
+    FileProcessingJobSerializer, MLModelTrainingSerializer, TargetedAnomalyUploadSerializer,
+    SAPGLPostingListSerializer, ClosingEntriesListSerializer, BackdatedEntriesListSerializer,
+    UnusualDaysListSerializer,HolidayListSerializer, DuplicateListSerializer, UserListSerializer
+)
+from .tasks import run_restructured_analysis
+from .excel_export import AuditExcelExporter
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# UPLOAD AND FILE MANAGEMENT
+# ============================================================================
+
+class DataFileViewSet(viewsets.ModelViewSet):
+    """ViewSet for uploaded data files"""
+    
+    queryset = DataFile.objects.all()
+    serializer_class = DataFileSerializer
+    parser_classes = (MultiPartParser, FormParser)
+    
+    @action(detail=False, methods=['post'])
+    def upload(self, request):
+        """Upload and process CSV file"""
+        try:
+            file_obj = request.FILES.get('file')
+            if not file_obj:
+                return Response(
+                    {'error': 'No file provided'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get additional fields from request data
+            engagement_id = request.data.get('engagement_id', '')
+            client_name = request.data.get('client_name', '')
+            company_name = request.data.get('company_name', '')
+            fiscal_year = request.data.get('fiscal_year', 2025)
+            audit_start_date = request.data.get('audit_start_date')
+            audit_end_date = request.data.get('audit_end_date')
+            
+            # Validate file type
+            if not file_obj.name.endswith('.csv'):
+                return Response(
+                    {'error': 'Only CSV files are supported'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create DataFile record with new fields
+            data_file = DataFile.objects.create(
+                file_name=file_obj.name,
+                file_size=file_obj.size,
+                engagement_id=engagement_id,
+                client_name=client_name,
+                company_name=company_name,
+                fiscal_year=fiscal_year,
+                audit_start_date=audit_start_date,
+                audit_end_date=audit_end_date,
+                status='PENDING'
+            )
+            
+            # Process file in background (for now, process synchronously)
+            result = self._process_csv_file(data_file, file_obj)
+            
+            if result['success']:
+                return Response(
+                    DataUploadResponseSerializer(data_file).data,
+                    status=status.HTTP_201_CREATED
+                )
+            else:
+                return Response(
+                    {'error': result['error']}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+        except Exception as e:
+            logger.error(f"Error uploading file: {e}")
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    def _process_csv_file(self, data_file, file_obj):
+        """Process uploaded CSV file"""
+        try:
+            # Update status
+            data_file.status = 'PROCESSING'
+            data_file.save()
+            
+            # Read CSV file
+            content = file_obj.read().decode('utf-8')
+            csv_reader = csv.DictReader(io.StringIO(content))
+            
+            # Process rows
+            processed_count = 0
+            failed_count = 0
+            min_date = None
+            max_date = None
+            min_amount = None
+            max_amount = None
+            
+            # Use bulk_create for better performance
+            postings_to_create = []
+            
+            for row in csv_reader:
+                try:
+                    # Map CSV columns to model fields
+                    posting = self._create_posting_from_row(row, data_file)
+                    if posting:
+                        postings_to_create.append(posting)
+                        processed_count += 1
+                        
+                        # Update date and amount ranges
+                        if posting.posting_date:
+                            if min_date is None or posting.posting_date < min_date:
+                                min_date = posting.posting_date
+                            if max_date is None or posting.posting_date > max_date:
+                                max_date = posting.posting_date
+                        
+                        if min_amount is None or posting.amount_local_currency < min_amount:
+                            min_amount = posting.amount_local_currency
+                        if max_amount is None or posting.amount_local_currency > max_amount:
+                            max_amount = posting.amount_local_currency
+                except Exception as e:
+                    logger.error(f"Error processing row: {e}")
+                    failed_count += 1
+            
+            # Bulk create all postings
+            if postings_to_create:
+                SAPGLPosting.objects.bulk_create(postings_to_create, batch_size=1000)
+                logger.info(f"Successfully saved {len(postings_to_create)} postings to database")
+            
+            # Update DataFile record
+            data_file.total_records = processed_count + failed_count
+            data_file.processed_records = processed_count
+            data_file.failed_records = failed_count
+            data_file.status = 'COMPLETED' if failed_count == 0 else 'PARTIAL'
+            data_file.processed_at = timezone.now()
+            data_file.min_date = min_date
+            data_file.max_date = max_date
+            data_file.min_amount = min_amount
+            data_file.max_amount = max_amount
+            data_file.save()
+            
+            # Create processing job to trigger analysis
+            self._create_processing_job(data_file)
+            
+            return {'success': True}
+            
+        except Exception as e:
+            logger.error(f"Error processing CSV file: {e}")
+            data_file.status = 'FAILED'
+            data_file.error_message = str(e)
+            data_file.processed_at = timezone.now()
+            data_file.save()
+            return {'success': False, 'error': str(e)}
+    
+    def _create_posting_from_row(self, row, data_file):
+        """Create SAPGLPosting from CSV row"""
+        try:
+            # Map CSV columns to model fields
+            posting = SAPGLPosting(
+                data_file=data_file,  # Associate with the uploaded file
+                document_number=row.get('Document', ''),
+                document_type=row.get('Document type', ''),
+                amount_local_currency=Decimal(row.get('Amount in Local Currency', '0').replace(',', '')),
+                local_currency=row.get('Local Currency', 'SAR'),
+                gl_account=row.get('G/L Account', ''),
+                profit_center=row.get('Profit Center', ''),
+                user_name=row.get('User Name', ''),
+                fiscal_year=int(row.get('Fiscal Year', '2025')),
+                posting_period=int(row.get('Posting period', '1')),
+                text=row.get('Text', ''),
+                segment=row.get('Segment', ''),
+                clearing_document=row.get('Clearing Document', ''),
+                offsetting_account=row.get('Offsetting', ''),
+                invoice_reference=row.get('Invoice Reference', ''),
+                sales_document=row.get('Sales Document', ''),
+                assignment=row.get('Assignment', ''),
+                year_month=row.get('Year/Month', '')
+            )
+            
+            # Parse dates
+            posting_date_str = row.get('Posting Date', '')
+            if posting_date_str:
+                try:
+                    parsed_date = datetime.strptime(posting_date_str, '%m/%d/%Y').date()
+                    posting.posting_date = parsed_date
+                except:
+                    # Set a default date if parsing fails
+                    posting.posting_date = datetime.now().date()
+            else:
+                # Set a default date if no posting date provided
+                posting.posting_date = datetime.now().date()
+            
+            document_date_str = row.get('Document Date', '')
+            if document_date_str:
+                try:
+                    parsed_date = datetime.strptime(document_date_str, '%m/%d/%Y').date()
+                    posting.document_date = parsed_date
+                except:
+                    pass
+            
+            entry_date_str = row.get('Entry Date', '')
+            if entry_date_str:
+                try:
+                    parsed_date = datetime.strptime(entry_date_str, '%m/%d/%Y').date()
+                    posting.entry_date = parsed_date
+                except:
+                    pass
+            
+            return posting
+            
+        except Exception as e:
+            logger.error(f"Error creating posting from row: {e}")
+            return None
+    
+    def _create_processing_job(self, data_file):
+        """Create a processing job to trigger analysis"""
+        try:
+            # Calculate file hash for duplicate detection
+            import hashlib
+            file_hash = hashlib.sha256(f"{data_file.file_name}{data_file.file_size}{data_file.uploaded_at}".encode()).hexdigest()
+            
+            # Create processing job
+            processing_job = FileProcessingJob.objects.create(
+                data_file=data_file,
+                file_hash=file_hash,
+                run_anomalies=True,  # Enable anomaly detection by default
+                requested_anomalies=['duplicate', 'backdated', 'high_value', 'unusual_patterns'],
+                status='PENDING'
+            )
+            
+            # Trigger the analysis task
+            from .tasks import run_restructured_analysis
+            run_restructured_analysis.delay(str(processing_job.id))
+            
+            logger.info(f"Created processing job {processing_job.id} for file {data_file.file_name}")
+            
+        except Exception as e:
+            logger.error(f"Error creating processing job: {e}")
+            # Don't fail the upload if job creation fails
+            pass
+
+# ============================================================================
+# PROCESSING JOBS
+# ============================================================================
+
+class FileProcessingJobViewSet(viewsets.ReadOnlyModelViewSet):
+    """ViewSet for file processing jobs"""
+    
+    queryset = FileProcessingJob.objects.all()
+    serializer_class = FileProcessingJobSerializer
+    
+    @action(detail=True, methods=['get'])
+    def status(self, request, pk=None):
+        """Get processing job status"""
+        try:
+            job = self.get_object()
+            return Response({
+                'job_id': str(job.id),
+                'status': job.status,
+                'started_at': job.started_at,
+                'completed_at': job.completed_at,
+                'processing_duration': job.processing_duration,
+                'error_message': job.error_message,
+                'analytics_results': job.analytics_results
+            })
+        except Exception as e:
+            logger.error(f"Error getting job status: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+# ============================================================================
+# ML MODEL TRAINING
+# ============================================================================
+
+class MLModelTrainingViewSet(viewsets.ModelViewSet):
+    """ViewSet for ML model training"""
+    
+    queryset = MLModelTraining.objects.all()
+    serializer_class = MLModelTrainingSerializer
+    
+    @action(detail=False, methods=['post'])
+    def train_models(self, request):
+        """Train ML models"""
+        try:
+            # Get the latest processing job or create a dummy one
+            latest_job = FileProcessingJob.objects.filter(status='COMPLETED').order_by('-created_at').first()
+            
+            if not latest_job:
+                return Response(
+                    {'error': 'No completed processing jobs found. Please upload and process a file first.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Trigger ML model training
+            from .tasks import train_ml_models
+            result = train_ml_models.delay(str(latest_job.id))
+            
+            return Response({
+                'message': 'ML model training started',
+                'status': 'PENDING',
+                'task_id': str(result.id),
+                'job_id': str(latest_job.id)
+            })
+        except Exception as e:
+            logger.error(f"Error training models: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def retrain_models(self, request):
+        """Retrain ML models"""
+        try:
+            # Get the latest processing job or create a dummy one
+            latest_job = FileProcessingJob.objects.filter(status='COMPLETED').order_by('-created_at').first()
+            
+            if not latest_job:
+                return Response(
+                    {'error': 'No completed processing jobs found. Please upload and process a file first.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Trigger ML model retraining
+            from .tasks import retrain_ml_models
+            result = retrain_ml_models.delay(str(latest_job.id))
+            
+            return Response({
+                'message': 'ML model retraining started',
+                'status': 'PENDING',
+                'task_id': str(result.id),
+                'job_id': str(latest_job.id)
+            })
+        except Exception as e:
+            logger.error(f"Error retraining models: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['get'])
+    def model_info(self, request):
+        """Get model information"""
+        try:
+            # Implementation for getting model info
+            return Response({
+                'models': [],
+                'latest_version': '1.0.0'
+            })
+        except Exception as e:
+            logger.error(f"Error getting model info: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def predict_anomalies(self, request):
+        """Predict anomalies"""
+        try:
+            # Implementation for predicting anomalies
+            return Response({
+                'predictions': [],
+                'status': 'completed'
+            })
+        except Exception as e:
+            logger.error(f"Error predicting anomalies: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=True, methods=['get'])
+    def status(self, request, pk=None):
+        """Get training status"""
+        try:
+            training = self.get_object()
+            return Response({
+                'training_id': str(training.id),
+                'status': training.status,
+                'started_at': training.started_at,
+                'completed_at': training.completed_at,
+                'training_duration': training.training_duration,
+                'error_message': training.error_message
+            })
+        except Exception as e:
+            logger.error(f"Error getting training status: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def train_holiday_model(self, request):
+        """Train holiday analysis ML model specifically"""
+        try:
+            # Get the latest processing job or create a dummy one
+            latest_job = FileProcessingJob.objects.filter(status='COMPLETED').order_by('-created_at').first()
+            
+            if not latest_job:
+                return Response(
+                    {'error': 'No completed processing jobs found. Please upload and process a file first.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get transactions for training
+            from .models import SAPGLPosting
+            transactions = list(SAPGLPosting.objects.filter(data_file=latest_job.data_file))
+            
+            if not transactions:
+                return Response(
+                    {'error': 'No transactions found for training.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create training session
+            training_session = MLModelTraining.objects.create(
+                session_name=f"Holiday Model Training {latest_job.id}",
+                description="Holiday analysis ML model training session",
+                model_type='holiday',
+                training_data_size=len(transactions),
+                training_data_date_range={
+                    'min_date': min(t.posting_date for t in transactions if t.posting_date).isoformat(),
+                    'max_date': max(t.posting_date for t in transactions if t.posting_date).isoformat()
+                },
+                status='TRAINING',
+                started_at=timezone.now()
+            )
+            
+            # Train holiday model
+            from .specialized_analysis_models import AnalysisModelManager
+            model_manager = AnalysisModelManager()
+            
+            # Generate holiday labels using holiday_utils
+            labels = []
+            try:
+                from .holiday_utils import is_holiday
+                # Default to Saudi Arabian holidays
+                country_code = 'saudiarabian'
+                for t in transactions:
+                    if t.posting_date:
+                        is_holiday_posting = is_holiday(country_code, t.posting_date)
+                        labels.append(1 if is_holiday_posting else 0)
+                    else:
+                        labels.append(0)
+                logger.info(f"Generated {sum(labels)} holiday labels from {len(transactions)} transactions")
+            except Exception as e:
+                logger.warning(f"Could not generate holiday labels using holiday_utils: {e}")
+                # Fallback to simple heuristic
+                for t in transactions:
+                    is_anomaly = (t.posting_date and t.posting_date.weekday() >= 5)  # Weekend
+                    labels.append(1 if is_anomaly else 0)
+                logger.info(f"Generated {sum(labels)} holiday labels using fallback heuristic")
+            
+            # Train the holiday model
+            success = model_manager.ensure_model_trained('holiday', transactions, labels)
+            
+            # Update training session
+            training_session.status = 'COMPLETED' if success else 'FAILED'
+            training_session.completed_at = timezone.now()
+            training_session.training_duration = (timezone.now() - training_session.started_at).total_seconds()
+            
+            if success:
+                # Get model performance metrics
+                holiday_model = model_manager.get_model('holiday')
+                if holiday_model and holiday_model.is_trained:
+                    training_session.performance_metrics = {
+                        'model_type': 'holiday',
+                        'training_success': True,
+                        'feature_count': 12,  # Standard feature count for holiday model
+                        'positive_cases': sum(labels),
+                        'total_cases': len(transactions),
+                        'positive_rate': (sum(labels) / len(transactions)) * 100 if transactions else 0
+                    }
+                training_session.save()
+                
+                return Response({
+                    'message': 'Holiday model training completed successfully',
+                    'status': 'COMPLETED',
+                    'training_id': str(training_session.id),
+                    'job_id': str(latest_job.id),
+                    'training_duration': training_session.training_duration,
+                    'performance_metrics': training_session.performance_metrics
+                })
+            else:
+                training_session.error_message = "Failed to train holiday model"
+                training_session.save()
+                
+                return Response({
+                    'error': 'Failed to train holiday model',
+                    'status': 'FAILED',
+                    'training_id': str(training_session.id)
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+        except Exception as e:
+            logger.error(f"Error training holiday model: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+# ============================================================================
+# DEBUG AND MONITORING
+# ============================================================================
+
+class CeleryDebugViewSet(viewsets.ViewSet):
+    """ViewSet for Celery debugging and monitoring"""
+    
+    @action(detail=False, methods=['get'])
+    def health_check(self, request):
+        """Health check for Celery workers"""
+        try:
+            return Response({
+                'status': 'healthy',
+                'timestamp': timezone.now()
+            })
+        except Exception as e:
+            logger.error(f"Error in health check: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['get'])
+    def list_queued_tasks(self, request):
+        """List all queued tasks"""
+        try:
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            queued_tasks = []
+            
+            # Get all queued task keys
+            pattern = "queued_task:*"
+            keys = r.keys(pattern)
+            
+            for key in keys:
+                task_data = r.get(key)
+                if task_data:
+                    task_info = json.loads(task_data)
+                    queued_tasks.append(task_info)
+            
+            return Response({
+                'status': 'success',
+                'queued_tasks': queued_tasks,
+                'count': len(queued_tasks)
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'])
+    def execute_queued_task(self, request):
+        """Execute a specific queued task"""
+        try:
+            job_id = request.data.get('job_id')
+            if not job_id:
+                return Response({
+                    'status': 'error',
+                    'message': 'job_id is required'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            queue_key = f"queued_task:{job_id}"
+            
+            # Get task info from Redis
+            task_data = r.get(queue_key)
+            if not task_data:
+                return Response({
+                    'status': 'error',
+                    'message': f'No queued task found for job_id: {job_id}'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            task_info = json.loads(task_data)
+            
+            # Execute the task
+            from .tasks import run_restructured_analysis
+            result = run_restructured_analysis.delay(job_id)
+            
+            # Remove from queue
+            r.delete(queue_key)
+            
+            # Update job status
+            from .models import FileProcessingJob
+            try:
+                job = FileProcessingJob.objects.get(id=job_id)
+                job.status = 'PROCESSING'
+                job.save()
+            except FileProcessingJob.DoesNotExist:
+                pass
+            
+            return Response({
+                'status': 'success',
+                'message': f'Task executed for job_id: {job_id}',
+                'task_id': result.id
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'])
+    def execute_all_queued_tasks(self, request):
+        """Execute all queued tasks"""
+        try:
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            pattern = "queued_task:*"
+            keys = r.keys(pattern)
+            
+            executed_tasks = []
+            
+            for key in keys:
+                task_data = r.get(key)
+                if task_data:
+                    task_info = json.loads(task_data)
+                    job_id = task_info['job_id']
+                    
+                    # Execute the task
+                    from .tasks import run_restructured_analysis
+                    result = run_restructured_analysis.delay(job_id)
+                    
+                    # Remove from queue
+                    r.delete(key)
+                    
+                    # Update job status
+                    from .models import FileProcessingJob
+                    try:
+                        job = FileProcessingJob.objects.get(id=job_id)
+                        job.status = 'PROCESSING'
+                        job.save()
+                    except FileProcessingJob.DoesNotExist:
+                        pass
+                    
+                    executed_tasks.append({
+                        'job_id': job_id,
+                        'task_id': result.id
+                    })
+            
+            return Response({
+                'status': 'success',
+                'message': f'Executed {len(executed_tasks)} tasks',
+                'executed_tasks': executed_tasks
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# ============================================================================
+"""
+Clean views file with only the views used in the current URLs
+"""
+
+from rest_framework import viewsets, status, generics, serializers
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.parsers import MultiPartParser, FormParser
+from django.db import transaction, models
+from django.db.models import Sum, Count, Avg, Min, Max, Q
+from django.utils import timezone
+import pandas as pd
+import csv
+import io
+import logging
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from rest_framework.pagination import PageNumberPagination
+from django.db.models import Q
+from rest_framework.views import APIView
+
+from .models import (
+    SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, 
+    RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, 
+    ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult, HolidayAnalysisResult, 
+    GeneralAnalysisResult, AIRiskAssessment, RiskPattern, AnomalyCluster, 
+    AIRiskRecommendation, RiskTrend, ModelPerformance, ProcessingJobTracker,
+    ManualEntryAnalysisResult
+)
+from .serializers import (
+    DataFileSerializer, DataFileUploadSerializer, DataUploadResponseSerializer,
+    FileProcessingJobSerializer, MLModelTrainingSerializer, TargetedAnomalyUploadSerializer,
+    SAPGLPostingListSerializer, ClosingEntriesListSerializer, BackdatedEntriesListSerializer,
+    UnusualDaysListSerializer,HolidayListSerializer, DuplicateListSerializer, UserListSerializer
+)
+from .tasks import run_restructured_analysis
+from .excel_export import AuditExcelExporter
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# UPLOAD AND FILE MANAGEMENT
+# ============================================================================
+
+class DataFileViewSet(viewsets.ModelViewSet):
+    """ViewSet for uploaded data files"""
+    
+    queryset = DataFile.objects.all()
+    serializer_class = DataFileSerializer
+    parser_classes = (MultiPartParser, FormParser)
+    
+    @action(detail=False, methods=['post'])
+    def upload(self, request):
+        """Upload and process CSV file"""
+        try:
+            file_obj = request.FILES.get('file')
+            if not file_obj:
+                return Response(
+                    {'error': 'No file provided'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get additional fields from request data
+            engagement_id = request.data.get('engagement_id', '')
+            client_name = request.data.get('client_name', '')
+            company_name = request.data.get('company_name', '')
+            fiscal_year = request.data.get('fiscal_year', 2025)
+            audit_start_date = request.data.get('audit_start_date')
+            audit_end_date = request.data.get('audit_end_date')
+            
+            # Validate file type
+            if not file_obj.name.endswith('.csv'):
+                return Response(
+                    {'error': 'Only CSV files are supported'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create DataFile record with new fields
+            data_file = DataFile.objects.create(
+                file_name=file_obj.name,
+                file_size=file_obj.size,
+                engagement_id=engagement_id,
+                client_name=client_name,
+                company_name=company_name,
+                fiscal_year=fiscal_year,
+                audit_start_date=audit_start_date,
+                audit_end_date=audit_end_date,
+                status='PENDING'
+            )
+            
+            # Process file in background (for now, process synchronously)
+            result = self._process_csv_file(data_file, file_obj)
+            
+            if result['success']:
+                return Response(
+                    DataUploadResponseSerializer(data_file).data,
+                    status=status.HTTP_201_CREATED
+                )
+            else:
+                return Response(
+                    {'error': result['error']}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+        except Exception as e:
+            logger.error(f"Error uploading file: {e}")
+            return Response(
+                {'error': str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    def _process_csv_file(self, data_file, file_obj):
+        """Process uploaded CSV file"""
+        try:
+            # Update status
+            data_file.status = 'PROCESSING'
+            data_file.save()
+            
+            # Read CSV file
+            content = file_obj.read().decode('utf-8')
+            csv_reader = csv.DictReader(io.StringIO(content))
+            
+            # Process rows
+            processed_count = 0
+            failed_count = 0
+            min_date = None
+            max_date = None
+            min_amount = None
+            max_amount = None
+            
+            # Use bulk_create for better performance
+            postings_to_create = []
+            
+            for row in csv_reader:
+                try:
+                    # Map CSV columns to model fields
+                    posting = self._create_posting_from_row(row, data_file)
+                    if posting:
+                        postings_to_create.append(posting)
+                        processed_count += 1
+                        
+                        # Update date and amount ranges
+                        if posting.posting_date:
+                            if min_date is None or posting.posting_date < min_date:
+                                min_date = posting.posting_date
+                            if max_date is None or posting.posting_date > max_date:
+                                max_date = posting.posting_date
+                        
+                        if min_amount is None or posting.amount_local_currency < min_amount:
+                            min_amount = posting.amount_local_currency
+                        if max_amount is None or posting.amount_local_currency > max_amount:
+                            max_amount = posting.amount_local_currency
+                except Exception as e:
+                    logger.error(f"Error processing row: {e}")
+                    failed_count += 1
+            
+            # Bulk create all postings
+            if postings_to_create:
+                SAPGLPosting.objects.bulk_create(postings_to_create, batch_size=1000)
+                logger.info(f"Successfully saved {len(postings_to_create)} postings to database")
+            
+            # Update DataFile record
+            data_file.total_records = processed_count + failed_count
+            data_file.processed_records = processed_count
+            data_file.failed_records = failed_count
+            data_file.status = 'COMPLETED' if failed_count == 0 else 'PARTIAL'
+            data_file.processed_at = timezone.now()
+            data_file.min_date = min_date
+            data_file.max_date = max_date
+            data_file.min_amount = min_amount
+            data_file.max_amount = max_amount
+            data_file.save()
+            
+            # Create processing job to trigger analysis
+            self._create_processing_job(data_file)
+            
+            return {'success': True}
+            
+        except Exception as e:
+            logger.error(f"Error processing CSV file: {e}")
+            data_file.status = 'FAILED'
+            data_file.error_message = str(e)
+            data_file.processed_at = timezone.now()
+            data_file.save()
+            return {'success': False, 'error': str(e)}
+    
+    def _create_posting_from_row(self, row, data_file):
+        """Create SAPGLPosting from CSV row"""
+        try:
+            # Map CSV columns to model fields
+            posting = SAPGLPosting(
+                data_file=data_file,  # Associate with the uploaded file
+                document_number=row.get('Document', ''),
+                document_type=row.get('Document type', ''),
+                amount_local_currency=Decimal(row.get('Amount in Local Currency', '0').replace(',', '')),
+                local_currency=row.get('Local Currency', 'SAR'),
+                gl_account=row.get('G/L Account', ''),
+                profit_center=row.get('Profit Center', ''),
+                user_name=row.get('User Name', ''),
+                fiscal_year=int(row.get('Fiscal Year', '2025')),
+                posting_period=int(row.get('Posting period', '1')),
+                text=row.get('Text', ''),
+                segment=row.get('Segment', ''),
+                clearing_document=row.get('Clearing Document', ''),
+                offsetting_account=row.get('Offsetting', ''),
+                invoice_reference=row.get('Invoice Reference', ''),
+                sales_document=row.get('Sales Document', ''),
+                assignment=row.get('Assignment', ''),
+                year_month=row.get('Year/Month', '')
+            )
+            
+            # Parse dates
+            posting_date_str = row.get('Posting Date', '')
+            if posting_date_str:
+                try:
+                    parsed_date = datetime.strptime(posting_date_str, '%m/%d/%Y').date()
+                    posting.posting_date = parsed_date
+                except:
+                    # Set a default date if parsing fails
+                    posting.posting_date = datetime.now().date()
+            else:
+                # Set a default date if no posting date provided
+                posting.posting_date = datetime.now().date()
+            
+            document_date_str = row.get('Document Date', '')
+            if document_date_str:
+                try:
+                    parsed_date = datetime.strptime(document_date_str, '%m/%d/%Y').date()
+                    posting.document_date = parsed_date
+                except:
+                    pass
+            
+            entry_date_str = row.get('Entry Date', '')
+            if entry_date_str:
+                try:
+                    parsed_date = datetime.strptime(entry_date_str, '%m/%d/%Y').date()
+                    posting.entry_date = parsed_date
+                except:
+                    pass
+            
+            return posting
+            
+        except Exception as e:
+            logger.error(f"Error creating posting from row: {e}")
+            return None
+    
+    def _create_processing_job(self, data_file):
+        """Create a processing job to trigger analysis"""
+        try:
+            # Calculate file hash for duplicate detection
+            import hashlib
+            file_hash = hashlib.sha256(f"{data_file.file_name}{data_file.file_size}{data_file.uploaded_at}".encode()).hexdigest()
+            
+            # Create processing job
+            processing_job = FileProcessingJob.objects.create(
+                data_file=data_file,
+                file_hash=file_hash,
+                run_anomalies=True,  # Enable anomaly detection by default
+                requested_anomalies=['duplicate', 'backdated', 'high_value', 'unusual_patterns'],
+                status='PENDING'
+            )
+            
+            # Trigger the analysis task
+            from .tasks import run_restructured_analysis
+            run_restructured_analysis.delay(str(processing_job.id))
+            
+            logger.info(f"Created processing job {processing_job.id} for file {data_file.file_name}")
+            
+        except Exception as e:
+            logger.error(f"Error creating processing job: {e}")
+            # Don't fail the upload if job creation fails
+            pass
+
+# ============================================================================
+# PROCESSING JOBS
+# ============================================================================
+
+class FileProcessingJobViewSet(viewsets.ReadOnlyModelViewSet):
+    """ViewSet for file processing jobs"""
+    
+    queryset = FileProcessingJob.objects.all()
+    serializer_class = FileProcessingJobSerializer
+    
+    @action(detail=True, methods=['get'])
+    def status(self, request, pk=None):
+        """Get processing job status"""
+        try:
+            job = self.get_object()
+            return Response({
+                'job_id': str(job.id),
+                'status': job.status,
+                'started_at': job.started_at,
+                'completed_at': job.completed_at,
+                'processing_duration': job.processing_duration,
+                'error_message': job.error_message,
+                'analytics_results': job.analytics_results
+            })
+        except Exception as e:
+            logger.error(f"Error getting job status: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+# ============================================================================
+# ML MODEL TRAINING
+# ============================================================================
+
+class MLModelTrainingViewSet(viewsets.ModelViewSet):
+    """ViewSet for ML model training"""
+    
+    queryset = MLModelTraining.objects.all()
+    serializer_class = MLModelTrainingSerializer
+    
+    @action(detail=False, methods=['post'])
+    def train_models(self, request):
+        """Train ML models"""
+        try:
+            # Get the latest processing job or create a dummy one
+            latest_job = FileProcessingJob.objects.filter(status='COMPLETED').order_by('-created_at').first()
+            
+            if not latest_job:
+                return Response(
+                    {'error': 'No completed processing jobs found. Please upload and process a file first.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Trigger ML model training
+            from .tasks import train_ml_models
+            result = train_ml_models.delay(str(latest_job.id))
+            
+            return Response({
+                'message': 'ML model training started',
+                'status': 'PENDING',
+                'task_id': str(result.id),
+                'job_id': str(latest_job.id)
+            })
+        except Exception as e:
+            logger.error(f"Error training models: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def retrain_models(self, request):
+        """Retrain ML models"""
+        try:
+            # Get the latest processing job or create a dummy one
+            latest_job = FileProcessingJob.objects.filter(status='COMPLETED').order_by('-created_at').first()
+            
+            if not latest_job:
+                return Response(
+                    {'error': 'No completed processing jobs found. Please upload and process a file first.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Trigger ML model retraining
+            from .tasks import retrain_ml_models
+            result = retrain_ml_models.delay(str(latest_job.id))
+            
+            return Response({
+                'message': 'ML model retraining started',
+                'status': 'PENDING',
+                'task_id': str(result.id),
+                'job_id': str(latest_job.id)
+            })
+        except Exception as e:
+            logger.error(f"Error retraining models: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['get'])
+    def model_info(self, request):
+        """Get model information"""
+        try:
+            # Implementation for getting model info
+            return Response({
+                'models': [],
+                'latest_version': '1.0.0'
+            })
+        except Exception as e:
+            logger.error(f"Error getting model info: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def predict_anomalies(self, request):
+        """Predict anomalies"""
+        try:
+            # Implementation for predicting anomalies
+            return Response({
+                'predictions': [],
+                'status': 'completed'
+            })
+        except Exception as e:
+            logger.error(f"Error predicting anomalies: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=True, methods=['get'])
+    def status(self, request, pk=None):
+        """Get training status"""
+        try:
+            training = self.get_object()
+            return Response({
+                'training_id': str(training.id),
+                'status': training.status,
+                'started_at': training.started_at,
+                'completed_at': training.completed_at,
+                'training_duration': training.training_duration,
+                'error_message': training.error_message
+            })
+        except Exception as e:
+            logger.error(f"Error getting training status: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def train_holiday_model(self, request):
+        """Train holiday analysis ML model specifically"""
+        try:
+            # Get the latest processing job or create a dummy one
+            latest_job = FileProcessingJob.objects.filter(status='COMPLETED').order_by('-created_at').first()
+            
+            if not latest_job:
+                return Response(
+                    {'error': 'No completed processing jobs found. Please upload and process a file first.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get transactions for training
+            from .models import SAPGLPosting
+            transactions = list(SAPGLPosting.objects.filter(data_file=latest_job.data_file))
+            
+            if not transactions:
+                return Response(
+                    {'error': 'No transactions found for training.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create training session
+            training_session = MLModelTraining.objects.create(
+                session_name=f"Holiday Model Training {latest_job.id}",
+                description="Holiday analysis ML model training session",
+                model_type='holiday',
+                training_data_size=len(transactions),
+                training_data_date_range={
+                    'min_date': min(t.posting_date for t in transactions if t.posting_date).isoformat(),
+                    'max_date': max(t.posting_date for t in transactions if t.posting_date).isoformat()
+                },
+                status='TRAINING',
+                started_at=timezone.now()
+            )
+            
+            # Train holiday model
+            from .specialized_analysis_models import AnalysisModelManager
+            model_manager = AnalysisModelManager()
+            
+            # Generate holiday labels using holiday_utils
+            labels = []
+            try:
+                from .holiday_utils import is_holiday
+                # Default to Saudi Arabian holidays
+                country_code = 'saudiarabian'
+                for t in transactions:
+                    if t.posting_date:
+                        is_holiday_posting = is_holiday(country_code, t.posting_date)
+                        labels.append(1 if is_holiday_posting else 0)
+                    else:
+                        labels.append(0)
+                logger.info(f"Generated {sum(labels)} holiday labels from {len(transactions)} transactions")
+            except Exception as e:
+                logger.warning(f"Could not generate holiday labels using holiday_utils: {e}")
+                # Fallback to simple heuristic
+                for t in transactions:
+                    is_anomaly = (t.posting_date and t.posting_date.weekday() >= 5)  # Weekend
+                    labels.append(1 if is_anomaly else 0)
+                logger.info(f"Generated {sum(labels)} holiday labels using fallback heuristic")
+            
+            # Train the holiday model
+            success = model_manager.ensure_model_trained('holiday', transactions, labels)
+            
+            # Update training session
+            training_session.status = 'COMPLETED' if success else 'FAILED'
+            training_session.completed_at = timezone.now()
+            training_session.training_duration = (timezone.now() - training_session.started_at).total_seconds()
+            
+            if success:
+                # Get model performance metrics
+                holiday_model = model_manager.get_model('holiday')
+                if holiday_model and holiday_model.is_trained:
+                    training_session.performance_metrics = {
+                        'model_type': 'holiday',
+                        'training_success': True,
+                        'feature_count': 12,  # Standard feature count for holiday model
+                        'positive_cases': sum(labels),
+                        'total_cases': len(transactions),
+                        'positive_rate': (sum(labels) / len(transactions)) * 100 if transactions else 0
+                    }
+                training_session.save()
+                
+                return Response({
+                    'message': 'Holiday model training completed successfully',
+                    'status': 'COMPLETED',
+                    'training_id': str(training_session.id),
+                    'job_id': str(latest_job.id),
+                    'training_duration': training_session.training_duration,
+                    'performance_metrics': training_session.performance_metrics
+                })
+            else:
+                training_session.error_message = "Failed to train holiday model"
+                training_session.save()
+                
+                return Response({
+                    'error': 'Failed to train holiday model',
+                    'status': 'FAILED',
+                    'training_id': str(training_session.id)
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+        except Exception as e:
+            logger.error(f"Error training holiday model: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+# ============================================================================
+# DEBUG AND MONITORING
+# ============================================================================
+
+class CeleryDebugViewSet(viewsets.ViewSet):
+    """ViewSet for Celery debugging and monitoring"""
+    
+    @action(detail=False, methods=['get'])
+    def health_check(self, request):
+        """Health check for Celery workers"""
+        try:
+            return Response({
+                'status': 'healthy',
+                'timestamp': timezone.now()
+            })
+        except Exception as e:
+            logger.error(f"Error in health check: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['get'])
+    def list_queued_tasks(self, request):
+        """List all queued tasks"""
+        try:
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            queued_tasks = []
+            
+            # Get all queued task keys
+            pattern = "queued_task:*"
+            keys = r.keys(pattern)
+            
+            for key in keys:
+                task_data = r.get(key)
+                if task_data:
+                    task_info = json.loads(task_data)
+                    queued_tasks.append(task_info)
+            
+            return Response({
+                'status': 'success',
+                'queued_tasks': queued_tasks,
+                'count': len(queued_tasks)
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'])
+    def execute_queued_task(self, request):
+        """Execute a specific queued task"""
+        try:
+            job_id = request.data.get('job_id')
+            if not job_id:
+                return Response({
+                    'status': 'error',
+                    'message': 'job_id is required'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            queue_key = f"queued_task:{job_id}"
+            
+            # Get task info from Redis
+            task_data = r.get(queue_key)
+            if not task_data:
+                return Response({
+                    'status': 'error',
+                    'message': f'No queued task found for job_id: {job_id}'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            task_info = json.loads(task_data)
+            
+            # Execute the task
+            from .tasks import run_restructured_analysis
+            result = run_restructured_analysis.delay(job_id)
+            
+            # Remove from queue
+            r.delete(queue_key)
+            
+            # Update job status
+            from .models import FileProcessingJob
+            try:
+                job = FileProcessingJob.objects.get(id=job_id)
+                job.status = 'PROCESSING'
+                job.save()
+            except FileProcessingJob.DoesNotExist:
+                pass
+            
+            return Response({
+                'status': 'success',
+                'message': f'Task executed for job_id: {job_id}',
+                'task_id': result.id
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'])
+    def execute_all_queued_tasks(self, request):
+        """Execute all queued tasks"""
+        try:
+            import json
+            import redis
+            from django.conf import settings
+            
+            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+            pattern = "queued_task:*"
+            keys = r.keys(pattern)
+            
+            executed_tasks = []
+            
+            for key in keys:
+                task_data = r.get(key)
+                if task_data:
+                    task_info = json.loads(task_data)
+                    job_id = task_info['job_id']
+                    
+                    # Execute the task
+                    from .tasks import run_restructured_analysis
+                    result = run_restructured_analysis.delay(job_id)
+                    
+                    # Remove from queue
+                    r.delete(key)
+                    
+                    # Update job status
+                    from .models import FileProcessingJob
+                    try:
+                        job = FileProcessingJob.objects.get(id=job_id)
+                        job.status = 'PROCESSING'
+                        job.save()
+                    except FileProcessingJob.DoesNotExist:
+                        pass
+                    
+                    executed_tasks.append({
+                        'job_id': job_id,
+                        'task_id': result.id
+                    })
+            
+            return Response({
+                'status': 'success',
+                'message': f'Executed {len(executed_tasks)} tasks',
+                'executed_tasks': executed_tasks
+            })
+        except Exception as e:
+            return Response({
+                'status': 'error',
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# ============================================================================
+"""
+Clean views file with only the views used in the current URLs
+"""
+
+from rest_framework import viewsets, status, generics, serializers
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.parsers import MultiPartParser, FormParser
+from django.db import transaction, models
+from django.db.models import Sum, Count, Avg, Min, Max, Q
+from django.utils import timezone
+import pandas as pd
+import csv
+import io
+import logging
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from rest_framework.pagination import PageNumberPagination
+from django.db.models import Q
+from rest_framework.views import APIView
+
+from .models import (
+    SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, 
+    RiskScoringDocument, DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, 
+    ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult, HolidayAnalysisResult, 
+    GeneralAnalysisResult, AIRiskAssessment, RiskPattern, AnomalyCluster, 
+    AIRiskRecommendation, RiskTrend, ModelPerformance, ProcessingJobTracker,
+    ManualEntryAnalysisResult
 )
 from .serializers import (
     DataFileSerializer, DataFileUploadSerializer, DataUploadResponseSerializer,
@@ -1131,30 +3223,32 @@ class FileListingAPIView(generics.GenericAPIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+
 # ============================================================================
 # ANALYSIS STATISTICS VIEWS
 # ============================================================================
 
 class FileAnalysisStatisticsView(generics.GenericAPIView):
     """
-    Enhanced view for retrieving comprehensive file analysis statistics and chart data
+    Comprehensive view for retrieving file analysis statistics from all available analysis data
     
     This view provides:
-    - Overall analysis statistics from the new data structure
-    - Risk analysis data and distributions
-    - Chart data for visualizations
-    - No listing functionality - only statistics and chart data
+    - Complete file information and metadata
+    - Statistics from all available analysis results (including AI assessments)
+    - Comprehensive aggregated metrics and risk assessments
+    - Processing job status and progress tracking
+    - Unified data structure for frontend consumption
     """
     
     def get(self, request, file_id):
         """
-        Get comprehensive overall analysis statistics and chart data for a specific file
+        Get simple statistics from all available analysis data for a specific file
         
         Args:
             file_id (str): UUID of the DataFile to get analysis for
             
         Returns:
-            JSON response with comprehensive statistics and chart data
+            JSON response with simple statistics from all analysis data
         """
         try:
             # Validate file exists
@@ -1164,72 +3258,24 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                 return Response(
                     {
                         'error': f'File with ID {file_id} not found',
-                        'error_code': 'FILE_NOT_FOUND',
-                        'suggestions': ['Verify the file ID is correct', 'Check if the file has been uploaded']
+                        'error_code': 'FILE_NOT_FOUND'
                     },
                     status=status.HTTP_404_NOT_FOUND
                 )
-            except Exception as e:
-                logger.error(f"Database error retrieving file {file_id}: {e}")
-                return Response(
-                    {
-                        'error': 'Database error occurred while retrieving file',
-                        'error_code': 'DATABASE_ERROR',
-                        'details': str(e)
-                    },
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
             
-            # Get the latest overall analysis result for this file
-            overall_analysis = OverallAnalysisResult.objects.filter(
-                data_file=data_file,
-                status='COMPLETED'
-            ).order_by('-analysis_date').first()
+            # Get all available analysis results for this file
+            analysis_results = self._get_all_analysis_results(data_file)
             
-            # Get the latest risk scoring document for this file
-            risk_document = RiskScoringDocument.objects.filter(
-                data_file=data_file,
-                status='COMPLETED'
-            ).order_by('-document_date').first()
+            # Get basic transaction statistics from SAPGLPosting data
+            transaction_stats = self._get_transaction_statistics(data_file)
             
-            # Get the latest general analysis result for this file
-            general_analysis = GeneralAnalysisResult.objects.filter(
-                data_file=data_file,
-                status='COMPLETED'
-            ).order_by('-analysis_date').first()
+            # Get processing job information
+            processing_info = self._get_processing_job_info(data_file)
             
-            # Get all specific analysis results
-            duplicate_analysis = DuplicateAnalysisResult.objects.filter(
-                data_file=data_file,
-                status='COMPLETED'
-            ).order_by('-analysis_date').first()
+            # Get AI risk assessment if available
+            ai_risk_info = self._get_ai_risk_assessment(data_file)
             
-            backdated_analysis = BackdatedAnalysisResult.objects.filter(
-                data_file=data_file,
-                status='COMPLETED'
-            ).order_by('-analysis_date').first()
-            
-            user_analysis = UserAnalysisResult.objects.filter(
-                data_file=data_file,
-                status='COMPLETED'
-            ).order_by('-analysis_date').first()
-            
-            unusual_days_analysis = UnusualDaysAnalysisResult.objects.filter(
-                data_file=data_file,
-                status='COMPLETED'
-            ).order_by('-analysis_date').first()
-            
-            closing_entries_analysis = ClosingEntriesAnalysisResult.objects.filter(
-                data_file=data_file,
-                status='COMPLETED'
-            ).order_by('-analysis_date').first()
-            
-            holiday_analysis = HolidayAnalysisResult.objects.filter(
-                data_file=data_file,
-                status='COMPLETED'
-            ).order_by('-analysis_date').first()
-            
-            # Prepare response data structure
+            # Prepare comprehensive response
             response_data = {
                 'file_info': {
                     'file_id': str(data_file.id),
@@ -1238,376 +3284,46 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                     'client_name': data_file.client_name,
                     'company_name': data_file.company_name,
                     'fiscal_year': data_file.fiscal_year,
-                    'uploaded_at': data_file.uploaded_at,
-                    'processed_at': data_file.processed_at,
+                    'audit_start_date': data_file.audit_start_date.isoformat() if data_file.audit_start_date else None,
+                    'audit_end_date': data_file.audit_end_date.isoformat() if data_file.audit_end_date else None,
+                    'uploaded_at': data_file.uploaded_at.isoformat(),
+                    'processed_at': data_file.processed_at.isoformat() if data_file.processed_at else None,
                     'total_records': data_file.total_records,
                     'processed_records': data_file.processed_records,
                     'failed_records': data_file.failed_records,
                     'file_status': data_file.status,
-                    'processing_success_rate': (data_file.processed_records / data_file.total_records * 100) if data_file.total_records > 0 else 0
+                    'min_date': data_file.min_date.isoformat() if data_file.min_date else None,
+                    'max_date': data_file.max_date.isoformat() if data_file.max_date else None,
+                    'min_amount': float(data_file.min_amount) if data_file.min_amount else None,
+                    'max_amount': float(data_file.max_amount) if data_file.max_amount else None
                 },
-                'analysis_metadata': {
-                    'has_overall_analysis': bool(overall_analysis),
-                    'has_risk_analysis': bool(risk_document),
-                    'has_general_analysis': bool(general_analysis),
-                    'has_duplicate_analysis': bool(duplicate_analysis),
-                    'has_backdated_analysis': bool(backdated_analysis),
-                    'has_user_analysis': bool(user_analysis),
-                    'has_unusual_days_analysis': bool(unusual_days_analysis),
-                    'has_closing_entries_analysis': bool(closing_entries_analysis),
-                    'has_holiday_analysis': bool(holiday_analysis),
-                    'analysis_timestamp': timezone.now().isoformat(),
-                    'analysis_version': '3.0.0'
-                },
-                'overall_statistics': {},
-                'risk_statistics': {},
-                'general_statistics': {},
-                'anomaly_statistics': {},
-                'chart_data': {},
-                'summary_dashboard': {}
-            }
-            
-            # Overall Analysis Statistics
-            if overall_analysis:
-                response_data['overall_statistics'] = {
-                    'analysis_id': str(overall_analysis.id),
-                    'analysis_date': overall_analysis.analysis_date.isoformat(),
-                    'processing_duration': overall_analysis.processing_duration,
-                    'transaction_summary': overall_analysis.transaction_summary or {},
-                    'flag_summary': overall_analysis.flag_summary or {},
-                    'expense_analysis': overall_analysis.expense_analysis or {},
-                    'risk_assessment': overall_analysis.risk_assessment or {},
-                    'flagged_transactions_count': len(overall_analysis.flagged_transactions) if overall_analysis.flagged_transactions else 0
-                }
-            
-            # Risk Analysis Statistics
-            if risk_document:
-                response_data['risk_statistics'] = {
-                    'document_id': str(risk_document.id),
-                    'document_date': risk_document.document_date.isoformat(),
-                    'total_transactions': risk_document.total_transactions,
-                    'high_risk_transactions': risk_document.high_risk_transactions,
-                    'medium_risk_transactions': risk_document.medium_risk_transactions,
-                    'low_risk_transactions': risk_document.low_risk_transactions,
-                    'critical_risk_transactions': risk_document.critical_risk_transactions,
-                    'overall_risk_score': risk_document.overall_risk_score,
-                    'risk_distributions': risk_document.risk_distributions or {},
-                    'methodology_overview': risk_document.methodology_overview or {},
-                    'recommendations': risk_document.recommendations or {},
-                    'audit_implications': risk_document.audit_implications or {}
-                }
-            
-            # General Analysis Statistics
-            if general_analysis:
-                response_data['general_statistics'] = {
-                    'analysis_id': str(general_analysis.id),
-                    'analysis_date': general_analysis.analysis_date.isoformat(),
-                    'trial_balance_summary': general_analysis.trial_balance_summary or {},
-                    'gl_account_summaries_count': len(general_analysis.gl_account_summaries) if general_analysis.gl_account_summaries else 0,
-                    'user_summaries_count': len(general_analysis.user_summaries) if general_analysis.user_summaries else 0,
-                    'statistical_calculations': general_analysis.statistical_calculations or {}
-                }
-            
-            # Anomaly Statistics - Combine all anomaly types using unified structure
-            anomaly_stats = {
-                'duplicate_analysis': {},
-                'backdated_analysis': {},
-                'user_analysis': {},
-                'unusual_days_analysis': {},
-                'closing_entries_analysis': {},
-                'holiday_analysis': {},
-                'total_anomalies': 0,
-                'anomaly_types_detected': [],
-                'unified_anomaly_list': []
-            }
-            
-            # Duplicate Analysis - Using unified structure
-            if duplicate_analysis:
-                try:
-                    # Use new unified structure if available
-                    if hasattr(duplicate_analysis, 'anomaly_list') and duplicate_analysis.anomaly_list:
-                        anomaly_list = duplicate_analysis.anomaly_list
-                        duplicate_count = len(anomaly_list)
-                        total_amount = sum(anomaly.get('amount', 0) for anomaly in anomaly_list)
-                        risk_distribution = duplicate_analysis.risk_assessment.get('risk_distribution', {}) if duplicate_analysis.risk_assessment else {}
-                        
-                        # Add to unified anomaly list
-                        anomaly_stats['unified_anomaly_list'].extend(anomaly_list)
-                    else:
-                        # Fallback to legacy structure
-                        duplicate_count = duplicate_analysis.get_duplicate_count()
-                        total_amount = duplicate_analysis.get_total_amount()
-                        risk_distribution = duplicate_analysis.get_risk_distribution()
-                        anomaly_list = []
-                except Exception as e:
-                    logger.warning(f"Error getting duplicate analysis data: {e}")
-                    duplicate_count = 0
-                    total_amount = 0
-                    risk_distribution = {}
-                    anomaly_list = []
-                
-                anomaly_stats['duplicate_analysis'] = {
-                    'analysis_id': str(duplicate_analysis.id),
-                    'analysis_date': duplicate_analysis.analysis_date.isoformat(),
-                    'duplicate_count': duplicate_count,
-                    'total_amount': total_amount,
-                    'risk_distribution': risk_distribution,
-                    'analysis_summary': duplicate_analysis.analysis_summary or {},
-                    'anomaly_list': anomaly_list,
-                    'chart_data': duplicate_analysis.chart_data or {},
-                    'audit_recommendations': duplicate_analysis.audit_recommendations or {},
-                    'compliance_assessment': duplicate_analysis.compliance_assessment or {}
-                }
-                anomaly_stats['total_anomalies'] += duplicate_count
-                anomaly_stats['anomaly_types_detected'].append('duplicate')
-            
-            # Backdated Analysis
-            if backdated_analysis:
-                try:
-                    backdated_count = backdated_analysis.get_backdated_count()
-                    total_amount = backdated_analysis.get_total_amount()
-                    risk_distribution = backdated_analysis.get_risk_distribution()
-                except Exception as e:
-                    logger.warning(f"Error getting backdated analysis data: {e}")
-                    backdated_count = 0
-                    total_amount = 0
-                    risk_distribution = {}
-                
-                anomaly_stats['backdated_analysis'] = {
-                    'analysis_id': str(backdated_analysis.id),
-                    'analysis_date': backdated_analysis.analysis_date.isoformat(),
-                    'backdated_count': backdated_count,
-                    'total_amount': total_amount,
-                    'risk_distribution': risk_distribution,
-                    'analysis_summary': backdated_analysis.analysis_summary or {}
-                }
-                anomaly_stats['total_anomalies'] += backdated_count
-                anomaly_stats['anomaly_types_detected'].append('backdated')
-            
-            # User Analysis
-            if user_analysis:
-                try:
-                    anomalies_count = user_analysis.get_anomalies_count()
-                    total_users = user_analysis.get_total_users()
-                    total_transactions = user_analysis.get_total_transactions()
-                    high_risk_users_count = user_analysis.get_high_risk_users_count()
-                except Exception as e:
-                    logger.warning(f"Error getting user analysis data: {e}")
-                    anomalies_count = 0
-                    total_users = 0
-                    total_transactions = 0
-                    high_risk_users_count = 0
-                
-                anomaly_stats['user_analysis'] = {
-                    'analysis_id': str(user_analysis.id),
-                    'analysis_date': user_analysis.analysis_date.isoformat(),
-                    'total_users': total_users,
-                    'total_transactions': total_transactions,
-                    'anomalies_count': anomalies_count,
-                    'high_risk_users_count': high_risk_users_count,
-                    'analysis_summary': user_analysis.analysis_summary or {},
-                    'user_anomalies': user_analysis.user_anomalies or [],
-                    'user_risk_assessment': user_analysis.user_risk_assessment or {}
-                }
-                anomaly_stats['total_anomalies'] += anomalies_count
-                anomaly_stats['anomaly_types_detected'].append('user_anomaly')
-            
-            # Unusual Days Analysis
-            if unusual_days_analysis:
-                try:
-                    weekend_count = unusual_days_analysis.get_weekend_transactions_count()
-                    unusual_days_count = unusual_days_analysis.get_unusual_days_count()
-                except Exception as e:
-                    logger.warning(f"Error getting unusual days analysis data: {e}")
-                    weekend_count = 0
-                    unusual_days_count = 0
-                
-                anomaly_stats['unusual_days_analysis'] = {
-                    'analysis_id': str(unusual_days_analysis.id),
-                    'analysis_date': unusual_days_analysis.analysis_date.isoformat(),
-                    'weekend_transactions_count': weekend_count,
-                    'unusual_days_count': unusual_days_count,
-                    'analysis_summary': unusual_days_analysis.analysis_summary or {}
-                }
-                anomaly_stats['total_anomalies'] += weekend_count + unusual_days_count
-                anomaly_stats['anomaly_types_detected'].extend(['weekend_activity', 'unusual_days'])
-            
-            # Closing Entries Analysis
-            if closing_entries_analysis:
-                try:
-                    closing_count = closing_entries_analysis.get_closing_entries_count()
-                    post_close_count = closing_entries_analysis.get_post_close_entries_count()
-                except Exception as e:
-                    logger.warning(f"Error getting closing entries analysis data: {e}")
-                    closing_count = 0
-                    post_close_count = 0
-                
-                anomaly_stats['closing_entries_analysis'] = {
-                    'analysis_id': str(closing_entries_analysis.id),
-                    'analysis_date': closing_entries_analysis.analysis_date.isoformat(),
-                    'closing_entries_count': closing_count,
-                    'post_close_entries_count': post_close_count,
-                    'analysis_summary': closing_entries_analysis.analysis_summary or {}
-                }
-                anomaly_stats['total_anomalies'] += closing_count + post_close_count
-                anomaly_stats['anomaly_types_detected'].extend(['closing_entries', 'post_close_entries'])
-            
-            # Holiday Analysis
-            if holiday_analysis:
-                try:
-                    # Get data from analysis_summary first, then fallback to model methods
-                    analysis_summary = holiday_analysis.analysis_summary or {}
-                    
-                    # Extract holiday data from analysis_summary
-                    holiday_count = analysis_summary.get('holiday_transactions_count', 0)
-                    if holiday_count == 0:
-                        holiday_count = holiday_analysis.get_holiday_postings_count()
-                    
-                    holiday_percentage = analysis_summary.get('holiday_percentage', 0)
-                    if holiday_percentage == 0:
-                        holiday_percentage = holiday_analysis.get_holiday_percentage()
-                    
-                    # Count unique holidays from breakdown
-                    holiday_breakdown = analysis_summary.get('holiday_breakdown', [])
-                    unique_holidays = len([h for h in holiday_breakdown if h and len(h) > 1 and h[1] > 0])
-                    if unique_holidays == 0:
-                        unique_holidays = holiday_analysis.get_unique_holidays()
-                    
-                    overall_risk_score = holiday_analysis.get_overall_risk_score()
-                    
-                    # Calculate total holiday amount
-                    total_holiday_amount = analysis_summary.get('total_holiday_amount', 0)
-                    
-                except Exception as e:
-                    logger.warning(f"Error getting holiday analysis data: {e}")
-                    holiday_count = 0
-                    holiday_percentage = 0
-                    unique_holidays = 0
-                    overall_risk_score = 0
-                    total_holiday_amount = 0
-                
-                anomaly_stats['holiday_analysis'] = {
-                    'analysis_id': str(holiday_analysis.id),
-                    'analysis_date': holiday_analysis.analysis_date.isoformat(),
-                    'holiday_postings_count': holiday_count,
-                    'holiday_percentage': holiday_percentage,
-                    'unique_holidays': unique_holidays,
-                    'overall_risk_score': overall_risk_score,
-                    'total_holiday_amount': total_holiday_amount,
-                    'analysis_summary': holiday_analysis.analysis_summary or {}
-                }
-                anomaly_stats['total_anomalies'] += holiday_count
-                anomaly_stats['anomaly_types_detected'].append('holiday_posting')
-            
-            response_data['anomaly_statistics'] = anomaly_stats
-            
-            # Chart Data - Combine chart data from all analyses using unified structure
-            chart_data = {
-                'overall_charts': {},
-                'risk_charts': {},
-                'anomaly_charts': {},
-                'temporal_charts': {},
-                'user_charts': {},
-                'account_charts': {},
-                'unified_charts': {
-                    'amount_charts': {},
-                    'account_charts': {},
-                    'user_charts': {},
-                    'date_charts': {}
-                }
-            }
-            
-            # Overall Analysis Chart Data
-            if overall_analysis and overall_analysis.chart_data:
-                chart_data['overall_charts'] = overall_analysis.chart_data
-            
-            # Risk Analysis Chart Data
-            if risk_document and risk_document.risk_distributions:
-                chart_data['risk_charts'] = {
-                    'risk_distribution': risk_document.risk_distributions.get('distribution_chart', {}),
-                    'risk_levels': risk_document.risk_distributions.get('risk_levels_chart', {}),
-                    'risk_trends': risk_document.risk_distributions.get('risk_trends_chart', {})
-                }
-            
-            # Unified Chart Data from all analyses
-            all_analyses = [
-                ('duplicate', duplicate_analysis),
-                ('backdated', backdated_analysis),
-                ('user', user_analysis),
-                ('unusual_days', unusual_days_analysis),
-                ('closing_entries', closing_entries_analysis),
-                ('holiday', holiday_analysis)
-            ]
-            
-            for analysis_name, analysis in all_analyses:
-                if analysis and hasattr(analysis, 'chart_data') and analysis.chart_data:
-                    # Extract unified chart data
-                    if 'amount_charts' in analysis.chart_data:
-                        chart_data['unified_charts']['amount_charts'][f'{analysis_name}_amount'] = analysis.chart_data['amount_charts']
-                    if 'account_charts' in analysis.chart_data:
-                        chart_data['unified_charts']['account_charts'][f'{analysis_name}_account'] = analysis.chart_data['account_charts']
-                    if 'user_charts' in analysis.chart_data:
-                        chart_data['unified_charts']['user_charts'][f'{analysis_name}_user'] = analysis.chart_data['user_charts']
-                    if 'date_charts' in analysis.chart_data:
-                        chart_data['unified_charts']['date_charts'][f'{analysis_name}_date'] = analysis.chart_data['date_charts']
-                    
-                    # Legacy chart data for backward compatibility
-                    chart_data['anomaly_charts'][f'{analysis_name}_charts'] = analysis.chart_data
-            
-            # User Analysis Chart Data
-            if user_analysis and user_analysis.chart_data:
-                chart_data['user_charts'] = user_analysis.chart_data
-            
-            # General Analysis Chart Data
-            if general_analysis and general_analysis.chart_data:
-                chart_data['account_charts'] = general_analysis.chart_data
-            
-            response_data['chart_data'] = chart_data
-            
-            # Summary Dashboard - Key metrics for quick overview
-            overall_risk_score = risk_document.overall_risk_score if risk_document else 0
-            summary_dashboard = {
-                'total_transactions': data_file.total_records,
-                'total_anomalies': anomaly_stats['total_anomalies'],
-                'anomaly_percentage': (anomaly_stats['total_anomalies'] / data_file.total_records * 100) if data_file.total_records > 0 else 0,
-                'overall_risk_score': overall_risk_score,
-                'risk_level': self._get_risk_level(overall_risk_score),
+                'transaction_statistics': transaction_stats,
+                'processing_information': processing_info,
+                'ai_risk_assessment': ai_risk_info,
                 'analysis_coverage': {
-                    'overall_analysis': bool(overall_analysis),
-                    'risk_analysis': bool(risk_document),
-                    'duplicate_analysis': bool(duplicate_analysis),
-                    'backdated_analysis': bool(backdated_analysis),
-                    'user_analysis': bool(user_analysis),
-                    'unusual_days_analysis': bool(unusual_days_analysis),
-                    'closing_entries_analysis': bool(closing_entries_analysis),
-                    'holiday_analysis': bool(holiday_analysis)
+                    'total_analyses': len(analysis_results),
+                    'analysis_types': list(analysis_results.keys()),
+                    'has_overall_analysis': 'overall' in analysis_results,
+                    'has_risk_analysis': 'risk' in analysis_results,
+                    'has_general_analysis': 'general' in analysis_results,
+                    'has_duplicate_analysis': 'duplicate' in analysis_results,
+                    'has_backdated_analysis': 'backdated' in analysis_results,
+                    'has_user_analysis': 'user' in analysis_results,
+                    'has_unusual_days_analysis': 'unusual_days' in analysis_results,
+                    'has_closing_entries_analysis': 'closing_entries' in analysis_results,
+                    'has_holiday_analysis': 'holiday' in analysis_results,
+                    'has_ai_risk_assessment': 'ai_risk' in analysis_results,
+                    'has_manual_entry_analysis': 'manual_entry' in analysis_results
                 },
-                'key_metrics': {
-                    'duplicate_transactions': anomaly_stats['duplicate_analysis'].get('duplicate_count', 0),
-                    'backdated_transactions': anomaly_stats['backdated_analysis'].get('backdated_count', 0),
-                    'user_anomalies': anomaly_stats['user_analysis'].get('anomalies_count', 0),
-                    'weekend_transactions': anomaly_stats['unusual_days_analysis'].get('weekend_transactions_count', 0),
-                    'holiday_transactions': anomaly_stats['holiday_analysis'].get('holiday_postings_count', 0),
-                    'closing_entries': anomaly_stats['closing_entries_analysis'].get('closing_entries_count', 0)
-                }
-            }
-            
-            response_data['summary_dashboard'] = summary_dashboard
-            
-            # Add methodology clarification
-            response_data['methodology_notes'] = {
-                'overall_analysis': {
-                    'description': 'Overall analysis uses flag-based detection focusing on specific anomaly types (duplicates, backdated, weekend, holiday, closing entries)',
-                    'flagging_criteria': 'Transactions are flagged based on specific anomaly detection rules',
-                    'risk_assessment': 'Simple risk scoring based on flagged transaction patterns'
-                },
-                'risk_analysis': {
-                    'description': 'Risk analysis uses comprehensive ML-based scoring considering multiple risk factors',
-                    'scoring_methodology': 'Advanced risk scoring using machine learning models and statistical analysis',
-                    'risk_factors': 'Considers duplicate risk, backdated risk, user anomalies, unusual days, closing entries, and holiday postings',
-                    'version': '2.0.0'
-                },
-                'data_discrepancy_explanation': 'Overall analysis and risk analysis use different methodologies, which may result in different transaction counts. Overall analysis focuses on specific anomaly flags, while risk analysis provides comprehensive risk scoring.'
+                'analysis_results': analysis_results,
+                'summary_metrics': self._calculate_comprehensive_summary_metrics(
+                    analysis_results, transaction_stats, data_file, ai_risk_info
+                ),
+                'risk_assessment_summary': self._get_risk_assessment_summary(analysis_results, ai_risk_info, data_file),
+                'compliance_summary': self._get_compliance_summary(analysis_results, transaction_stats),
+                'audit_recommendations': self._get_audit_recommendations(analysis_results, ai_risk_info),
+                'financial_impact_summary': self._get_financial_impact_summary(analysis_results, transaction_stats, data_file),
+                'processing_efficiency_metrics': self._get_processing_efficiency_metrics(analysis_results, processing_info)
             }
             
             return Response(response_data, status=status.HTTP_200_OK)
@@ -1623,19 +3339,1969 @@ class FileAnalysisStatisticsView(generics.GenericAPIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
+    def _get_all_analysis_results(self, data_file):
+        """Get all available analysis results for the file"""
+        results = {}
+        
+        # Overall Analysis
+        overall = OverallAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if overall:
+            results['overall'] = {
+                'analysis_id': str(overall.id),
+                'analysis_date': overall.analysis_date.isoformat(),
+                'analysis_type': overall.analysis_type,
+                'processing_duration': overall.processing_duration,
+                'transaction_summary': overall.transaction_summary or {},
+                'flag_summary': overall.flag_summary or {},
+                'flagged_transactions': overall.flagged_transactions or [],
+                'flagged_transactions_count': len(overall.flagged_transactions) if overall.flagged_transactions else 0,
+                'expense_analysis': overall.expense_analysis or {},
+                'financial_statement_impact': overall.financial_statement_impact or {},
+                'analysis_summary': overall.analysis_summary or {},
+                'anomaly_list': overall.anomaly_list or [],
+                'chart_data': overall.chart_data or {},
+                'risk_assessment': overall.risk_assessment or {},
+                'audit_recommendations': overall.audit_recommendations or {},
+                'compliance_assessment': overall.compliance_assessment or {},
+                'export_data': overall.export_data or []
+            }
+        
+        # Risk Analysis
+        risk = RiskScoringDocument.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-document_date').first()
+        if risk:
+            results['risk'] = {
+                'document_id': str(risk.id),
+                'document_date': risk.document_date.isoformat(),
+                'document_type': risk.document_type,
+                'document_version': risk.document_version,
+                'total_transactions': risk.total_transactions,
+                'high_risk_transactions': risk.high_risk_transactions,
+                'medium_risk_transactions': risk.medium_risk_transactions,
+                'low_risk_transactions': risk.low_risk_transactions,
+                'critical_risk_transactions': risk.critical_risk_transactions,
+                'overall_risk_score': risk.overall_risk_score,
+                'methodology_overview': risk.methodology_overview or {},
+                'risk_factors': risk.risk_factors or {},
+                'scoring_criteria': risk.scoring_criteria or {},
+                'risk_calculations': risk.risk_calculations or {},
+                'risk_distributions': risk.risk_distributions or {},
+                'recommendations': risk.recommendations or {},
+                'audit_implications': risk.audit_implications or {},
+                'analysis_summary': risk.analysis_summary or {},
+                'anomaly_list': risk.anomaly_list or [],
+                'chart_data': risk.chart_data or {},
+                'risk_assessment': risk.risk_assessment or {},
+                'audit_recommendations': risk.audit_recommendations or {},
+                'compliance_assessment': risk.compliance_assessment or {},
+                'export_data': risk.export_data or []
+            }
+        
+        # General Analysis
+        general = GeneralAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if general:
+            results['general'] = {
+                'analysis_id': str(general.id),
+                'analysis_date': general.analysis_date.isoformat(),
+                'processing_duration': general.processing_duration,
+                'trial_balance_summary': general.trial_balance_summary or {},
+                'gl_account_summaries': general.gl_account_summaries or [],
+                'gl_account_summaries_count': len(general.gl_account_summaries) if general.gl_account_summaries else 0,
+                'user_summaries': general.user_summaries or [],
+                'user_summaries_count': len(general.user_summaries) if general.user_summaries else 0,
+                'statistical_calculations': general.statistical_calculations or {},
+                'financial_statement_impact': general.financial_statement_impact or {},
+                'chart_data': general.chart_data or {},
+                'export_data': general.export_data or [],
+                'analysis_summary': general.analysis_summary or {},
+                'anomaly_list': general.anomaly_list or [],
+                'risk_assessment': general.risk_assessment or {},
+                'audit_recommendations': general.audit_recommendations or {},
+                'compliance_assessment': general.compliance_assessment or {}
+            }
+        
+        # Duplicate Analysis
+        duplicate = DuplicateAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if duplicate:
+            results['duplicate'] = {
+                'analysis_id': str(duplicate.id),
+                'analysis_date': duplicate.analysis_date.isoformat(),
+                'duplicate_count': duplicate.get_anomaly_count(),
+                'total_amount': float(duplicate.get_total_amount()),
+                'risk_distribution': duplicate.get_risk_distribution()
+            }
+        
+        # Backdated Analysis
+        backdated = BackdatedAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if backdated:
+            results['backdated'] = {
+                'analysis_id': str(backdated.id),
+                'analysis_date': backdated.analysis_date.isoformat(),
+                'backdated_count': backdated.get_anomaly_count(),
+                'total_amount': float(backdated.get_total_amount()),
+                'risk_distribution': backdated.get_risk_distribution()
+            }
+        
+        # User Analysis
+        user = UserAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if user:
+            results['user'] = {
+                'analysis_id': str(user.id),
+                'analysis_date': user.analysis_date.isoformat(),
+                'anomalies_count': user.get_anomalies_count(),
+                'total_users': user.get_total_users(),
+                'total_transactions': user.get_total_transactions(),
+                'high_risk_users_count': user.get_high_risk_users_count()
+            }
+        
+        # Unusual Days Analysis
+        unusual_days = UnusualDaysAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if unusual_days:
+            results['unusual_days'] = {
+                'analysis_id': str(unusual_days.id),
+                'analysis_date': unusual_days.analysis_date.isoformat(),
+                'weekend_transactions_count': unusual_days.get_weekend_transactions_count(),
+                'unusual_days_count': unusual_days.get_unusual_days_count()
+            }
+        
+        # Closing Entries Analysis
+        closing_entries = ClosingEntriesAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if closing_entries:
+            results['closing_entries'] = {
+                'analysis_id': str(closing_entries.id),
+                'analysis_date': closing_entries.analysis_date.isoformat(),
+                'closing_entries_count': closing_entries.get_closing_entries_count(),
+                'post_close_entries_count': closing_entries.get_post_close_entries_count()
+            }
+        
+        # Holiday Analysis
+        holiday = HolidayAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if holiday:
+            results['holiday'] = {
+                'analysis_id': str(holiday.id),
+                'analysis_date': holiday.analysis_date.isoformat(),
+                'holiday_postings_count': holiday.get_holiday_postings_count(),
+                'holiday_percentage': holiday.get_holiday_percentage(),
+                'unique_holidays': holiday.get_unique_holidays(),
+                'overall_risk_score': holiday.get_overall_risk_score()
+            }
+        
+        # Manual Entry Analysis
+        manual_entry = ManualEntryAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if manual_entry:
+            results['manual_entry'] = {
+                'analysis_id': str(manual_entry.id),
+                'analysis_date': manual_entry.analysis_date.isoformat(),
+                'manual_entries_count': len(manual_entry.manual_entries) if manual_entry.manual_entries else 0,
+                'period_end_adjustments_count': len(manual_entry.period_end_adjustments) if manual_entry.period_end_adjustments else 0,
+                'management_override_indicators_count': len(manual_entry.management_override_indicators) if manual_entry.management_override_indicators else 0
+            }
+        
+        return results
+    
+    def _get_processing_job_info(self, data_file):
+        """Get processing job information and progress"""
+        try:
+            latest_job = FileProcessingJob.objects.filter(
+                data_file=data_file
+            ).order_by('-created_at').first()
+            
+            if not latest_job:
+                return {
+                    'has_processing_job': False,
+                    'status': 'NO_JOB',
+                    'progress': 0
+                }
+            
+            # Get job tracker if available
+            try:
+                job_tracker = ProcessingJobTracker.objects.get(processing_job=latest_job)
+                progress_info = job_tracker.get_progress_summary()
+            except ProcessingJobTracker.DoesNotExist:
+                progress_info = {
+                    'overall_progress': 0,
+                    'current_step': 'Unknown',
+                    'status_breakdown': {
+                        'file_processing': 'UNKNOWN',
+                        'analytics': 'UNKNOWN',
+                        'ml_processing': 'UNKNOWN',
+                        'anomaly_detection': 'UNKNOWN'
+                    }
+                }
+            
+            return {
+                'has_processing_job': True,
+                'job_id': str(latest_job.id),
+                'status': latest_job.status,
+                'run_anomalies': latest_job.run_anomalies,
+                'requested_anomalies': latest_job.requested_anomalies or [],
+                'started_at': latest_job.started_at.isoformat() if latest_job.started_at else None,
+                'completed_at': latest_job.completed_at.isoformat() if latest_job.completed_at else None,
+                'processing_duration': latest_job.processing_duration,
+                'progress': progress_info,
+                'is_duplicate_content': latest_job.is_duplicate_content,
+                'existing_job_id': str(latest_job.existing_job.id) if latest_job.existing_job else None
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting processing job info: {e}")
+            return {
+                'has_processing_job': False,
+                'status': 'ERROR',
+                'error': str(e)
+            }
+    
+    def _get_ai_risk_assessment(self, data_file):
+        """Get AI risk assessment information"""
+        try:
+            # Check if AI risk assessment table exists first
+            try:
+                ai_assessment = AIRiskAssessment.objects.filter(
+                    data_file=data_file,
+                    status='COMPLETED'
+                ).order_by('-analysis_date').first()
+            except Exception as table_error:
+                # Table doesn't exist yet, return appropriate status
+                return {
+                    'has_ai_assessment': False,
+                    'status': 'TABLE_NOT_CREATED',
+                    'message': 'AI risk assessment table not yet created in database'
+                }
+            
+            if not ai_assessment:
+                return {
+                    'has_ai_assessment': False,
+                    'status': 'NO_AI_ASSESSMENT',
+                    'message': 'No AI risk assessment completed for this file'
+                }
+            
+            # Get related AI models and recommendations
+            try:
+                risk_patterns = RiskPattern.objects.filter(
+                    data_file=data_file,
+                    ai_assessment=ai_assessment
+                ).values('pattern_name', 'pattern_type', 'pattern_severity', 'pattern_risk_score')
+                
+                anomaly_clusters = AnomalyCluster.objects.filter(
+                    data_file=data_file,
+                    ai_assessment=ai_assessment
+                ).values('cluster_name', 'cluster_type', 'cluster_size', 'cluster_risk_score')
+                
+                ai_recommendations = AIRiskRecommendation.objects.filter(
+                    data_file=data_file,
+                    ai_assessment=ai_assessment
+                ).values('recommendation_title', 'category', 'priority', 'urgency', 'status')
+                
+                risk_trends = RiskTrend.objects.filter(
+                    data_file=data_file,
+                    ai_assessment=ai_assessment
+                ).values('trend_name', 'trend_type', 'trend_direction', 'trend_significance')
+                
+                model_performances = ModelPerformance.objects.filter(
+                    data_file=data_file,
+                    ai_assessment=ai_assessment
+                ).values('model_name', 'model_version', 'accuracy', 'precision', 'recall', 'f1_score')
+            except Exception as related_error:
+                # Related tables don't exist yet
+                risk_patterns = []
+                anomaly_clusters = []
+                ai_recommendations = []
+                risk_trends = []
+                model_performances = []
+            
+            return {
+                'has_ai_assessment': True,
+                'assessment_id': str(ai_assessment.id),
+                'ai_risk_score': ai_assessment.overall_ai_risk_score,
+                'ai_risk_level': ai_assessment.ai_risk_level,
+                'confidence_score': ai_assessment.ai_confidence_score,
+                'assessment_date': ai_assessment.analysis_date.isoformat(),
+                'risk_patterns': list(risk_patterns),
+                'anomaly_clusters': list(anomaly_clusters),
+                'ai_recommendations': list(ai_recommendations),
+                'risk_trends': list(risk_trends),
+                'model_performances': list(model_performances),
+                'models_used': ai_assessment.models_used or []
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting AI risk assessment: {e}")
+            return {
+                'has_ai_assessment': False,
+                'status': 'ERROR',
+                'error': str(e)
+            }
+    
+    def _get_transaction_statistics(self, data_file):
+        """Get basic statistics from SAPGLPosting data"""
+        postings = SAPGLPosting.objects.filter(data_file=data_file)
+        
+        if not postings.exists():
+            return {
+                'total_transactions': 0,
+                'total_amount': 0,
+                'unique_accounts': 0,
+                'unique_users': 0,
+                'date_range': {},
+                'amount_range': {},
+                'transaction_types': {},
+                'anomaly_flags': {}
+            }
+        
+        # Basic counts
+        total_transactions = postings.count()
+        total_amount = postings.aggregate(
+            total=models.Sum('amount_local_currency')
+        )['total'] or 0
+        
+        # Unique counts
+        unique_accounts = postings.values('gl_account').distinct().count()
+        unique_users = postings.values('user_name').distinct().count()
+        
+        # Date range
+        date_range = postings.aggregate(
+            min_date=models.Min('posting_date'),
+            max_date=models.Max('posting_date')
+        )
+        
+        # Amount range
+        amount_range = postings.aggregate(
+            min_amount=models.Min('amount_local_currency'),
+            max_amount=models.Max('amount_local_currency')
+        )
+        
+        # Transaction types - use proper transaction type logic
+        transaction_types = {}
+        debit_count = 0
+        credit_count = 0
+        
+        for posting in postings:
+            proper_type = posting.get_proper_transaction_type()
+            if proper_type == 'DEBIT':
+                debit_count += 1
+            elif proper_type == 'CREDIT':
+                credit_count += 1
+        
+        transaction_types = {
+            'DEBIT': debit_count,
+            'CREDIT': credit_count
+        }
+        
+        # Enhanced transaction statistics
+        # Calculate debit and credit amounts separately to avoid complex nested expressions
+        debit_amount_result = postings.filter(amount_local_currency__gt=0).aggregate(
+            total=models.Sum('amount_local_currency'))
+        credit_amount_result = postings.filter(amount_local_currency__lt=0).aggregate(
+            total=models.Sum('amount_local_currency'))
+        
+        transaction_statistics = {
+            'total_debits': debit_count,
+            'total_credits': credit_count,
+            'debit_amount': float(debit_amount_result['total'] or 0),
+            'credit_amount': float(credit_amount_result['total'] or 0),
+            'balance': float(total_amount),
+            'is_balanced': abs(total_amount) < 0.01,  # Check if balanced (within 0.01 tolerance)
+            'balance_percentage': abs(total_amount) / (abs(float(amount_range['max_amount'])) * 100) if amount_range['max_amount'] else 0
+        }
+        
+        # Anomaly flags
+        anomaly_flags = {
+            'duplicates': postings.filter(is_duplicate=True).count(),
+            'backdated': postings.filter(is_backdated=True).count(),
+            'holiday_postings': postings.filter(is_holiday_posting=True).count(),
+            'unusual_days': postings.filter(is_unusual_days_posting=True).count(),
+            'user_anomalies': postings.filter(is_user_anomaly=True).count(),
+            'closing_entries': postings.filter(is_closing_entry=True).count(),
+            'high_value': postings.filter(amount_local_currency__gt=1000000).count(),
+            'manual_entries': postings.filter(is_manual_entry=True).count(),
+            'period_end_adjustments': postings.filter(is_period_end_adjustment=True).count()
+        }
+        
+        # Risk distribution
+        risk_distribution = {
+            'high_risk': postings.filter(overall_risk_score__gte=60).count(),
+            'medium_risk': postings.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count(),
+            'low_risk': postings.filter(overall_risk_score__lt=30).count(),
+            'critical_risk': postings.filter(overall_risk_score__gte=80).count()
+        }
+        
+        # Account categories (top 20)
+        account_categories = {}
+        account_data = postings.values('gl_account').annotate(
+            count=models.Count('id'),
+            total_amount=models.Sum('amount_local_currency')
+        ).values_list('gl_account', 'count', 'total_amount')[:20]
+        
+        for account, count, total_amount in account_data:
+            account_categories[account] = {
+                'count': count,
+                'total_amount': float(total_amount) if total_amount else 0
+            }
+        
+        # User activity (top 20)
+        user_activity = {}
+        user_data = postings.values('user_name').annotate(
+            count=models.Count('id'),
+            total_amount=models.Sum('amount_local_currency')
+        ).values_list('user_name', 'count', 'total_amount')[:20]
+        
+        for user, count, total_amount in user_data:
+            user_activity[user] = {
+                'count': count,
+                'total_amount': float(total_amount) if total_amount else 0
+            }
+        
+        return {
+            'total_transactions': total_transactions,
+            'total_amount': float(total_amount),
+            'unique_accounts': unique_accounts,
+            'unique_users': unique_users,
+            'date_range': {
+                'min_date': date_range['min_date'].isoformat() if date_range['min_date'] else None,
+                'max_date': date_range['max_date'].isoformat() if date_range['max_date'] else None
+            },
+            'amount_range': {
+                'min_amount': float(amount_range['min_amount']) if amount_range['min_amount'] else 0,
+                'max_amount': float(amount_range['max_amount']) if amount_range['max_amount'] else 0
+            },
+            'transaction_types': transaction_types,
+            'transaction_statistics': transaction_statistics,
+            'anomaly_flags': anomaly_flags,
+            'risk_distribution': risk_distribution,
+            'account_categories': account_categories,
+            'user_activity': user_activity
+        }
+    
+    def _calculate_comprehensive_summary_metrics(self, analysis_results, transaction_stats, data_file, ai_risk_info):
+        """Calculate comprehensive summary metrics using pre-compiled database data"""
+        total_anomalies = 0
+        
+        # Use pre-compiled anomaly counts from analysis results
+        if 'duplicate' in analysis_results:
+            total_anomalies += analysis_results['duplicate'].get('duplicate_count', 0)
+        if 'backdated' in analysis_results:
+            total_anomalies += analysis_results['backdated'].get('backdated_count', 0)
+        if 'user' in analysis_results:
+            total_anomalies += analysis_results['user'].get('anomalies_count', 0)
+        if 'unusual_days' in analysis_results:
+            total_anomalies += analysis_results['unusual_days'].get('unusual_days_count', 0)
+        if 'holiday' in analysis_results:
+            total_anomalies += analysis_results['holiday'].get('holiday_postings_count', 0)
+        if 'closing_entries' in analysis_results:
+            total_anomalies += analysis_results['closing_entries'].get('closing_entries_count', 0)
+        if 'manual_entry' in analysis_results:
+            total_anomalies += len(analysis_results['manual_entry'].get('manual_entries', []))
+        
+        # Use pre-compiled risk scores from RiskScoringDocument
+        overall_risk_score = 0
+        ai_risk_score = 0
+        risk_distribution = {}
+        
+        if 'risk' in analysis_results:
+            risk_data = analysis_results['risk']
+            overall_risk_score = risk_data.get('overall_risk_score', 0)
+            
+            # Use pre-compiled risk distribution
+            risk_distribution = {
+                'critical_risk': risk_data.get('critical_risk_transactions', 0),
+                'high_risk': risk_data.get('high_risk_transactions', 0),
+                'medium_risk': risk_data.get('medium_risk_transactions', 0),
+                'low_risk': risk_data.get('low_risk_transactions', 0)
+            }
+            
+            # If overall_risk_score is 0 or risk_distribution is empty, calculate from actual transaction data
+            if overall_risk_score == 0 or not any(risk_distribution.values()):
+                overall_risk_score, risk_distribution = self._calculate_risk_from_transactions(data_file)
+        
+        # Add AI risk score if available
+        if ai_risk_info and ai_risk_info.get('has_ai_assessment'):
+            ai_risk_score = ai_risk_info.get('ai_risk_score', 0)
+        
+        # Use the higher of overall risk score or AI risk score
+        composite_risk_score = max(overall_risk_score, ai_risk_score)
+        
+        return {
+            'total_anomalies': total_anomalies,
+            'anomaly_percentage': (total_anomalies / transaction_stats['total_transactions'] * 100) if transaction_stats['total_transactions'] > 0 else 0,
+            'overall_risk_score': overall_risk_score,
+            'ai_risk_score': ai_risk_score,
+            'composite_risk_score': composite_risk_score,
+            'risk_level': self._get_risk_level(composite_risk_score),
+            'risk_distribution': risk_distribution,
+            'processing_success_rate': (data_file.processed_records / data_file.total_records * 100) if data_file.total_records > 0 else 0,
+            'analysis_coverage_score': (len(analysis_results) / 10 * 100),  # Assuming 10 possible analysis types
+            'data_quality_score': self._calculate_data_quality_score(transaction_stats, analysis_results)
+        }
+    
     def _get_risk_level(self, risk_score):
-        """Get risk level based on risk score"""
+        """
+        Get risk level based on risk score following documented methodology
+        
+        Risk Level Classification System (from RISK_SCORING_METHODOLOGY_AND_INTEGRATION.md):
+        - CRITICAL (80-100): Critical risk requiring immediate attention
+        - HIGH (60-79): High risk requiring investigation  
+        - MEDIUM (30-59): Medium risk requiring monitoring
+        - LOW (0-29): Low risk, normal operations
+        """
+        if risk_score is None:
+            return 'UNKNOWN'
         if risk_score >= 80:
             return 'CRITICAL'
         elif risk_score >= 60:
             return 'HIGH'
-        elif risk_score >= 40:
+        elif risk_score >= 30:
             return 'MEDIUM'
-        elif risk_score >= 20:
-            return 'LOW'
         else:
-            return 'VERY_LOW'
+            return 'LOW'
+    
+    def _get_risk_assessment_summary(self, analysis_results, ai_risk_info, data_file):
+        """Get comprehensive risk assessment summary using actual transaction data and analysis results"""
+        risk_summary = {
+            'overall_risk_level': 'UNKNOWN',
+            'risk_factors': [],
+            'high_risk_areas': [],
+            'risk_trends': [],
+            'mitigation_strategies': [],
+            'risk_distribution': {},
+            'methodology_info': {}
+        }
+        
+        # Calculate risk from actual transaction data
+        if data_file:
+            from .models import SAPGLPosting
+            from django.db import models
+            
+            # Get all transactions for this file
+            transactions = SAPGLPosting.objects.filter(data_file=data_file)
+            total_transactions = transactions.count()
+            
+            if total_transactions > 0:
+                # Count transactions by risk level based on their overall_risk_score
+                critical_risk_count = transactions.filter(overall_risk_score__gte=80).count()
+                high_risk_count = transactions.filter(overall_risk_score__gte=60, overall_risk_score__lt=80).count()
+                medium_risk_count = transactions.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count()
+                low_risk_count = transactions.filter(overall_risk_score__lt=30).count()
+                
+                # Calculate overall risk score
+                if critical_risk_count > 0:
+                    critical_percentage = (critical_risk_count / total_transactions) * 100
+                    overall_risk_score = 75.0 + (critical_percentage * 0.5)
+                elif high_risk_count > 0:
+                    high_percentage = ((high_risk_count + critical_risk_count) / total_transactions) * 100
+                    if high_percentage > 5:
+                        overall_risk_score = 60.0 + (high_percentage * 0.3)
+                    else:
+                        overall_risk_score = 40.0 + (high_percentage * 0.5)
+                else:
+                    # Use average risk score for low risk scenarios
+                    risk_scores = transactions.values_list('overall_risk_score', flat=True)
+                    non_zero_scores = [score for score in risk_scores if score and score > 0]
+                    overall_risk_score = sum(non_zero_scores) / len(non_zero_scores) if non_zero_scores else 0.0
+                
+                # Cap risk score at 100
+                overall_risk_score = min(overall_risk_score, 100.0)
+                
+                # Set overall risk level
+                risk_summary['overall_risk_level'] = self._get_risk_level(overall_risk_score)
+                
+                # Set risk distribution
+                risk_summary['risk_distribution'] = {
+                    'critical_risk': critical_risk_count,
+                    'high_risk': high_risk_count,
+                    'medium_risk': medium_risk_count,
+                    'low_risk': low_risk_count,
+                    'total_transactions': total_transactions
+                }
+                
+                # Calculate risk factors from actual data
+                risk_factors = []
+                
+                # Duplicate risk
+                if 'duplicate' in analysis_results:
+                    duplicate_count = analysis_results['duplicate'].get('duplicate_count', 0)
+                    if duplicate_count > 0:
+                        risk_factors.append(f"duplicate_risk: {duplicate_count} occurrences")
+                
+                # Backdated risk
+                if 'backdated' in analysis_results:
+                    backdated_count = analysis_results['backdated'].get('backdated_count', 0)
+                    if backdated_count > 0:
+                        risk_factors.append(f"backdated_risk: {backdated_count} occurrences")
+                
+                # Holiday risk
+                if 'holiday' in analysis_results:
+                    holiday_count = analysis_results['holiday'].get('holiday_postings_count', 0)
+                    if holiday_count > 0:
+                        risk_factors.append(f"holiday_risk: {holiday_count} occurrences")
+                
+                # Weekend/unusual days risk
+                if 'unusual_days' in analysis_results:
+                    weekend_count = analysis_results['unusual_days'].get('weekend_transactions_count', 0)
+                    if weekend_count > 0:
+                        risk_factors.append(f"weekend_risk: {weekend_count} occurrences")
+                
+                # Closing entries risk
+                if 'closing_entries' in analysis_results:
+                    closing_count = analysis_results['closing_entries'].get('closing_entries_count', 0)
+                    if closing_count > 0:
+                        risk_factors.append(f"closing_entries_risk: {closing_count} occurrences")
+                
+                # User anomaly risk
+                if 'user' in analysis_results:
+                    user_anomalies = analysis_results['user'].get('anomalies_count', 0)
+                    if user_anomalies > 0:
+                        risk_factors.append(f"user_anomaly_risk: {user_anomalies} occurrences")
+                
+                # Amount risk (high value transactions)
+                high_value_count = transactions.filter(
+                    overall_risk_score__gte=60,
+                    amount_local_currency__gte=1000000
+                ).count()
+                if high_value_count > 0:
+                    risk_factors.append(f"amount_risk: {high_value_count} high-value anomalies")
+                
+                risk_summary['risk_factors'] = risk_factors
+                
+                # Identify high risk areas
+                high_risk_areas = []
+                if critical_risk_count > 0:
+                    high_risk_areas.append(f"Critical risk transactions: {critical_risk_count}")
+                if high_risk_count > 0:
+                    high_risk_areas.append(f"High risk transactions: {high_risk_count}")
+                if high_value_count > 0:
+                    high_risk_areas.append(f"High value anomalies: {high_value_count}")
+                
+                risk_summary['high_risk_areas'] = high_risk_areas
+                
+                # Generate mitigation strategies based on actual risks
+                mitigation_strategies = []
+                if critical_risk_count > 0:
+                    mitigation_strategies.append("Immediate review of critical risk transactions required")
+                if high_risk_count > 0:
+                    mitigation_strategies.append("Investigate high risk transactions for potential fraud")
+                if duplicate_count > 0:
+                    mitigation_strategies.append("Implement duplicate detection controls")
+                if backdated_count > 0:
+                    mitigation_strategies.append("Review backdated entries for authorization")
+                if holiday_count > 0:
+                    mitigation_strategies.append("Monitor holiday posting activities")
+                if weekend_count > 0:
+                    mitigation_strategies.append("Review weekend transaction patterns")
+                
+                risk_summary['mitigation_strategies'] = mitigation_strategies
+                
+                # Calculate risk trends based on actual data
+                risk_trends = []
+                
+                # Calculate risk concentration trends
+                total_high_risk = critical_risk_count + high_risk_count
+                high_risk_percentage = (total_high_risk / total_transactions) * 100 if total_transactions > 0 else 0
+                
+                if high_risk_percentage > 50:
+                    risk_trends.append(f"High risk concentration: {high_risk_percentage:.1f}% of transactions are high/critical risk")
+                elif high_risk_percentage > 25:
+                    risk_trends.append(f"Moderate risk concentration: {high_risk_percentage:.1f}% of transactions are high/critical risk")
+                
+                # Calculate anomaly pattern trends
+                total_anomalies = 0
+                if 'duplicate' in analysis_results:
+                    total_anomalies += analysis_results['duplicate'].get('duplicate_count', 0)
+                if 'backdated' in analysis_results:
+                    total_anomalies += analysis_results['backdated'].get('backdated_count', 0)
+                if 'holiday' in analysis_results:
+                    total_anomalies += analysis_results['holiday'].get('holiday_postings_count', 0)
+                if 'unusual_days' in analysis_results:
+                    total_anomalies += analysis_results['unusual_days'].get('weekend_transactions_count', 0)
+                if 'closing_entries' in analysis_results:
+                    total_anomalies += analysis_results['closing_entries'].get('closing_entries_count', 0)
+                if 'user' in analysis_results:
+                    total_anomalies += analysis_results['user'].get('anomalies_count', 0)
+                
+                anomaly_percentage = (total_anomalies / total_transactions) * 100 if total_transactions > 0 else 0
+                
+                if anomaly_percentage > 100:
+                    risk_trends.append(f"Extreme anomaly rate: {anomaly_percentage:.1f}% (overlapping anomalies detected)")
+                elif anomaly_percentage > 50:
+                    risk_trends.append(f"High anomaly rate: {anomaly_percentage:.1f}% of transactions have anomalies")
+                elif anomaly_percentage > 20:
+                    risk_trends.append(f"Moderate anomaly rate: {anomaly_percentage:.1f}% of transactions have anomalies")
+                
+                # Calculate financial impact trends
+                if high_value_count > 0:
+                    high_value_percentage = (high_value_count / total_transactions) * 100
+                    if high_value_percentage > 50:
+                        risk_trends.append(f"High value concentration: {high_value_percentage:.1f}% of transactions are high-value anomalies")
+                    elif high_value_percentage > 10:
+                        risk_trends.append(f"Moderate high value concentration: {high_value_percentage:.1f}% of transactions are high-value anomalies")
+                
+                # Calculate temporal risk trends (holiday/weekend patterns)
+                if 'holiday' in analysis_results and 'unusual_days' in analysis_results:
+                    holiday_count = analysis_results['holiday'].get('holiday_postings_count', 0)
+                    weekend_count = analysis_results['unusual_days'].get('weekend_transactions_count', 0)
+                    temporal_anomalies = holiday_count + weekend_count
+                    temporal_percentage = (temporal_anomalies / total_transactions) * 100 if total_transactions > 0 else 0
+                    
+                    if temporal_percentage > 50:
+                        risk_trends.append(f"High temporal risk: {temporal_percentage:.1f}% of transactions occur during holidays/weekends")
+                    elif temporal_percentage > 20:
+                        risk_trends.append(f"Moderate temporal risk: {temporal_percentage:.1f}% of transactions occur during holidays/weekends")
+                
+                # Calculate user behavior trends
+                if 'user' in analysis_results:
+                    user_anomalies = analysis_results['user'].get('anomalies_count', 0)
+                    if user_anomalies > 0:
+                        risk_trends.append(f"User behavior anomalies detected: {user_anomalies} instances")
+                
+                # Calculate closing entry trends
+                if 'closing_entries' in analysis_results:
+                    closing_count = analysis_results['closing_entries'].get('closing_entries_count', 0)
+                    if closing_count > 0:
+                        closing_percentage = (closing_count / total_transactions) * 100 if total_transactions > 0 else 0
+                        if closing_percentage > 30:
+                            risk_trends.append(f"High closing entry activity: {closing_percentage:.1f}% of transactions are closing entries")
+                        elif closing_percentage > 10:
+                            risk_trends.append(f"Moderate closing entry activity: {closing_percentage:.1f}% of transactions are closing entries")
+                
+                risk_summary['risk_trends'] = risk_trends
+        
+        # Add methodology information
+        risk_summary['methodology_info'] = {
+            'document_type': 'comprehensive_risk_scoring',
+            'document_version': '2.0.0',
+            'methodology_overview': {
+                'version': '2.0.0',
+                'description': 'Enhanced risk scoring methodology using actual transaction data and comprehensive anomaly analysis',
+                'last_updated': '2025-09-04T17:55:00.000000+00:00'
+            },
+            'scoring_criteria': {
+                'low_risk': {
+                    'max': 29,
+                    'min': 0,
+                    'description': 'Normal transactions'
+                },
+                'medium_risk': {
+                    'max': 59,
+                    'min': 30,
+                    'description': 'Some concerns'
+                },
+                'high_risk': {
+                    'max': 79,
+                    'min': 60,
+                    'description': 'Significant risk'
+                },
+                'critical_risk': {
+                    'max': 100,
+                    'min': 80,
+                    'description': 'High risk requiring immediate attention'
+                }
+            }
+        }
+        
+        # Add AI risk information if available
+        if ai_risk_info and ai_risk_info.get('has_ai_assessment'):
+            ai_data = ai_risk_info
+            risk_summary['risk_factors'].extend([
+                f"AI Risk Score: {ai_data.get('ai_risk_score', 0)}",
+                f"AI Confidence: {ai_data.get('confidence_score', 0)}"
+            ])
+            risk_summary['high_risk_areas'].extend([
+                pattern['pattern_name'] for pattern in ai_data.get('risk_patterns', [])
+                if pattern.get('pattern_severity') in ['HIGH', 'CRITICAL']
+            ])
+        
+        return risk_summary
+    
+    def _calculate_risk_from_transactions(self, data_file):
+        """Calculate risk score and distribution from actual transaction data when pre-compiled data is incorrect"""
+        from .models import SAPGLPosting
+        
+        # Get all transactions for this file
+        transactions = SAPGLPosting.objects.filter(data_file=data_file)
+        total_transactions = transactions.count()
+        
+        if total_transactions == 0:
+            return 0.0, {'critical_risk': 0, 'high_risk': 0, 'medium_risk': 0, 'low_risk': 0}
+        
+        # Count transactions by risk level based on their overall_risk_score
+        critical_risk_count = transactions.filter(overall_risk_score__gte=80).count()
+        high_risk_count = transactions.filter(overall_risk_score__gte=60, overall_risk_score__lt=80).count()
+        medium_risk_count = transactions.filter(overall_risk_score__gte=30, overall_risk_score__lt=60).count()
+        low_risk_count = transactions.filter(overall_risk_score__lt=30).count()
+        
+        # Calculate risk percentages
+        high_risk_percentage = (high_risk_count + critical_risk_count) / total_transactions * 100
+        critical_risk_percentage = critical_risk_count / total_transactions * 100
+        
+        # Calculate overall risk score using the same logic as sync_analysis.py
+        if critical_risk_percentage > 0:
+            # If there are critical risk transactions, score should be HIGH
+            overall_risk_score = 75.0 + (critical_risk_percentage * 0.5)  # Base 75 + critical risk bonus
+        elif high_risk_percentage > 5:
+            # If more than 5% are high risk, score should be HIGH
+            overall_risk_score = 60.0 + (high_risk_percentage * 0.3)  # Base 60 + high risk bonus
+        elif high_risk_percentage > 1:
+            # If more than 1% are high risk, score should be MEDIUM
+            overall_risk_score = 40.0 + (high_risk_percentage * 0.5)  # Base 40 + high risk bonus
+        else:
+            # Use average risk score for low risk scenarios
+            risk_scores = transactions.values_list('overall_risk_score', flat=True)
+            non_zero_scores = [score for score in risk_scores if score and score > 0]
+            overall_risk_score = sum(non_zero_scores) / len(non_zero_scores) if non_zero_scores else 0.0
+        
+        # Cap risk score at 100
+        overall_risk_score = min(overall_risk_score, 100.0)
+        
+        risk_distribution = {
+            'critical_risk': critical_risk_count,
+            'high_risk': high_risk_count,
+            'medium_risk': medium_risk_count,
+            'low_risk': low_risk_count
+        }
+        
+        return overall_risk_score, risk_distribution
+    
+    def _get_compliance_summary(self, analysis_results, transaction_stats):
+        """Get comprehensive compliance assessment summary using all analysis types"""
+        compliance_summary = {
+            'compliance_score': 100,
+            'compliance_risks': [],
+            'regulatory_concerns': [],
+            'control_deficiencies': []
+        }
 
+        # Calculate total anomalies for percentage-based scoring
+        total_anomalies = 0
+        
+        # Use correct total transactions from transaction_stats instead of potentially incorrect overall analysis
+        total_transactions = transaction_stats.get('total_transactions', 0)
+        
+        # Analyze compliance across all analysis types with proper weighting
+        if 'duplicate' in analysis_results:
+            duplicate_count = analysis_results['duplicate'].get('duplicate_count', 0)
+            if duplicate_count > 0:
+                # Duplicates are critical compliance issues
+                compliance_summary['compliance_score'] -= min(25, duplicate_count * 5)
+                compliance_summary['compliance_risks'].append(f"Duplicate transactions: {duplicate_count}")
+                compliance_summary['regulatory_concerns'].append("Duplicate transactions violate accounting principles")
+                total_anomalies += duplicate_count
+        
+        if 'backdated' in analysis_results:
+            backdated_count = analysis_results['backdated'].get('backdated_count', 0)
+            if backdated_count > 0:
+                # Backdated entries are serious compliance issues
+                compliance_summary['compliance_score'] -= min(20, backdated_count * 4)
+                compliance_summary['compliance_risks'].append(f"Backdated entries: {backdated_count}")
+                compliance_summary['regulatory_concerns'].append("Backdated entries may indicate manipulation")
+                total_anomalies += backdated_count
+        
+        if 'holiday' in analysis_results:
+            holiday_count = analysis_results['holiday'].get('holiday_postings_count', 0)
+            if holiday_count > 0:
+                # Holiday postings are moderate compliance concerns
+                holiday_percentage = (holiday_count / total_transactions * 100) if total_transactions > 0 else 0
+                if holiday_percentage > 50:  # More than 50% holiday postings
+                    compliance_summary['compliance_score'] -= min(30, holiday_percentage * 0.3)
+                    compliance_summary['compliance_risks'].append(f"Holiday postings: {holiday_count} ({holiday_percentage:.1f}%)")
+                    compliance_summary['control_deficiencies'].append("Excessive holiday posting activity")
+                total_anomalies += holiday_count
+        
+        if 'unusual_days' in analysis_results:
+            weekend_count = analysis_results['unusual_days'].get('weekend_transactions_count', 0)
+            if weekend_count > 0:
+                # Weekend postings are moderate compliance concerns
+                weekend_percentage = (weekend_count / total_transactions * 100) if total_transactions > 0 else 0
+                if weekend_percentage > 20:  # More than 20% weekend postings
+                    compliance_summary['compliance_score'] -= min(25, weekend_percentage * 0.25)
+                    compliance_summary['compliance_risks'].append(f"Weekend transactions: {weekend_count} ({weekend_percentage:.1f}%)")
+                    compliance_summary['control_deficiencies'].append("Excessive weekend posting activity")
+                total_anomalies += weekend_count
+        
+        if 'closing_entries' in analysis_results:
+            closing_count = analysis_results['closing_entries'].get('closing_entries_count', 0)
+            if closing_count > 0:
+                # Closing entries are moderate compliance concerns
+                closing_percentage = (closing_count / total_transactions * 100) if total_transactions > 0 else 0
+                if closing_percentage > 30:  # More than 30% closing entries
+                    compliance_summary['compliance_score'] -= min(20, closing_percentage * 0.2)
+                    compliance_summary['compliance_risks'].append(f"Closing entries: {closing_count} ({closing_percentage:.1f}%)")
+                    compliance_summary['control_deficiencies'].append("Excessive closing entry activity")
+                total_anomalies += closing_count
+        
+        if 'user' in analysis_results:
+            user_anomalies = analysis_results['user'].get('anomalies_count', 0)
+            if user_anomalies > 0:
+                # User anomalies are moderate compliance concerns
+                compliance_summary['compliance_score'] -= min(15, user_anomalies * 1)
+                compliance_summary['compliance_risks'].append(f"User anomalies: {user_anomalies}")
+                compliance_summary['control_deficiencies'].append("User behavior anomalies detected")
+                total_anomalies += user_anomalies
+        
+        # Calculate overall anomaly percentage impact
+        if total_transactions > 0:
+            anomaly_percentage = (total_anomalies / total_transactions * 100)
+            if anomaly_percentage > 100:  # More anomalies than transactions (overlapping)
+                compliance_summary['compliance_score'] -= min(40, (anomaly_percentage - 100) * 0.4)
+                compliance_summary['regulatory_concerns'].append(f"Extremely high anomaly rate: {anomaly_percentage:.1f}%")
+            elif anomaly_percentage > 50:  # High anomaly rate
+                compliance_summary['compliance_score'] -= min(30, anomaly_percentage * 0.3)
+                compliance_summary['regulatory_concerns'].append(f"High anomaly rate: {anomaly_percentage:.1f}%")
+            elif anomaly_percentage > 20:  # Moderate anomaly rate
+                compliance_summary['compliance_score'] -= min(20, anomaly_percentage * 0.2)
+                compliance_summary['regulatory_concerns'].append(f"Moderate anomaly rate: {anomaly_percentage:.1f}%")
+        
+        # Ensure compliance score doesn't go below 0
+        compliance_summary['compliance_score'] = max(0, compliance_summary['compliance_score'])
+        
+        # Add summary information
+        compliance_summary['total_anomalies'] = total_anomalies
+        compliance_summary['total_transactions'] = total_transactions
+        compliance_summary['anomaly_percentage'] = (total_anomalies / total_transactions * 100) if total_transactions > 0 else 0
+        
+        return compliance_summary
+    
+    def _get_audit_recommendations(self, analysis_results, ai_risk_info):
+        """Get comprehensive audit recommendations and AI instructions from all analyses"""
+        recommendations = []
+        ai_instructions = []
+        
+        # Collect recommendations from all analysis types
+        for analysis_type, results in analysis_results.items():
+            if 'audit_recommendations' in results:
+                recommendations.extend(results['audit_recommendations'].get('high_priority', []))
+        
+        # Generate AI-powered recommendations based on actual risk data
+        ai_recommendations = self._generate_ai_recommendations(analysis_results, ai_risk_info)
+        recommendations.extend(ai_recommendations)
+        
+        # Generate AI instructions based on risk patterns
+        ai_instructions = self._generate_ai_instructions(analysis_results, ai_risk_info)
+        
+        # Add existing AI recommendations if available
+        if ai_risk_info and ai_risk_info.get('has_ai_assessment'):
+            existing_ai_recommendations = ai_risk_info.get('ai_recommendations', [])
+            for rec in existing_ai_recommendations:
+                if rec.get('priority') in ['HIGH', 'CRITICAL']:
+                    recommendations.append({
+                        'source': 'AI Assessment',
+                        'title': rec.get('recommendation_title', ''),
+                        'priority': rec.get('priority', 'MEDIUM'),
+                        'urgency': rec.get('urgency', 'MEDIUM'),
+                        'category': rec.get('category', 'General'),
+                        'description': rec.get('description', ''),
+                        'implementation_steps': rec.get('implementation_steps', [])
+                    })
+        
+        # Remove duplicates and limit to top recommendations
+        unique_recommendations = []
+        seen_titles = set()
+        for rec in recommendations:
+            title = rec.get('title', '')
+            if title and title not in seen_titles:
+                unique_recommendations.append(rec)
+                seen_titles.add(title)
+        
+        return {
+            'recommendations': unique_recommendations[:15],  # Top 15 recommendations
+            'ai_instructions': ai_instructions,
+            'total_recommendations': len(unique_recommendations),
+            'high_priority_count': len([r for r in unique_recommendations if r.get('priority') in ['HIGH', 'CRITICAL']]),
+            'ai_generated_count': len([r for r in unique_recommendations if r.get('source') == 'AI Generated'])
+        }
+    
+    def _generate_ai_recommendations(self, analysis_results, ai_risk_info):
+        """Generate AI-powered recommendations based on actual risk data"""
+        recommendations = []
+        
+        # Calculate total anomalies for context
+        total_anomalies = 0
+        if 'duplicate' in analysis_results:
+            total_anomalies += analysis_results['duplicate'].get('duplicate_count', 0)
+        if 'backdated' in analysis_results:
+            total_anomalies += analysis_results['backdated'].get('backdated_count', 0)
+        if 'holiday' in analysis_results:
+            total_anomalies += analysis_results['holiday'].get('holiday_postings_count', 0)
+        if 'unusual_days' in analysis_results:
+            total_anomalies += analysis_results['unusual_days'].get('weekend_transactions_count', 0)
+        if 'closing_entries' in analysis_results:
+            total_anomalies += analysis_results['closing_entries'].get('closing_entries_count', 0)
+        if 'user' in analysis_results:
+            total_anomalies += analysis_results['user'].get('anomalies_count', 0)
+        
+        # Critical Risk Recommendations
+        if 'risk' in analysis_results:
+            risk_data = analysis_results['risk']
+            overall_risk_score = risk_data.get('overall_risk_score', 0)
+            critical_risk_count = risk_data.get('critical_risk_transactions', 0)
+            
+            if overall_risk_score >= 80 or critical_risk_count > 0:
+                recommendations.append({
+                    'source': 'AI Generated',
+                    'title': 'Immediate Critical Risk Review Required',
+                    'priority': 'CRITICAL',
+                    'urgency': 'IMMEDIATE',
+                    'category': 'Risk Management',
+                    'description': f'Critical risk level detected (Score: {overall_risk_score:.1f}, Critical transactions: {critical_risk_count}). Immediate executive review and intervention required.',
+                    'implementation_steps': [
+                        '1. Notify senior management immediately',
+                        '2. Initiate emergency risk assessment protocol',
+                        '3. Implement transaction hold procedures',
+                        '4. Schedule executive risk committee meeting within 24 hours',
+                        '5. Prepare detailed risk mitigation plan'
+                    ]
+                })
+        
+        # Duplicate Transaction Recommendations
+        if 'duplicate' in analysis_results:
+            duplicate_count = analysis_results['duplicate'].get('duplicate_count', 0)
+            if duplicate_count > 0:
+                recommendations.append({
+                    'source': 'AI Generated',
+                    'title': 'Implement Duplicate Detection Controls',
+                    'priority': 'HIGH',
+                    'urgency': 'HIGH',
+                    'category': 'Control Implementation',
+                    'description': f'Found {duplicate_count} duplicate transactions. Implement automated duplicate detection to prevent future occurrences.',
+                    'implementation_steps': [
+                        '1. Implement real-time duplicate detection algorithm',
+                        '2. Set up automated alerts for duplicate attempts',
+                        '3. Review and approve all duplicate transactions manually',
+                        '4. Implement user training on duplicate prevention',
+                        '5. Establish duplicate transaction reporting procedures'
+                    ]
+                })
+        
+        # Backdated Entry Recommendations
+        if 'backdated' in analysis_results:
+            backdated_count = analysis_results['backdated'].get('backdated_count', 0)
+            if backdated_count > 0:
+                recommendations.append({
+                    'source': 'AI Generated',
+                    'title': 'Strengthen Backdated Entry Controls',
+                    'priority': 'HIGH',
+                    'urgency': 'HIGH',
+                    'category': 'Compliance',
+                    'description': f'Detected {backdated_count} backdated entries. Implement strict authorization controls for backdated transactions.',
+                    'implementation_steps': [
+                        '1. Require dual approval for all backdated entries',
+                        '2. Implement time-based access controls',
+                        '3. Mandate detailed justification for backdated entries',
+                        '4. Set up automated monitoring for backdated patterns',
+                        '5. Conduct regular backdated entry audits'
+                    ]
+                })
+        
+        # Holiday/Weekend Activity Recommendations
+        if 'holiday' in analysis_results or 'unusual_days' in analysis_results:
+            holiday_count = analysis_results.get('holiday', {}).get('holiday_postings_count', 0)
+            weekend_count = analysis_results.get('unusual_days', {}).get('weekend_transactions_count', 0)
+            total_temporal_anomalies = holiday_count + weekend_count
+            
+            if total_temporal_anomalies > 0:
+                recommendations.append({
+                    'source': 'AI Generated',
+                    'title': 'Implement Temporal Risk Monitoring',
+                    'priority': 'MEDIUM',
+                    'urgency': 'MEDIUM',
+                    'category': 'Monitoring',
+                    'description': f'Detected {total_temporal_anomalies} transactions during holidays/weekends ({holiday_count} holiday, {weekend_count} weekend). Implement enhanced monitoring for off-hours activity.',
+                    'implementation_steps': [
+                        '1. Implement real-time holiday/weekend transaction monitoring',
+                        '2. Require additional approval for off-hours transactions',
+                        '3. Set up automated alerts for unusual temporal patterns',
+                        '4. Review holiday/weekend transaction policies',
+                        '5. Implement user activity logging for off-hours access'
+                    ]
+                })
+        
+        # High Anomaly Rate Recommendations
+        if total_anomalies > 1000:  # High anomaly threshold
+            recommendations.append({
+                'source': 'AI Generated',
+                'title': 'Comprehensive Anomaly Management Program',
+                'priority': 'HIGH',
+                'urgency': 'HIGH',
+                'category': 'Process Improvement',
+                'description': f'Extremely high anomaly rate detected ({total_anomalies} anomalies). Implement comprehensive anomaly management program.',
+                'implementation_steps': [
+                    '1. Conduct root cause analysis of anomaly patterns',
+                    '2. Implement automated anomaly detection system',
+                    '3. Establish anomaly response procedures',
+                    '4. Train staff on anomaly identification and reporting',
+                    '5. Implement continuous monitoring and improvement process'
+                ]
+            })
+        
+        # User Behavior Anomaly Recommendations
+        if 'user' in analysis_results:
+            user_anomalies = analysis_results['user'].get('anomalies_count', 0)
+            if user_anomalies > 0:
+                recommendations.append({
+                    'source': 'AI Generated',
+                    'title': 'Enhanced User Behavior Monitoring',
+                    'priority': 'MEDIUM',
+                    'urgency': 'MEDIUM',
+                    'category': 'User Management',
+                    'description': f'Detected {user_anomalies} user behavior anomalies. Implement enhanced user activity monitoring and access controls.',
+                    'implementation_steps': [
+                        '1. Implement user behavior analytics system',
+                        '2. Set up automated user anomaly detection',
+                        '3. Review user access permissions and roles',
+                        '4. Implement user activity logging and monitoring',
+                        '5. Conduct user training on proper system usage'
+                    ]
+                })
+        
+        # AI Risk Assessment Integration
+        if ai_risk_info and ai_risk_info.get('has_ai_assessment'):
+            ai_risk_score = ai_risk_info.get('ai_risk_score', 0)
+            confidence_score = ai_risk_info.get('confidence_score', 0)
+            
+            if ai_risk_score >= 70:
+                recommendations.append({
+                    'source': 'AI Generated',
+                    'title': 'AI-Identified High Risk Pattern',
+                    'priority': 'HIGH',
+                    'urgency': 'HIGH',
+                    'category': 'AI Risk Assessment',
+                    'description': f'AI assessment indicates high risk (Score: {ai_risk_score:.1f}, Confidence: {confidence_score:.1f}%). Investigate AI-identified risk patterns.',
+                    'implementation_steps': [
+                        '1. Review AI risk assessment report in detail',
+                        '2. Investigate identified risk patterns',
+                        '3. Validate AI findings with manual review',
+                        '4. Implement AI-recommended mitigation strategies',
+                        '5. Monitor AI model performance and accuracy'
+                    ]
+                })
+        
+        return recommendations
+    
+    def _generate_ai_instructions(self, analysis_results, ai_risk_info):
+        """Generate AI instructions based on risk patterns and analysis results"""
+        instructions = []
+        
+        # Risk Level Based Instructions
+        if 'risk' in analysis_results:
+            risk_data = analysis_results['risk']
+            overall_risk_score = risk_data.get('overall_risk_score', 0)
+            
+            if overall_risk_score >= 80:
+                instructions.extend([
+                    {
+                        'instruction_type': 'Immediate Action',
+                        'title': 'Critical Risk Response Protocol',
+                        'description': 'Execute critical risk response protocol immediately',
+                        'steps': [
+                            'Activate emergency response team',
+                            'Implement transaction hold procedures',
+                            'Notify senior management and board',
+                            'Initiate forensic investigation',
+                            'Prepare regulatory notification if required'
+                        ],
+                        'priority': 'CRITICAL',
+                        'estimated_time': 'Immediate (0-2 hours)'
+                    },
+                    {
+                        'instruction_type': 'Investigation',
+                        'title': 'Critical Risk Investigation',
+                        'description': 'Conduct comprehensive investigation of critical risk factors',
+                        'steps': [
+                            'Review all high-risk transactions',
+                            'Analyze risk concentration patterns',
+                            'Identify root causes of critical risks',
+                            'Document findings and evidence',
+                            'Prepare investigation report'
+                        ],
+                        'priority': 'CRITICAL',
+                        'estimated_time': '24-48 hours'
+                    }
+                ])
+            elif overall_risk_score >= 60:
+                instructions.extend([
+                    {
+                        'instruction_type': 'Risk Management',
+                        'title': 'High Risk Mitigation Plan',
+                        'description': 'Develop and implement high risk mitigation strategies',
+                        'steps': [
+                            'Assess high-risk transaction patterns',
+                            'Implement additional controls',
+                            'Enhance monitoring procedures',
+                            'Review and update risk policies',
+                            'Train staff on high-risk scenarios'
+                        ],
+                        'priority': 'HIGH',
+                        'estimated_time': '1-3 days'
+                    }
+                ])
+        
+        # Anomaly-Specific Instructions
+        total_anomalies = 0
+        anomaly_types = []
+        
+        if 'duplicate' in analysis_results:
+            duplicate_count = analysis_results['duplicate'].get('duplicate_count', 0)
+            if duplicate_count > 0:
+                total_anomalies += duplicate_count
+                anomaly_types.append('duplicate')
+        
+        if 'backdated' in analysis_results:
+            backdated_count = analysis_results['backdated'].get('backdated_count', 0)
+            if backdated_count > 0:
+                total_anomalies += backdated_count
+                anomaly_types.append('backdated')
+        
+        if total_anomalies > 100:
+            instructions.append({
+                'instruction_type': 'Process Improvement',
+                'title': 'Anomaly Management System Implementation',
+                'description': f'Implement comprehensive anomaly management system for {total_anomalies} detected anomalies',
+                'steps': [
+                    'Deploy automated anomaly detection system',
+                    'Establish anomaly classification procedures',
+                    'Implement anomaly response workflows',
+                    'Train staff on anomaly management',
+                    'Set up anomaly reporting and tracking'
+                ],
+                'priority': 'HIGH',
+                'estimated_time': '1-2 weeks'
+            })
+        
+        # AI Model Instructions
+        if ai_risk_info and ai_risk_info.get('has_ai_assessment'):
+            ai_risk_score = ai_risk_info.get('ai_risk_score', 0)
+            confidence_score = ai_risk_info.get('confidence_score', 0)
+            
+            if confidence_score < 70:
+                instructions.append({
+                    'instruction_type': 'AI Model Management',
+                    'title': 'AI Model Validation and Improvement',
+                    'description': f'AI model confidence is low ({confidence_score:.1f}%). Validate and improve AI model performance.',
+                    'steps': [
+                        'Review AI model training data',
+                        'Validate AI predictions with manual review',
+                        'Retrain AI models with updated data',
+                        'Implement model performance monitoring',
+                        'Establish AI model governance procedures'
+                    ],
+                    'priority': 'MEDIUM',
+                    'estimated_time': '2-4 weeks'
+                })
+        
+        # Compliance Instructions
+        if 'compliance' in str(analysis_results).lower() or any('compliance' in str(result).lower() for result in analysis_results.values()):
+            instructions.append({
+                'instruction_type': 'Compliance',
+                'title': 'Compliance Review and Enhancement',
+                'description': 'Conduct comprehensive compliance review and implement enhancements',
+                'steps': [
+                    'Review current compliance procedures',
+                    'Identify compliance gaps and weaknesses',
+                    'Update compliance policies and procedures',
+                    'Implement compliance monitoring systems',
+                    'Conduct compliance training for staff'
+                ],
+                'priority': 'HIGH',
+                'estimated_time': '2-3 weeks'
+            })
+        
+        # Data Quality Instructions
+        if total_anomalies > 500:
+            instructions.append({
+                'instruction_type': 'Data Quality',
+                'title': 'Data Quality Improvement Program',
+                'description': f'Implement data quality improvement program to address {total_anomalies} anomalies',
+                'steps': [
+                    'Conduct data quality assessment',
+                    'Implement data validation rules',
+                    'Establish data cleansing procedures',
+                    'Train staff on data quality standards',
+                    'Set up continuous data quality monitoring'
+                ],
+                'priority': 'MEDIUM',
+                'estimated_time': '3-4 weeks'
+            })
+        
+        return instructions
+    
+    def _calculate_data_quality_score(self, transaction_stats, analysis_results):
+        """Calculate data quality score based on various factors"""
+        score = 100
+        
+        # Deduct for missing data
+        if transaction_stats['total_transactions'] == 0:
+            score -= 50
+        
+        # Deduct for processing failures
+        if 'overall' in analysis_results:
+            overall = analysis_results['overall']
+            if overall.get('flagged_transactions_count', 0) > 0:
+                score -= min(20, overall['flagged_transactions_count'] * 0.5)
+        
+        # Deduct for anomalies
+        total_anomalies = sum([
+            analysis_results.get('duplicate', {}).get('duplicate_count', 0),
+            analysis_results.get('backdated', {}).get('backdated_count', 0),
+            analysis_results.get('user', {}).get('anomalies_count', 0)
+        ])
+        
+        if total_anomalies > 0:
+            score -= min(30, total_anomalies * 0.3)
+        
+        return max(0, score)
+    
+    def _get_financial_impact_summary(self, analysis_results, transaction_stats, data_file):
+        """Get comprehensive financial impact summary from all analyses"""
+        financial_summary = {
+            'total_anomaly_amount': 0.0,
+            'high_value_anomalies': 0,
+            'material_impact': False,
+            'impact_by_analysis_type': {},
+            'risk_concentration': 'LOW',
+            'anomaly_amount_percentage': 0.0,
+            'high_value_threshold': 1000000,  # 1M SAR threshold for high value
+            'material_impact_threshold': 5.0  # 5% threshold for material impact
+        }
+        
+        # Calculate total anomaly amount from all analysis types
+        total_anomaly_amount = 0.0
+        
+        # Check duplicate analysis
+        if 'duplicate' in analysis_results:
+            duplicate_amount = analysis_results['duplicate'].get('total_amount', 0)
+            if duplicate_amount > 0:
+                total_anomaly_amount += duplicate_amount
+                financial_summary['impact_by_analysis_type']['duplicate'] = duplicate_amount
+        
+        # Check backdated analysis
+        if 'backdated' in analysis_results:
+            backdated_amount = analysis_results['backdated'].get('total_amount', 0)
+            if backdated_amount > 0:
+                total_anomaly_amount += backdated_amount
+                financial_summary['impact_by_analysis_type']['backdated'] = backdated_amount
+        
+        # Check other analysis types for amount data in different field names
+        for analysis_type, data in analysis_results.items():
+            if analysis_type in ['duplicate', 'backdated']:
+                continue  # Already processed above
+                
+            if isinstance(data, dict):
+                analysis_amount = 0
+                
+                # Look for amount fields in various possible names
+                amount_fields = ['total_amount', 'amount', 'total_value', 'value', 'sum_amount']
+                for field in amount_fields:
+                    if field in data and data[field] > 0:
+                        analysis_amount += data[field]
+                        break  # Only count once per analysis type
+                
+                # Check nested structures for financial data
+                if analysis_type == 'overall':
+                    # Check flag_summary for anomaly amounts
+                    if 'flag_summary' in data and isinstance(data['flag_summary'], dict):
+                        flag_summary = data['flag_summary']
+                        if 'amount_summary' in flag_summary and isinstance(flag_summary['amount_summary'], dict):
+                            amount_summary = flag_summary['amount_summary']
+                            if 'total_amount' in amount_summary:
+                                analysis_amount += amount_summary['total_amount']
+                
+                elif analysis_type == 'general':
+                    # Check trial_balance_summary for financial data
+                    if 'trial_balance_summary' in data and isinstance(data['trial_balance_summary'], dict):
+                        trial_balance = data['trial_balance_summary']
+                        # Don't add total_amount here as it's the overall file total, not anomaly amount
+                        # But we can track it separately for reference
+                        pass
+                
+                # Add the analysis amount to total if it's anomaly-related
+                if analysis_amount > 0:
+                    total_anomaly_amount += analysis_amount
+                    if analysis_type not in financial_summary['impact_by_analysis_type']:
+                        financial_summary['impact_by_analysis_type'][analysis_type] = 0
+                    financial_summary['impact_by_analysis_type'][analysis_type] += analysis_amount
+        
+        # Calculate amounts for other anomaly types directly from database
+        if data_file:
+            from .models import SAPGLPosting
+            from django.db import models
+            
+            # Holiday postings
+            holiday_postings = SAPGLPosting.objects.filter(data_file=data_file, is_holiday_posting=True)
+            holiday_amount = float(holiday_postings.aggregate(total=models.Sum('amount_local_currency'))['total'] or 0)
+            if holiday_amount > 0:
+                total_anomaly_amount += holiday_amount
+                financial_summary['impact_by_analysis_type']['holiday'] = holiday_amount
+            
+            # Weekend/unusual days postings
+            weekend_postings = SAPGLPosting.objects.filter(data_file=data_file, is_unusual_days_posting=True)
+            weekend_amount = float(weekend_postings.aggregate(total=models.Sum('amount_local_currency'))['total'] or 0)
+            if weekend_amount > 0:
+                total_anomaly_amount += weekend_amount
+                financial_summary['impact_by_analysis_type']['unusual_days'] = weekend_amount
+            
+            # Closing entries
+            closing_postings = SAPGLPosting.objects.filter(data_file=data_file, is_closing_entry=True)
+            closing_amount = float(closing_postings.aggregate(total=models.Sum('amount_local_currency'))['total'] or 0)
+            if closing_amount > 0:
+                total_anomaly_amount += closing_amount
+                financial_summary['impact_by_analysis_type']['closing_entries'] = closing_amount
+            
+            # User anomalies
+            user_anomaly_postings = SAPGLPosting.objects.filter(data_file=data_file, anomaly_types__contains=['user_anomaly'])
+            user_anomaly_amount = float(user_anomaly_postings.aggregate(total=models.Sum('amount_local_currency'))['total'] or 0)
+            if user_anomaly_amount > 0:
+                total_anomaly_amount += user_anomaly_amount
+                financial_summary['impact_by_analysis_type']['user_anomaly'] = user_anomaly_amount
+        
+        financial_summary['total_anomaly_amount'] = total_anomaly_amount
+        
+        # Calculate high value anomalies count from transaction data
+        from .models import SAPGLPosting
+        
+        if data_file:
+            # Count high value anomalies (transactions with high risk scores and high amounts)
+            high_value_threshold = financial_summary['high_value_threshold']
+            high_value_anomalies = SAPGLPosting.objects.filter(
+                data_file=data_file,
+                overall_risk_score__gte=60,  # High or critical risk
+                amount_local_currency__gte=high_value_threshold
+            ).count()
+            financial_summary['high_value_anomalies'] = high_value_anomalies
+        
+        # Calculate material impact percentage
+        total_amount = transaction_stats.get('total_amount', 0)
+        if total_amount > 0:
+            anomaly_percentage = (total_anomaly_amount / total_amount) * 100
+            financial_summary['anomaly_amount_percentage'] = anomaly_percentage
+            financial_summary['material_impact'] = anomaly_percentage > financial_summary['material_impact_threshold']
+        
+        # Determine risk concentration based on both amount and percentage
+        if total_anomaly_amount > 50000000:  # Over 50M SAR
+            financial_summary['risk_concentration'] = 'CRITICAL'
+        elif total_anomaly_amount > 10000000:  # Over 10M SAR
+            financial_summary['risk_concentration'] = 'HIGH'
+        elif total_anomaly_amount > 1000000:  # Over 1M SAR
+            financial_summary['risk_concentration'] = 'MEDIUM'
+        else:
+            financial_summary['risk_concentration'] = 'LOW'
+        
+        # Add additional financial insights
+        financial_summary['financial_insights'] = []
+        if financial_summary['material_impact']:
+            financial_summary['financial_insights'].append(f"Material impact detected: {anomaly_percentage:.2f}% of total transactions")
+        
+        if financial_summary['high_value_anomalies'] > 0:
+            financial_summary['financial_insights'].append(f"{financial_summary['high_value_anomalies']} high-value anomalies detected")
+        
+        if financial_summary['risk_concentration'] in ['HIGH', 'CRITICAL']:
+            financial_summary['financial_insights'].append(f"High risk concentration: {total_anomaly_amount:,.2f} SAR in anomalies")
+        
+        # Add breakdown by analysis type insights
+        impact_by_type = financial_summary['impact_by_analysis_type']
+        if impact_by_type:
+            # Find the analysis type with highest financial impact
+            max_impact_type = max(impact_by_type.items(), key=lambda x: x[1])
+            financial_summary['financial_insights'].append(f"Highest financial impact: {max_impact_type[0]} ({max_impact_type[1]:,.2f} SAR)")
+            
+            # Add insights for specific analysis types
+            if 'overall' in impact_by_type and impact_by_type['overall'] > 0:
+                financial_summary['financial_insights'].append(f"Overall flagged transactions: {impact_by_type['overall']:,.2f} SAR")
+            
+            if 'duplicate' in impact_by_type and impact_by_type['duplicate'] > 0:
+                financial_summary['financial_insights'].append(f"Duplicate transactions: {impact_by_type['duplicate']:,.2f} SAR")
+            
+            if 'backdated' in impact_by_type and impact_by_type['backdated'] > 0:
+                financial_summary['financial_insights'].append(f"Backdated entries: {impact_by_type['backdated']:,.2f} SAR")
+            
+            if 'holiday' in impact_by_type and impact_by_type['holiday'] > 0:
+                financial_summary['financial_insights'].append(f"Holiday postings: {impact_by_type['holiday']:,.2f} SAR")
+            
+            if 'unusual_days' in impact_by_type and impact_by_type['unusual_days'] > 0:
+                financial_summary['financial_insights'].append(f"Weekend/unusual days: {impact_by_type['unusual_days']:,.2f} SAR")
+            
+            if 'closing_entries' in impact_by_type and impact_by_type['closing_entries'] > 0:
+                financial_summary['financial_insights'].append(f"Closing entries: {impact_by_type['closing_entries']:,.2f} SAR")
+            
+            if 'user_anomaly' in impact_by_type and impact_by_type['user_anomaly'] > 0:
+                financial_summary['financial_insights'].append(f"User anomalies: {impact_by_type['user_anomaly']:,.2f} SAR")
+        
+        # Add summary statistics
+        financial_summary['summary_statistics'] = {
+            'total_analysis_types_with_amounts': len(impact_by_type),
+            'largest_anomaly_amount': max(impact_by_type.values()) if impact_by_type else 0,
+            'average_anomaly_amount_per_type': sum(impact_by_type.values()) / len(impact_by_type) if impact_by_type else 0
+        }
+        
+        return financial_summary
+    
+    def _get_processing_efficiency_metrics(self, analysis_results, processing_info):
+        """Get comprehensive processing efficiency metrics"""
+        efficiency_metrics = {
+            'total_processing_time': 0.0,
+            'average_analysis_time': 0.0,
+            'fastest_analysis': None,
+            'slowest_analysis': None,
+            'efficiency_score': 100,
+            'total_analyses': 0,
+            'completed_analyses': 0,
+            'processing_job_info': {},
+            'performance_insights': []
+        }
+        
+        # Get processing job information
+        if processing_info:
+            efficiency_metrics['processing_job_info'] = {
+                'has_processing_job': processing_info.get('has_processing_job', False),
+                'job_id': processing_info.get('job_id'),
+                'status': processing_info.get('status'),
+                'processing_duration': processing_info.get('processing_duration', 0),
+                'started_at': processing_info.get('started_at'),
+                'completed_at': processing_info.get('completed_at'),
+                'requested_anomalies': processing_info.get('requested_anomalies', [])
+            }
+        
+        # Calculate total processing time from all analysis results
+        total_time = 0.0
+        completed_analyses = []
+        
+        # Get processing times from analysis results
+        for analysis_type, results in analysis_results.items():
+            if isinstance(results, dict):
+                duration = results.get('processing_duration', 0)
+                if duration and duration > 0:
+                    total_time += duration
+                    completed_analyses.append({
+                        'type': analysis_type,
+                        'duration': duration,
+                        'analysis_id': results.get('analysis_id', '')
+                    })
+        
+        # Use processing_info duration if available and higher than analysis total
+        processing_duration = processing_info.get('processing_duration', 0) if processing_info else 0
+        if processing_duration > total_time:
+            total_time = processing_duration
+            efficiency_metrics['performance_insights'].append(f"Using processing job duration: {processing_duration:.2f}s")
+        
+        efficiency_metrics['total_processing_time'] = total_time
+        efficiency_metrics['total_analyses'] = len(analysis_results)
+        efficiency_metrics['completed_analyses'] = len(completed_analyses)
+        
+        if completed_analyses:
+            # Calculate average analysis time
+            efficiency_metrics['average_analysis_time'] = total_time / len(completed_analyses)
+            
+            # Find fastest and slowest analyses
+            fastest = min(completed_analyses, key=lambda x: x['duration'])
+            slowest = max(completed_analyses, key=lambda x: x['duration'])
+            
+            efficiency_metrics['fastest_analysis'] = {
+                'type': self._get_analysis_type_name(fastest['type']),
+                'time': fastest['duration']
+            }
+            efficiency_metrics['slowest_analysis'] = {
+                'type': self._get_analysis_type_name(slowest['type']),
+                'time': slowest['duration']
+            }
+            
+            # Add performance insights
+            if len(completed_analyses) > 1:
+                time_diff = slowest['duration'] - fastest['duration']
+                efficiency_metrics['performance_insights'].append(f"Performance variance: {time_diff:.2f}s between fastest and slowest")
+        
+        # Calculate comprehensive efficiency score
+        efficiency_score = 100
+        
+        # Time-based penalties
+        if total_time > 0:
+            if total_time > 300:  # Over 5 minutes
+                efficiency_score -= 30
+                efficiency_metrics['performance_insights'].append("Long processing time detected (>5 minutes)")
+            elif total_time > 120:  # Over 2 minutes
+                efficiency_score -= 15
+                efficiency_metrics['performance_insights'].append("Moderate processing time (>2 minutes)")
+        
+        # Completion-based penalties
+        completion_rate = len(completed_analyses) / len(analysis_results) if analysis_results else 0
+        if completion_rate < 0.5:  # Less than 50% completion
+            efficiency_score -= 25
+            efficiency_metrics['performance_insights'].append(f"Low completion rate: {completion_rate:.1%}")
+        elif completion_rate < 0.8:  # Less than 80% completion
+            efficiency_score -= 10
+            efficiency_metrics['performance_insights'].append(f"Moderate completion rate: {completion_rate:.1%}")
+        
+        # Analysis count penalties
+        if len(analysis_results) > 10:
+            efficiency_score -= 5
+            efficiency_metrics['performance_insights'].append("High number of analyses may impact performance")
+        
+        efficiency_metrics['efficiency_score'] = max(0, efficiency_score)
+        
+        # Add positive insights
+        if completion_rate >= 0.8:
+            efficiency_metrics['performance_insights'].append(f"Good completion rate: {completion_rate:.1%}")
+        if total_time < 60:
+            efficiency_metrics['performance_insights'].append("Fast processing time (<1 minute)")
+        
+        return efficiency_metrics
+    
+    def _get_analysis_type_name(self, analysis_type):
+        """Get human-readable analysis type name"""
+        if isinstance(analysis_type, dict):
+            # Handle old format with analysis_id
+            analysis_id = analysis_type.get('analysis_id', '')
+            if 'duplicate' in analysis_id:
+                return 'Duplicate Analysis'
+            elif 'backdated' in analysis_id:
+                return 'Backdated Analysis'
+            elif 'user' in analysis_id:
+                return 'User Analysis'
+            elif 'unusual_days' in analysis_id:
+                return 'Unusual Days Analysis'
+            elif 'closing_entries' in analysis_id:
+                return 'Closing Entries Analysis'
+            elif 'holiday' in analysis_id:
+                return 'Holiday Analysis'
+            elif 'overall' in analysis_id:
+                return 'Overall Analysis'
+            elif 'risk' in analysis_id:
+                return 'Risk Analysis'
+            elif 'general' in analysis_id:
+                return 'General Analysis'
+            else:
+                return 'Unknown Analysis'
+        else:
+            # Handle new format with analysis type string
+            analysis_type_lower = analysis_type.lower()
+            if analysis_type_lower == 'duplicate':
+                return 'Duplicate Analysis'
+            elif analysis_type_lower == 'backdated':
+                return 'Backdated Analysis'
+            elif analysis_type_lower == 'user':
+                return 'User Analysis'
+            elif analysis_type_lower == 'unusual_days':
+                return 'Unusual Days Analysis'
+            elif analysis_type_lower == 'closing_entries':
+                return 'Closing Entries Analysis'
+            elif analysis_type_lower == 'holiday':
+                return 'Holiday Analysis'
+            elif analysis_type_lower == 'overall':
+                return 'Overall Analysis'
+            elif analysis_type_lower == 'risk':
+                return 'Risk Analysis'
+            elif analysis_type_lower == 'general':
+                return 'General Analysis'
+            else:
+                return f'{analysis_type.title()} Analysis'
+
+    
+    def _get_all_analysis_results(self, data_file):
+        """Get all available analysis results for the file"""
+        results = {}
+        
+        # Overall Analysis
+        overall = OverallAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if overall:
+            results['overall'] = {
+                'analysis_id': str(overall.id),
+                'analysis_date': overall.analysis_date.isoformat(),
+                'analysis_type': overall.analysis_type,
+                'processing_duration': overall.processing_duration,
+                'transaction_summary': overall.transaction_summary or {},
+                'flag_summary': overall.flag_summary or {},
+                'flagged_transactions': overall.flagged_transactions or [],
+                'flagged_transactions_count': len(overall.flagged_transactions) if overall.flagged_transactions else 0,
+                'expense_analysis': overall.expense_analysis or {},
+                'financial_statement_impact': overall.financial_statement_impact or {},
+                'analysis_summary': overall.analysis_summary or {},
+                'anomaly_list': overall.anomaly_list or [],
+                'chart_data': overall.chart_data or {},
+                'risk_assessment': overall.risk_assessment or {},
+                'audit_recommendations': overall.audit_recommendations or {},
+                'compliance_assessment': overall.compliance_assessment or {},
+                'export_data': overall.export_data or []
+            }
+        
+        # Risk Analysis
+        risk = RiskScoringDocument.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-document_date').first()
+        if risk:
+            results['risk'] = {
+                'document_id': str(risk.id),
+                'document_date': risk.document_date.isoformat(),
+                'document_type': risk.document_type,
+                'document_version': risk.document_version,
+                'total_transactions': risk.total_transactions,
+                'high_risk_transactions': risk.high_risk_transactions,
+                'medium_risk_transactions': risk.medium_risk_transactions,
+                'low_risk_transactions': risk.low_risk_transactions,
+                'critical_risk_transactions': risk.critical_risk_transactions,
+                'overall_risk_score': risk.overall_risk_score,
+                'methodology_overview': risk.methodology_overview or {},
+                'risk_factors': risk.risk_factors or {},
+                'scoring_criteria': risk.scoring_criteria or {},
+                'risk_calculations': risk.risk_calculations or {},
+                'risk_distributions': risk.risk_distributions or {},
+                'recommendations': risk.recommendations or {},
+                'audit_implications': risk.audit_implications or {},
+                'analysis_summary': risk.analysis_summary or {},
+                'anomaly_list': risk.anomaly_list or [],
+                'chart_data': risk.chart_data or {},
+                'risk_assessment': risk.risk_assessment or {},
+                'audit_recommendations': risk.audit_recommendations or {},
+                'compliance_assessment': risk.compliance_assessment or {},
+                'export_data': risk.export_data or []
+            }
+        
+        # General Analysis
+        general = GeneralAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if general:
+            results['general'] = {
+                'analysis_id': str(general.id),
+                'analysis_date': general.analysis_date.isoformat(),
+                'processing_duration': general.processing_duration,
+                'trial_balance_summary': general.trial_balance_summary or {},
+                'gl_account_summaries': general.gl_account_summaries or [],
+                'gl_account_summaries_count': len(general.gl_account_summaries) if general.gl_account_summaries else 0,
+                'user_summaries': general.user_summaries or [],
+                'user_summaries_count': len(general.user_summaries) if general.user_summaries else 0,
+                'statistical_calculations': general.statistical_calculations or {},
+                'financial_statement_impact': general.financial_statement_impact or {},
+                'chart_data': general.chart_data or {},
+                'export_data': general.export_data or [],
+                'analysis_summary': general.analysis_summary or {},
+                'anomaly_list': general.anomaly_list or [],
+                'risk_assessment': general.risk_assessment or {},
+                'audit_recommendations': general.audit_recommendations or {},
+                'compliance_assessment': general.compliance_assessment or {}
+            }
+        
+        # Duplicate Analysis
+        duplicate = DuplicateAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if duplicate:
+            results['duplicate'] = {
+                'analysis_id': str(duplicate.id),
+                'analysis_date': duplicate.analysis_date.isoformat(),
+                'duplicate_count': duplicate.get_anomaly_count(),
+                'total_amount': float(duplicate.get_total_amount()),
+                'risk_distribution': duplicate.get_risk_distribution()
+            }
+        
+        # Backdated Analysis
+        backdated = BackdatedAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if backdated:
+            results['backdated'] = {
+                'analysis_id': str(backdated.id),
+                'analysis_date': backdated.analysis_date.isoformat(),
+                'backdated_count': backdated.get_anomaly_count(),
+                'total_amount': float(backdated.get_total_amount()),
+                'risk_distribution': backdated.get_risk_distribution()
+            }
+        
+        # User Analysis
+        user = UserAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if user:
+            results['user'] = {
+                'analysis_id': str(user.id),
+                'analysis_date': user.analysis_date.isoformat(),
+                'anomalies_count': user.get_anomalies_count(),
+                'total_users': user.get_total_users(),
+                'total_transactions': user.get_total_transactions(),
+                'high_risk_users_count': user.get_high_risk_users_count()
+            }
+        
+        # Unusual Days Analysis
+        unusual_days = UnusualDaysAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if unusual_days:
+            results['unusual_days'] = {
+                'analysis_id': str(unusual_days.id),
+                'analysis_date': unusual_days.analysis_date.isoformat(),
+                'weekend_transactions_count': unusual_days.get_weekend_transactions_count(),
+                'unusual_days_count': unusual_days.get_unusual_days_count()
+            }
+        
+        # Closing Entries Analysis
+        closing_entries = ClosingEntriesAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if closing_entries:
+            results['closing_entries'] = {
+                'analysis_id': str(closing_entries.id),
+                'analysis_date': closing_entries.analysis_date.isoformat(),
+                'closing_entries_count': closing_entries.get_closing_entries_count(),
+                'post_close_entries_count': closing_entries.get_post_close_entries_count()
+            }
+        
+        # Holiday Analysis
+        holiday = HolidayAnalysisResult.objects.filter(
+            data_file=data_file, 
+            status='COMPLETED'
+        ).order_by('-analysis_date').first()
+        if holiday:
+            results['holiday'] = {
+                'analysis_id': str(holiday.id),
+                'analysis_date': holiday.analysis_date.isoformat(),
+                'holiday_postings_count': holiday.get_holiday_postings_count(),
+                'holiday_percentage': holiday.get_holiday_percentage(),
+                'unique_holidays': holiday.get_unique_holidays(),
+                'overall_risk_score': holiday.get_overall_risk_score()
+            }
+        
+        return results
+    
+    def _get_transaction_statistics(self, data_file):
+        """Get basic statistics from SAPGLPosting data"""
+        postings = SAPGLPosting.objects.filter(data_file=data_file)
+        
+        if not postings.exists():
+            return {
+                'total_transactions': 0,
+                'total_amount': 0,
+                'unique_accounts': 0,
+                'unique_users': 0,
+                'date_range': {},
+                'amount_range': {},
+                'transaction_types': {},
+                'anomaly_flags': {}
+            }
+        
+        # Basic counts
+        total_transactions = postings.count()
+        total_amount = postings.aggregate(
+            total=models.Sum('amount_local_currency')
+        )['total'] or 0
+        
+        # Unique counts
+        unique_accounts = postings.values('gl_account').distinct().count()
+        unique_users = postings.values('user_name').distinct().count()
+        
+        # Date range
+        date_range = postings.aggregate(
+            min_date=models.Min('posting_date'),
+            max_date=models.Max('posting_date')
+        )
+        
+        # Amount range
+        amount_range = postings.aggregate(
+            min_amount=models.Min('amount_local_currency'),
+            max_amount=models.Max('amount_local_currency')
+        )
+        
+        # Transaction types
+        transaction_types = dict(
+            postings.values('transaction_type').annotate(
+                count=models.Count('id')
+            ).values_list('transaction_type', 'count')
+        )
+        
+        # Anomaly flags
+        anomaly_flags = {
+            'duplicates': postings.filter(is_duplicate=True).count(),
+            'backdated': postings.filter(is_backdated=True).count(),
+            'holiday_postings': postings.filter(is_holiday_posting=True).count(),
+            'unusual_days': postings.filter(is_unusual_days_posting=True).count(),
+            'user_anomalies': postings.filter(is_user_anomaly=True).count(),
+            'closing_entries': postings.filter(is_closing_entry=True).count(),
+            'high_value': postings.filter(amount_local_currency__gt=1000000).count()
+        }
+        
+        return {
+            'total_transactions': total_transactions,
+            'total_amount': float(total_amount),
+            'unique_accounts': unique_accounts,
+            'unique_users': unique_users,
+            'date_range': {
+                'min_date': date_range['min_date'].isoformat() if date_range['min_date'] else None,
+                'max_date': date_range['max_date'].isoformat() if date_range['max_date'] else None
+            },
+            'amount_range': {
+                'min_amount': float(amount_range['min_amount']) if amount_range['min_amount'] else 0,
+                'max_amount': float(amount_range['max_amount']) if amount_range['max_amount'] else 0
+            },
+            'transaction_types': transaction_types,
+            'anomaly_flags': anomaly_flags
+        }
+    
+    def _calculate_summary_metrics(self, analysis_results, transaction_stats, data_file):
+        """Calculate simple summary metrics"""
+        total_anomalies = 0
+        
+        # Count anomalies from analysis results
+        if 'duplicate' in analysis_results:
+            total_anomalies += analysis_results['duplicate'].get('duplicate_count', 0)
+        if 'backdated' in analysis_results:
+            total_anomalies += analysis_results['backdated'].get('backdated_count', 0)
+        if 'user' in analysis_results:
+            total_anomalies += analysis_results['user'].get('anomalies_count', 0)
+        if 'unusual_days' in analysis_results:
+            total_anomalies += analysis_results['unusual_days'].get('weekend_transactions_count', 0)
+            total_anomalies += analysis_results['unusual_days'].get('unusual_days_count', 0)
+        if 'holiday' in analysis_results:
+            total_anomalies += analysis_results['holiday'].get('holiday_postings_count', 0)
+        if 'closing_entries' in analysis_results:
+            total_anomalies += analysis_results['closing_entries'].get('closing_entries_count', 0)
+            total_anomalies += analysis_results['closing_entries'].get('post_close_entries_count', 0)
+        
+        # Get overall risk score
+        overall_risk_score = 0
+        if 'risk' in analysis_results:
+            overall_risk_score = analysis_results['risk'].get('overall_risk_score', 0)
+        
+        return {
+            'total_anomalies': total_anomalies,
+            'anomaly_percentage': (total_anomalies / transaction_stats['total_transactions'] * 100) if transaction_stats['total_transactions'] > 0 else 0,
+            'overall_risk_score': overall_risk_score,
+            'risk_level': self._get_risk_level(overall_risk_score),
+            'processing_success_rate': (data_file.processed_records / data_file.total_records * 100) if data_file.total_records > 0 else 0
+        }
+    
 class SAPGLPostingPagination(PageNumberPagination):
     page_size = 50
     page_size_query_param = 'page_size'
@@ -10645,14 +14311,8 @@ class ExcelExportView(generics.GenericAPIView):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
                 
-        except DataFile.DoesNotExist:
-            return Response(
-                {'error': 'Data file not found'}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
         except Exception as e:
             logger.error(f"Error generating Excel export: {e}")
             return Response(
                 {'error': str(e)}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR)
