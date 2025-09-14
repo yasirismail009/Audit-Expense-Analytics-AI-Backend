@@ -1,63 +1,13 @@
 from rest_framework import serializers
 from .models import (
-    SAPGLPosting, DataFile, AnalysisSession, TransactionAnalysis, GLAccount, 
-    FileProcessingJob, MLModelTraining, OverallAnalysisResult, RiskScoringDocument, 
+    SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, RiskScoringDocument, 
     DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, 
     ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult, HolidayAnalysisResult, 
-    GeneralAnalysisResult, AIRiskAssessment, RiskPattern, AnomalyCluster, 
-    AIRiskRecommendation, RiskTrend, ModelPerformance
+    GeneralAnalysisResult, CompletenessTestResult
 )
 from decimal import Decimal
 import uuid
 
-class GLAccountSerializer(serializers.ModelSerializer):
-    """Serializer for GL Account data"""
-    
-    current_balance = serializers.ReadOnlyField()
-    total_debits = serializers.SerializerMethodField()
-    total_credits = serializers.SerializerMethodField()
-    transaction_count = serializers.SerializerMethodField()
-    
-    class Meta:
-        model = GLAccount
-        fields = '__all__'
-        read_only_fields = ['id', 'created_at', 'updated_at']
-    
-    def get_total_debits(self, obj):
-        """Calculate total debits for this account"""
-        from django.db.models import Sum
-        return obj.postings.filter(transaction_type='DEBIT').aggregate(
-            total=Sum('amount_local_currency')
-        )['total'] or Decimal('0.00')
-    
-    def get_total_credits(self, obj):
-        """Calculate total credits for this account"""
-        from django.db.models import Sum
-        return obj.postings.filter(transaction_type='CREDIT').aggregate(
-            total=Sum('amount_local_currency')
-        )['total'] or Decimal('0.00')
-    
-    def get_transaction_count(self, obj):
-        """Get total transaction count for this account"""
-        return obj.postings.count()
-
-class GLAccountListSerializer(serializers.ModelSerializer):
-    """Lightweight serializer for listing GL Accounts"""
-    
-    current_balance = serializers.ReadOnlyField()
-    transaction_count = serializers.SerializerMethodField()
-    
-    class Meta:
-        model = GLAccount
-        fields = [
-            'id', 'account_id', 'account_name', 'account_type', 
-            'account_category', 'normal_balance', 'is_active',
-            'current_balance', 'transaction_count'
-        ]
-    
-    def get_transaction_count(self, obj):
-        """Get total transaction count for this account"""
-        return obj.postings.count()
 
 class SAPGLPostingSerializer(serializers.ModelSerializer):
     """Serializer for SAP GL Posting data"""
@@ -67,8 +17,7 @@ class SAPGLPostingSerializer(serializers.ModelSerializer):
     is_cleared = serializers.ReadOnlyField()
     has_arabic_text = serializers.ReadOnlyField()
     
-    # GL Account details
-    gl_account_details = GLAccountSerializer(source='gl_account_ref', read_only=True)
+    # GL Account details - removed since GLAccount model was deleted
     
     class Meta:
         model = SAPGLPosting
@@ -80,14 +29,13 @@ class SAPGLPostingListSerializer(serializers.ModelSerializer):
     
     is_high_value = serializers.ReadOnlyField()
     is_cleared = serializers.ReadOnlyField()
-    gl_account_name = serializers.CharField(source='gl_account_ref.account_name', read_only=True)
     
     class Meta:
         model = SAPGLPosting
         fields = [
             'id', 'document_number', 'document_type', 'posting_date', 
             'amount_local_currency', 'local_currency', 'transaction_type',
-            'gl_account', 'gl_account_name', 'profit_center', 'user_name', 
+            'gl_account', 'profit_center', 'user_name', 
             'fiscal_year', 'posting_period', 'is_high_value', 'is_cleared', 
             'created_at'
         ]
@@ -109,7 +57,7 @@ class DataFileSerializer(serializers.ModelSerializer):
 class DataFileUploadSerializer(serializers.Serializer):
     """Serializer for file upload requests"""
     
-    file = serializers.FileField(help_text='CSV file containing SAP GL posting data')
+    file = serializers.FileField(help_text='CSV or Excel file (xlsx, xls, xlsb) containing SAP GL posting data')
     description = serializers.CharField(max_length=500, required=False, help_text='Optional description of the file')
     
     # New fields for enhanced file upload flow
@@ -120,69 +68,6 @@ class DataFileUploadSerializer(serializers.Serializer):
     audit_start_date = serializers.DateField(help_text='Audit start date')
     audit_end_date = serializers.DateField(help_text='Audit end date')
 
-class AnalysisSessionSerializer(serializers.ModelSerializer):
-    """Serializer for analysis sessions"""
-    
-    # Computed fields
-    flag_rate = serializers.SerializerMethodField()
-    duration = serializers.SerializerMethodField()
-    
-    class Meta:
-        model = AnalysisSession
-        fields = '__all__'
-        read_only_fields = ['id', 'created_at', 'started_at', 'completed_at']
-    
-    def get_flag_rate(self, obj):
-        """Calculate flag rate percentage"""
-        if obj.total_transactions > 0:
-            return round((obj.flagged_transactions / obj.total_transactions) * 100, 2)
-        return 0.0
-    
-    def get_duration(self, obj):
-        """Calculate analysis duration in seconds"""
-        if obj.started_at and obj.completed_at:
-            return (obj.completed_at - obj.started_at).total_seconds()
-        return None
-
-class AnalysisSessionCreateSerializer(serializers.ModelSerializer):
-    """Serializer for creating analysis sessions"""
-    
-    class Meta:
-        model = AnalysisSession
-        fields = [
-            'session_name', 'description', 'date_from', 'date_to',
-            'min_amount', 'max_amount', 'document_types', 'gl_accounts',
-            'profit_centers', 'users'
-        ]
-
-class TransactionAnalysisSerializer(serializers.ModelSerializer):
-    """Serializer for transaction analysis results"""
-    
-    # Include transaction details
-    transaction = SAPGLPostingListSerializer(read_only=True)
-    
-    class Meta:
-        model = TransactionAnalysis
-        fields = '__all__'
-        read_only_fields = ['id', 'created_at', 'updated_at']
-
-class TransactionAnalysisListSerializer(serializers.ModelSerializer):
-    """Lightweight serializer for listing transaction analyses"""
-    
-    document_number = serializers.CharField(source='transaction.document_number', read_only=True)
-    amount = serializers.DecimalField(source='transaction.amount_local_currency', max_digits=20, decimal_places=2, read_only=True)
-    currency = serializers.CharField(source='transaction.local_currency', read_only=True)
-    user_name = serializers.CharField(source='transaction.user_name', read_only=True)
-    posting_date = serializers.DateField(source='transaction.posting_date', read_only=True)
-    
-    class Meta:
-        model = TransactionAnalysis
-        fields = [
-            'id', 'document_number', 'amount', 'currency', 'user_name', 
-            'posting_date', 'risk_score', 'risk_level', 'amount_anomaly',
-            'timing_anomaly', 'user_anomaly', 'account_anomaly', 'pattern_anomaly',
-            'created_at'
-        ]
 
 
 
@@ -330,35 +215,6 @@ class DashboardStatsSerializer(serializers.Serializer):
     date_from = serializers.DateField()
     date_to = serializers.DateField()
 
-class GLAccountAnalysisSerializer(serializers.Serializer):
-    """Serializer for GL Account analysis results"""
-    
-    account_id = serializers.CharField()
-    account_name = serializers.CharField()
-    account_type = serializers.CharField()
-    account_category = serializers.CharField()
-    normal_balance = serializers.CharField()
-    
-    # Balance information
-    current_balance = serializers.DecimalField(max_digits=20, decimal_places=2)
-    total_debits = serializers.DecimalField(max_digits=20, decimal_places=2)
-    total_credits = serializers.DecimalField(max_digits=20, decimal_places=2)
-    
-    # Transaction statistics
-    transaction_count = serializers.IntegerField()
-    debit_count = serializers.IntegerField()
-    credit_count = serializers.IntegerField()
-    
-    # Risk analysis
-    high_value_transactions = serializers.IntegerField()
-    flagged_transactions = serializers.IntegerField()
-    risk_score = serializers.FloatField()
-    
-    # Activity analysis
-    first_transaction_date = serializers.DateField(allow_null=True)
-    last_transaction_date = serializers.DateField(allow_null=True)
-    avg_transaction_amount = serializers.DecimalField(max_digits=20, decimal_places=2)
-    max_transaction_amount = serializers.DecimalField(max_digits=20, decimal_places=2)
 
 class TrialBalanceSerializer(serializers.Serializer):
     """Serializer for Trial Balance data"""
@@ -387,35 +243,6 @@ class TrialBalanceSerializer(serializers.Serializer):
     # Transaction counts
     transaction_count = serializers.IntegerField()
 
-class GLAccountChartSerializer(serializers.Serializer):
-    """Serializer for GL Account charts data"""
-    
-    # Account distribution by type
-    account_type_distribution = serializers.ListField()
-    
-    # Account distribution by category
-    account_category_distribution = serializers.ListField()
-    
-    # Top accounts by balance
-    top_accounts_by_balance = serializers.ListField()
-    
-    # Top accounts by transaction count
-    top_accounts_by_transactions = serializers.ListField()
-    
-    # Debit vs Credit analysis
-    debit_credit_analysis = serializers.DictField()
-    
-    # Monthly activity by account type
-    monthly_activity = serializers.ListField()
-    
-    # Risk distribution by account type
-    risk_distribution = serializers.ListField()
-
-class GLAccountUploadSerializer(serializers.Serializer):
-    """Serializer for GL Account master data upload"""
-    
-    file = serializers.FileField(help_text='CSV file containing GL Account master data')
-    description = serializers.CharField(max_length=500, required=False, help_text='Optional description of the file') 
 
 class DuplicateAnomalySerializer(serializers.Serializer):
     """Serializer for duplicate anomaly data"""
@@ -1142,65 +969,53 @@ class HolidayListSerializer(serializers.Serializer):
 
 
 # ============================================================================
-# AI RISK ASSESSMENT SERIALIZERS
+# COMPLETENESS TEST RESULT SERIALIZER
 # ============================================================================
 
-class AIRiskAssessmentSerializer(serializers.ModelSerializer):
-    """Serializer for AI Risk Assessment model"""
+class CompletenessTestResultSerializer(serializers.ModelSerializer):
+    """Serializer for Completeness Test Results"""
+    
+    # Computed fields
+    status_display = serializers.CharField(source='get_overall_status_display', read_only=True)
+    test_duration = serializers.SerializerMethodField()
+    data_file_name = serializers.CharField(source='data_file.file_name', read_only=True)
     
     class Meta:
-        model = AIRiskAssessment
-        fields = '__all__'
-        read_only_fields = ('id', 'analysis_date', 'created_at', 'updated_at')
+        model = CompletenessTestResult
+        fields = [
+            'id', 'data_file', 'data_file_name', 'engagement_id', 'test_timestamp',
+            'overall_status', 'status_display', 'overall_explanation', 'completeness_score',
+            'step1_gl_tb_reconciliation', 'step2_debit_credit_balance', 
+            'step3_account_coverage', 'step4_transaction_gaps',
+            'total_gl_records', 'total_tb_records', 'tests_passed', 'total_tests',
+            'critical_issues_count', 'comprehensive_statistics',
+            'processing_duration', 'test_duration'
+        ]
+        read_only_fields = ['id', 'test_timestamp', 'processing_duration']
     
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-        data['risk_summary'] = instance.get_risk_summary()
-        data['key_recommendations'] = instance.get_key_recommendations()
-        data['investigation_priorities'] = instance.get_investigation_priorities()
-        return data
+    def get_test_duration(self, obj):
+        """Get formatted test duration"""
+        if obj.processing_duration:
+            return f"{obj.processing_duration:.2f} seconds"
+        return None
 
 
-class RiskPatternSerializer(serializers.ModelSerializer):
-    """Serializer for Risk Pattern model"""
+class CompletenessTestSummarySerializer(serializers.ModelSerializer):
+    """Simplified serializer for completeness test summary"""
     
-    class Meta:
-        model = RiskPattern
-        fields = '__all__'
-        read_only_fields = ('id', 'first_detected', 'last_updated')
-
-
-class AnomalyClusterSerializer(serializers.ModelSerializer):
-    """Serializer for Anomaly Cluster model"""
-    
-    class Meta:
-        model = AnomalyCluster
-        fields = '__all__'
-        read_only_fields = ('id', 'created_at', 'updated_at')
-
-
-class AIRiskRecommendationSerializer(serializers.ModelSerializer):
-    """Serializer for AI Risk Recommendation model"""
+    data_file_name = serializers.CharField(source='data_file.file_name', read_only=True)
+    status_display = serializers.CharField(source='get_overall_status_display', read_only=True)
     
     class Meta:
-        model = AIRiskRecommendation
-        fields = '__all__'
-        read_only_fields = ('id', 'created_at', 'updated_at')
+        model = CompletenessTestResult
+        fields = [
+            'id', 'engagement_id', 'data_file_name', 'test_timestamp',
+            'overall_status', 'status_display', 'completeness_score',
+            'tests_passed', 'total_tests', 'critical_issues_count',
+            'total_gl_records', 'total_tb_records'
+        ]
 
 
-class RiskTrendSerializer(serializers.ModelSerializer):
-    """Serializer for Risk Trend model"""
-    
-    class Meta:
-        model = RiskTrend
-        fields = '__all__'
-        read_only_fields = ('id', 'created_at')
-
-
-class ModelPerformanceSerializer(serializers.ModelSerializer):
-    """Serializer for Model Performance model"""
-    
-    class Meta:
-        model = ModelPerformance
-        fields = '__all__'
-        read_only_fields = ('id', 'created_at')
+# ============================================================================
+# AI RISK ASSESSMENT SERIALIZERS - REMOVED (models deleted)
+# ============================================================================

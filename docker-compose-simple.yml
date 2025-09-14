@@ -13,7 +13,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U analytics_user -d analytics_db"]
       interval: 30s
@@ -24,7 +24,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -37,10 +37,6 @@ services:
   web:
     build: .
     command: python manage.py runserver 0.0.0.0:8000
-    volumes:
-      - .:/app
-      - static_volume:/app/static
-      - media_volume:/app/media
     ports:
       - "8000:8000"
     environment:
@@ -50,22 +46,18 @@ services:
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - REDIS_URL=redis://redis:6379/0
-      - DJANGO_SETTINGS_MODULE=analytics.settings
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
 
   # Celery Worker
   celery_worker:
     build: .
-    command: celery -A analytics worker --loglevel=info --concurrency=4
-    volumes:
-      - .:/app
-      - static_volume:/app/static
-      - media_volume:/app/media
+    command: celery -A analytics worker --loglevel=info --concurrency=2
     environment:
       - POSTGRES_DB=analytics_db
       - POSTGRES_USER=analytics_user
@@ -73,22 +65,18 @@ services:
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - REDIS_URL=redis://redis:6379/0
-      - DJANGO_SETTINGS_MODULE=analytics.settings
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
 
-  # Celery Beat (for scheduled tasks)
+  # Celery Beat (Scheduler)
   celery_beat:
     build: .
-    command: celery -A analytics beat --loglevel=info
-    volumes:
-      - .:/app
-      - static_volume:/app/static
-      - media_volume:/app/media
+    command: celery -A analytics beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
     environment:
       - POSTGRES_DB=analytics_db
       - POSTGRES_USER=analytics_user
@@ -96,16 +84,32 @@ services:
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - REDIS_URL=redis://redis:6379/0
-      - DJANGO_SETTINGS_MODULE=analytics.settings
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
+
+  # Celery Flower (Monitoring)
+  celery_flower:
+    build: .
+    command: sh -c "pip install flower && celery -A analytics flower --port=5555"
+    ports:
+      - "5555:5555"
+    environment:
+      - POSTGRES_DB=analytics_db
+      - POSTGRES_USER=analytics_user
+      - POSTGRES_PASSWORD=analytics_password
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - redis
 
 volumes:
   postgres_data:
   redis_data:
-  static_volume:
-  media_volume: 

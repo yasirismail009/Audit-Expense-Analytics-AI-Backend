@@ -558,10 +558,11 @@ class OverallAnalyzer:
             account_expenses[account_id]['total_amount'] += amount
             account_expenses[account_id]['transaction_count'] += 1
             
-            if transaction.transaction_type == 'DEBIT':
+            # Determine debit/credit based on amount (positive = debit, negative = credit)
+            if amount > 0:
                 account_expenses[account_id]['debit_amount'] += amount
             else:
-                account_expenses[account_id]['credit_amount'] += amount
+                account_expenses[account_id]['credit_amount'] += abs(amount)
         
         # Categorize accounts (simplified categorization)
         expense_categories = {

@@ -38,7 +38,7 @@ services:
     build: .
     command: python manage.py runserver 0.0.0.0:8000
     volumes:
-      - .:/app
+      - ${PWD}:/app
       - static_volume:/app/static
       - media_volume:/app/media
     ports:
@@ -50,24 +50,26 @@ services:
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - REDIS_URL=redis://redis:6379/0
-      - DJANGO_SETTINGS_MODULE=analytics.settings
-      - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,web
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # Celery Worker
   celery_worker:
     build: .
-    command: celery -A analytics worker --loglevel=info --concurrency=4 -Q default,analytics,ml_training,maintenance --hostname=worker1@%h --without-gossip --without-mingle --without-heartbeat
+    command: celery -A analytics worker --loglevel=info --concurrency=2
     volumes:
-      - .:/app
-      - static_volume:/app/static
+      - ${PWD}:/app
       - media_volume:/app/media
-      - ./temp_uploads:/app/temp_uploads
     environment:
       - POSTGRES_DB=analytics_db
       - POSTGRES_USER=analytics_user
@@ -75,44 +77,25 @@ services:
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - REDIS_URL=redis://redis:6379/0
-      - DJANGO_SETTINGS_MODULE=analytics.settings
-      - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,web
-      - CELERY_WORKER_CONCURRENCY=4
-      - CELERY_WORKER_MAX_TASKS_PER_CHILD=1000
-      - CELERY_WORKER_PREFETCH_MULTIPLIER=1
-      - CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP=true
-      - CELERY_BROKER_CONNECTION_MAX_RETRIES=20
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "celery", "-A", "analytics", "inspect", "ping"]
       interval: 30s
       timeout: 10s
-      retries: 5
-      start_period: 40s
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 1G
-      restart_policy:
-        condition: on-failure
-        delay: 5s
-        max_attempts: 3
-        window: 120s
+      retries: 3
 
-  # Celery Beat (for scheduled tasks)
+  # Celery Beat (Scheduler)
   celery_beat:
     build: .
-    command: celery -A analytics beat --loglevel=info
+    command: celery -A analytics beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
     volumes:
-      - .:/app
-      - static_volume:/app/static
+      - ${PWD}:/app
       - media_volume:/app/media
     environment:
       - POSTGRES_DB=analytics_db
@@ -121,37 +104,27 @@ services:
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - REDIS_URL=redis://redis:6379/0
-      - DJANGO_SETTINGS_MODULE=analytics.settings
-      - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,web
-      - CELERY_BEAT_SCHEDULE_FILENAME=/tmp/celerybeat-schedule
-      - CELERY_BEAT_SYNC_EVERY=1
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "celery", "-A", "analytics", "inspect", "ping"]
       interval: 30s
       timeout: 10s
-      retries: 5
-      start_period: 40s
-    deploy:
-      restart_policy:
-        condition: on-failure
-        delay: 5s
-        max_attempts: 3
-        window: 120s
+      retries: 3
 
-  # Celery Flower (monitoring) - Optional
+  # Celery Flower (Monitoring)
   celery_flower:
     build: .
-    command: sh -c "pip install flower==2.0.1 && celery -A analytics flower --port=5555"
-    volumes:
-      - .:/app
+    command: sh -c "pip install flower && celery -A analytics flower --port=5555"
     ports:
       - "5555:5555"
+    volumes:
+      - ${PWD}:/app
     environment:
       - POSTGRES_DB=analytics_db
       - POSTGRES_USER=analytics_user
@@ -159,19 +132,13 @@ services:
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - REDIS_URL=redis://redis:6379/0
-      - DJANGO_SETTINGS_MODULE=analytics.settings
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      celery_worker:
-        condition: service_started
-    restart: unless-stopped
+      - redis
 
 volumes:
   postgres_data:
   redis_data:
   static_volume:
   media_volume:
-  temp_uploads_volume: 

@@ -1,214 +1,143 @@
 #!/usr/bin/env python3
 """
-Script to flush all data from the database without restarting Docker
-This will clear all analysis results, jobs, and transaction data
+Script to flush all data from the analytics database
 """
 
 import os
+import sys
 import django
+
+# Add the project root to Python path
+sys.path.append('/app')
 
 # Setup Django
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'analytics.settings')
 django.setup()
 
-from core.models import *
-from django.db import connection
+from core.models import (
+    DataFile, SAPGLPosting, SAPGLPostingError, 
+    TrialBalance, ChartOfAccount, GLAccount,
+    FileProcessingJob, FileProcessingTask
+)
+from users.models import User
 
 def flush_all_data():
     """Flush all data from the database"""
-    print("🗑️  FLUSHING ALL DATA FROM DATABASE")
+    
+    print("🧹 FLUSHING ALL DATA FROM DATABASE")
     print("=" * 50)
     
-    # Get counts before deletion
-    print("\n📊 CURRENT DATA COUNTS:")
-    print(f"  DataFiles: {DataFile.objects.count()}")
-    print(f"  FileProcessingJobs: {FileProcessingJob.objects.count()}")
-    print(f"  SAPGLPostings: {SAPGLPosting.objects.count()}")
-    print(f"  GeneralAnalysisResult: {GeneralAnalysisResult.objects.count()}")
-    print(f"  DuplicateAnalysisResult: {DuplicateAnalysisResult.objects.count()}")
-    print(f"  BackdatedAnalysisResult: {BackdatedAnalysisResult.objects.count()}")
-    print(f"  UserAnalysisResult: {UserAnalysisResult.objects.count()}")
-    print(f"  ClosingEntriesAnalysisResult: {ClosingEntriesAnalysisResult.objects.count()}")
-    print(f"  UnusualDaysAnalysisResult: {UnusualDaysAnalysisResult.objects.count()}")
-    print(f"  HolidayAnalysisResult: {HolidayAnalysisResult.objects.count()}")
-    print(f"  OverallAnalysisResult: {OverallAnalysisResult.objects.count()}")
-    print(f"  RiskScoringDocument: {RiskScoringDocument.objects.count()}")
-    
-    # Confirmation
-    print("\n⚠️  WARNING: This will delete ALL data!")
-    print("   - All uploaded files")
-    print("   - All processing jobs")
-    print("   - All transaction data")
-    print("   - All analysis results")
-    print("   - All ML training data")
-    
-    confirm = input("\n❓ Are you sure you want to continue? (yes/no): ")
-    
-    if confirm.lower() != 'yes':
-        print("❌ Operation cancelled.")
-        return
-    
-    print("\n🗑️  Starting data deletion...")
-    
     try:
-        # Delete in reverse order to avoid foreign key constraints
+        # Get counts before deletion (with error handling for missing tables)
+        gl_count = SAPGLPosting.objects.count()
         
-        # 1. Delete all analysis results
-        print("   🗑️  Deleting analysis results...")
-        GeneralAnalysisResult.objects.all().delete()
-        DuplicateAnalysisResult.objects.all().delete()
-        BackdatedAnalysisResult.objects.all().delete()
-        UserAnalysisResult.objects.all().delete()
-        ClosingEntriesAnalysisResult.objects.all().delete()
-        UnusualDaysAnalysisResult.objects.all().delete()
-        HolidayAnalysisResult.objects.all().delete()
-        OverallAnalysisResult.objects.all().delete()
-        RiskScoringDocument.objects.all().delete()
-        print("   ✅ Analysis results deleted")
+        try:
+            error_count = SAPGLPostingError.objects.count()
+        except Exception:
+            error_count = 0
+            print("⚠️  SAPGLPostingError table doesn't exist yet")
         
-        # 2. Delete all processing jobs
-        print("   🗑️  Deleting processing jobs...")
-        FileProcessingJob.objects.all().delete()
-        print("   ✅ Processing jobs deleted")
+        tb_count = TrialBalance.objects.count()
+        chart_count = ChartOfAccount.objects.count()
+        gl_account_count = GLAccount.objects.count()
+        data_file_count = DataFile.objects.count()
+        job_count = FileProcessingJob.objects.count()
+        task_count = FileProcessingTask.objects.count()
+        user_count = User.objects.count()
         
-        # 3. Delete all transaction data
-        print("   🗑️  Deleting transaction data...")
+        print(f"📊 Current Data Counts:")
+        print(f"   - GL Postings: {gl_count}")
+        print(f"   - GL Errors: {error_count}")
+        print(f"   - Trial Balance: {tb_count}")
+        print(f"   - Chart of Accounts: {chart_count}")
+        print(f"   - GL Accounts: {gl_account_count}")
+        print(f"   - Data Files: {data_file_count}")
+        print(f"   - Processing Jobs: {job_count}")
+        print(f"   - Processing Tasks: {task_count}")
+        print(f"   - Users: {user_count}")
+        
+        # Confirm deletion
+        print(f"\n⚠️  WARNING: This will delete ALL data from the database!")
+        print("🔄 Starting data deletion...")
+        
+        # Delete in order to respect foreign key constraints
+        print("\n🗑️  Deleting GL Posting Errors...")
+        try:
+            SAPGLPostingError.objects.all().delete()
+            print(f"✅ Deleted {error_count} GL Posting Errors")
+        except Exception:
+            print("⚠️  SAPGLPostingError table doesn't exist, skipping...")
+        
+        print("\n🗑️  Deleting GL Postings...")
         SAPGLPosting.objects.all().delete()
-        print("   ✅ Transaction data deleted")
+        print(f"✅ Deleted {gl_count} GL Postings")
         
-        # 4. Delete all data files
-        print("   🗑️  Deleting data files...")
+        print("\n🗑️  Deleting Trial Balance records...")
+        TrialBalance.objects.all().delete()
+        print(f"✅ Deleted {tb_count} Trial Balance records")
+        
+        print("\n🗑️  Deleting Chart of Accounts records...")
+        ChartOfAccount.objects.all().delete()
+        print(f"✅ Deleted {chart_count} Chart of Accounts records")
+        
+        print("\n🗑️  Deleting GL Accounts...")
+        GLAccount.objects.all().delete()
+        print(f"✅ Deleted {gl_account_count} GL Accounts")
+        
+        print("\n🗑️  Deleting Processing Tasks...")
+        FileProcessingTask.objects.all().delete()
+        print(f"✅ Deleted {task_count} Processing Tasks")
+        
+        print("\n🗑️  Deleting Processing Jobs...")
+        FileProcessingJob.objects.all().delete()
+        print(f"✅ Deleted {job_count} Processing Jobs")
+        
+        print("\n🗑️  Deleting Data Files...")
         DataFile.objects.all().delete()
-        print("   ✅ Data files deleted")
+        print(f"✅ Deleted {data_file_count} Data Files")
         
-        # 5. Reset auto-increment counters (PostgreSQL)
-        print("   🔄 Resetting auto-increment counters...")
-        with connection.cursor() as cursor:
-            cursor.execute("""
-                SELECT setval(pg_get_serial_sequence('core_datafile', 'id'), 1, false);
-                SELECT setval(pg_get_serial_sequence('core_fileprocessingjob', 'id'), 1, false);
-                SELECT setval(pg_get_serial_sequence('core_sapglposting', 'id'), 1, false);
-            """)
-        print("   ✅ Auto-increment counters reset")
+        # Note: Not deleting users as they might be needed for authentication
+        print(f"\n👤 Users preserved: {user_count} (not deleted for security)")
         
         # Verify deletion
-        print("\n📊 VERIFICATION - DATA COUNTS AFTER DELETION:")
-        print(f"  DataFiles: {DataFile.objects.count()}")
-        print(f"  FileProcessingJobs: {FileProcessingJob.objects.count()}")
-        print(f"  SAPGLPostings: {SAPGLPosting.objects.count()}")
-        print(f"  GeneralAnalysisResult: {GeneralAnalysisResult.objects.count()}")
-        print(f"  DuplicateAnalysisResult: {DuplicateAnalysisResult.objects.count()}")
-        print(f"  BackdatedAnalysisResult: {BackdatedAnalysisResult.objects.count()}")
-        print(f"  UserAnalysisResult: {UserAnalysisResult.objects.count()}")
-        print(f"  ClosingEntriesAnalysisResult: {ClosingEntriesAnalysisResult.objects.count()}")
-        print(f"  UnusualDaysAnalysisResult: {UnusualDaysAnalysisResult.objects.count()}")
-        print(f"  HolidayAnalysisResult: {HolidayAnalysisResult.objects.count()}")
-        print(f"  OverallAnalysisResult: {OverallAnalysisResult.objects.count()}")
-        print(f"  RiskScoringDocument: {RiskScoringDocument.objects.count()}")
+        print("\n🔍 Verifying deletion...")
+        remaining_gl = SAPGLPosting.objects.count()
         
-        print("\n✅ SUCCESS: All data has been flushed from the database!")
-        print("   The system is now clean and ready for new data.")
+        try:
+            remaining_errors = SAPGLPostingError.objects.count()
+        except Exception:
+            remaining_errors = 0
         
-    except Exception as e:
-        print(f"\n❌ ERROR: Failed to flush data: {e}")
-        print("   Please check the error and try again.")
-
-def flush_analysis_only():
-    """Flush only analysis results, keep files and transactions"""
-    print("🗑️  FLUSHING ANALYSIS RESULTS ONLY")
-    print("=" * 50)
-    
-    # Get counts before deletion
-    print("\n📊 CURRENT ANALYSIS COUNTS:")
-    print(f"  GeneralAnalysisResult: {GeneralAnalysisResult.objects.count()}")
-    print(f"  DuplicateAnalysisResult: {DuplicateAnalysisResult.objects.count()}")
-    print(f"  BackdatedAnalysisResult: {BackdatedAnalysisResult.objects.count()}")
-    print(f"  UserAnalysisResult: {UserAnalysisResult.objects.count()}")
-    print(f"  ClosingEntriesAnalysisResult: {ClosingEntriesAnalysisResult.objects.count()}")
-    print(f"  UnusualDaysAnalysisResult: {UnusualDaysAnalysisResult.objects.count()}")
-    print(f"  HolidayAnalysisResult: {HolidayAnalysisResult.objects.count()}")
-    print(f"  OverallAnalysisResult: {OverallAnalysisResult.objects.count()}")
-    print(f"  RiskScoringDocument: {RiskScoringDocument.objects.count()}")
-    
-    # Confirmation
-    print("\n⚠️  WARNING: This will delete ALL analysis results!")
-    print("   - All analysis results will be deleted")
-    print("   - Files and transactions will be kept")
-    print("   - Jobs will be reset to PENDING status")
-    
-    confirm = input("\n❓ Are you sure you want to continue? (yes/no): ")
-    
-    if confirm.lower() != 'yes':
-        print("❌ Operation cancelled.")
-        return
-    
-    print("\n🗑️  Starting analysis deletion...")
-    
-    try:
-        # Delete all analysis results
-        print("   🗑️  Deleting analysis results...")
-        GeneralAnalysisResult.objects.all().delete()
-        DuplicateAnalysisResult.objects.all().delete()
-        BackdatedAnalysisResult.objects.all().delete()
-        UserAnalysisResult.objects.all().delete()
-        ClosingEntriesAnalysisResult.objects.all().delete()
-        UnusualDaysAnalysisResult.objects.all().delete()
-        HolidayAnalysisResult.objects.all().delete()
-        OverallAnalysisResult.objects.all().delete()
-        RiskScoringDocument.objects.all().delete()
-        print("   ✅ Analysis results deleted")
+        remaining_tb = TrialBalance.objects.count()
+        remaining_chart = ChartOfAccount.objects.count()
+        remaining_gl_accounts = GLAccount.objects.count()
+        remaining_files = DataFile.objects.count()
+        remaining_jobs = FileProcessingJob.objects.count()
+        remaining_tasks = FileProcessingTask.objects.count()
         
-        # Reset job statuses to PENDING
-        print("   🔄 Resetting job statuses...")
-        FileProcessingJob.objects.all().update(
-            status='PENDING',
-            started_at=None,
-            completed_at=None,
-            processing_duration=None,
-            analytics_results={},
-            error_message=''
-        )
-        print("   ✅ Job statuses reset")
+        print(f"📊 Remaining Data Counts:")
+        print(f"   - GL Postings: {remaining_gl}")
+        print(f"   - GL Errors: {remaining_errors}")
+        print(f"   - Trial Balance: {remaining_tb}")
+        print(f"   - Chart of Accounts: {remaining_chart}")
+        print(f"   - GL Accounts: {remaining_gl_accounts}")
+        print(f"   - Data Files: {remaining_files}")
+        print(f"   - Processing Jobs: {remaining_jobs}")
+        print(f"   - Processing Tasks: {remaining_tasks}")
         
-        # Verify deletion
-        print("\n📊 VERIFICATION - ANALYSIS COUNTS AFTER DELETION:")
-        print(f"  GeneralAnalysisResult: {GeneralAnalysisResult.objects.count()}")
-        print(f"  DuplicateAnalysisResult: {DuplicateAnalysisResult.objects.count()}")
-        print(f"  BackdatedAnalysisResult: {BackdatedAnalysisResult.objects.count()}")
-        print(f"  UserAnalysisResult: {UserAnalysisResult.objects.count()}")
-        print(f"  ClosingEntriesAnalysisResult: {ClosingEntriesAnalysisResult.objects.count()}")
-        print(f"  UnusualDaysAnalysisResult: {UnusualDaysAnalysisResult.objects.count()}")
-        print(f"  HolidayAnalysisResult: {HolidayAnalysisResult.objects.count()}")
-        print(f"  OverallAnalysisResult: {OverallAnalysisResult.objects.count()}")
-        print(f"  RiskScoringDocument: {RiskScoringDocument.objects.count()}")
+        if (remaining_gl == 0 and remaining_errors == 0 and remaining_tb == 0 and 
+            remaining_chart == 0 and remaining_gl_accounts == 0 and 
+            remaining_files == 0 and remaining_jobs == 0 and remaining_tasks == 0):
+            print("\n✅ SUCCESS: All data has been flushed from the database!")
+        else:
+            print("\n⚠️  WARNING: Some data may still remain in the database")
         
-        print("\n✅ SUCCESS: All analysis results have been flushed!")
-        print("   Files and transactions are preserved.")
-        print("   Jobs are reset to PENDING status and ready for reprocessing.")
+        print("\n🎯 Data flush completed!")
         
     except Exception as e:
-        print(f"\n❌ ERROR: Failed to flush analysis results: {e}")
-        print("   Please check the error and try again.")
-
-def main():
-    """Main function"""
-    print("🗑️  DATA FLUSH UTILITY")
-    print("=" * 50)
-    print("Choose an option:")
-    print("1. Flush ALL data (files, jobs, transactions, analysis)")
-    print("2. Flush analysis results only (keep files and transactions)")
-    print("3. Exit")
-    
-    choice = input("\nEnter your choice (1-3): ")
-    
-    if choice == '1':
-        flush_all_data()
-    elif choice == '2':
-        flush_analysis_only()
-    elif choice == '3':
-        print("👋 Exiting...")
-    else:
-        print("❌ Invalid choice. Please run the script again.")
+        print(f"❌ Error during data flush: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    main() 
+    flush_all_data()

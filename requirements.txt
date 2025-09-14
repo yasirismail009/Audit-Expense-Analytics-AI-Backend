@@ -34,6 +34,7 @@ holidays==0.76
 kiwisolver==1.4.8
 kombu==5.5.4
 openpyxl==3.1.5
+pyxlsb
 packaging==25.0
 prompt_toolkit==3.0.51
 psutil==7.0.0

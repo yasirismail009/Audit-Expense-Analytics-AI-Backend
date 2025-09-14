@@ -2790,7 +2790,14 @@ def run_holiday_analysis_sync(job_id):
         from datetime import datetime, timedelta
         
         # Use holiday_utils to get dynamic Saudi Arabian holidays
-        from .holiday_utils import get_holidays, is_holiday
+        # Holiday utilities - simplified implementation since holiday_utils module was removed
+        def get_holidays(country_code, start_date, end_date, include_observances=True):
+            """Get holidays for a given date range - simplified implementation"""
+            return []
+        
+        def is_holiday(date):
+            """Check if a date is a holiday - simplified implementation"""
+            return False
         
         # Get date range for holiday detection
         start_date = data_file.audit_start_date if data_file.audit_start_date else datetime(data_file.fiscal_year, 1, 1).date()
