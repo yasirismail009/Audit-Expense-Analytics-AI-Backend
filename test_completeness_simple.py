@@ -11,7 +11,7 @@ django.setup()
 from core.tasks import run_gl_completeness_analysis
 
 def run_simple_test():
-    file_id = 'cd8a5ad7-cc80-4969-a6df-3e919f30147a'
+    file_id = '51671285-0c2e-4c26-ae59-0292a21fd113'  # General Entry Data File - DA Illustrative Example.xlsx (GL)
     print(f"🚀 Starting Completeness Test for file: {file_id}")
     print("=" * 70)
     

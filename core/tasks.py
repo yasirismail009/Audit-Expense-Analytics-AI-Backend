@@ -22,7 +22,8 @@ from .models import (
     RuleBasedModelTraining, DuplicateAnalysisModelTraining, BackdatedAnalysisModelTraining,
     UserAnalysisModelTraining, UnusualDaysAnalysisModelTraining, ClosingEntriesAnalysisModelTraining,
     HolidayAnalysisModelTraining, OverallRiskAnalysisModelTraining, ManualEntryAnalysisResult,
-    FileProcessingTask, CompletenessJob, TrialBalance, ChartOfAccount
+    FileProcessingTask, CompletenessJob, TrialBalance, ChartOfAccount, CompletenessTestResult,
+    GLAccount, Engagement
 )
 from .specialized_analysis_models import AnalysisModelManager
 from .ml_models import MLModelTrainer
@@ -7003,38 +7004,62 @@ def run_completeness_job(self, job_id):
 # GL COMPLETENESS ANALYSIS TASK
 # ============================================================================
 
-@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=600, soft_time_limit=540)
 def run_gl_completeness_analysis(self, data_file_id):
     """
-    Run GL-TB Completeness Test after GL file processing is complete
+    Run 2-Step GL Completeness Test after GL file processing is complete
     
-    Performs a 3-step completeness validation between General Ledger (GL) and Trial Balance (TB):
+    Performs a streamlined 2-step completeness validation:
     
-    Step 1: Sum all debit and credit entries in GL and confirm they reconcile with TB totals
-    Step 2: Verify that the overall sum of debits equals the overall sum of credits  
-    Step 3: Ensure every GL account included in TB is also present in GL data
+    Step 1: GL Completeness Check
+        - Verify GL is balanced (Credit - Debit = 0)
+        - Check data volume and availability (sufficient transactions, TB data present)
+        
+    Step 2: Account-wise Balance Verification
+        - For each account: Opening + Debits - Credits = Closing balance
+        - Cross-verify GL movements with TB movements per account
+        - Requires 90%+ pass rate for overall completion
+        
+    Features:
+        - Chart generation based on posting/document dates
+        - Enhanced logging and debugging
+        - Comprehensive statistics and scoring
+        - Database persistence of results
     
     Args:
         data_file_id (str): UUID of the DataFile to analyze
         
     Returns:
-        dict: Completeness test results with Pass/Fail status and explanation
+        dict: Completeness test results with Pass/Fail status and detailed explanation
     """
     task_name = "run_gl_completeness_analysis"
     start_time = timezone.now()
     
+    # Enhanced debugging setup
+    logger.info("=" * 80)
+    logger.info(f"🚀 STARTING COMPLETENESS ANALYSIS - Task ID: {self.request.id}")
+    logger.info(f"📁 Data File ID: {data_file_id}")
+    logger.info(f"⏰ Start Time: {start_time}")
+    logger.info(f"🔧 Celery Worker: {self.request.hostname}")
+    logger.info("=" * 80)
+    
     try:
         from django.db import models
-        from .models import DataFile, SAPGLPosting, TrialBalance
         
         # Get the data file
         try:
             data_file = DataFile.objects.get(id=data_file_id)
+            logger.info(f"✅ STEP 0.1: Data file retrieved successfully")
+            logger.info(f"   📄 File Name: {data_file.file_name}")
+            logger.info(f"   📊 File Type: {data_file.file_type}")
+            logger.info(f"   🎯 Engagement: {data_file.engagement_id}")
+            logger.info(f"   📈 Status: {data_file.status}")
+            logger.info(f"   📋 Total Records: {data_file.total_records}")
         except DataFile.DoesNotExist:
-            logger.error(f"Data file {data_file_id} not found for completeness analysis")
-            return {'success': False, 'error': f'Data file {data_file_id} not found'}
+            logger.error(f"❌ STEP 0.1 FAILED: DataFile with ID {data_file_id} not found")
+            return {'success': False, 'error': f'DataFile {data_file_id} not found'}
         
-        logger.info(f"Starting GL-TB completeness test for file: {data_file.file_name}")
+        logger.info(f"🔄 STEP 0.2: Starting GL-TB completeness test for file: {data_file.file_name}")
         
         # =======================================================================
         # AI-POWERED PRE-PROCESSING PREDICTION
@@ -7043,7 +7068,7 @@ def run_gl_completeness_analysis(self, data_file_id):
         ai_prediction_result = None
         try:
             # Trigger AI prediction to estimate completeness before full processing
-            logger.info("🤖 Running AI prediction for fast completeness estimation...")
+            logger.info("🤖 STEP 0.3: Running AI prediction for fast completeness estimation...")
             ai_prediction_task = predict_completeness_with_ai.delay(str(data_file.id), 'COMPLETENESS_PREDICTOR')
             ai_prediction_result = ai_prediction_task.get(timeout=30)  # Wait up to 30 seconds for prediction
             
@@ -7062,10 +7087,21 @@ def run_gl_completeness_analysis(self, data_file_id):
                 
         except Exception as ai_error:
             logger.warning(f"🤖 AI prediction skipped due to error: {ai_error}")
+            logger.info("🤖 Continuing without AI prediction...")
+        
+        # =======================================================================
+        # STEP 0.4: DATA LOADING AND VALIDATION
+        # =======================================================================
+        
+        logger.info("📊 STEP 0.4: Loading GL postings and Trial Balance data...")
         
         # Get GL postings and Trial Balance data for this engagement
         gl_postings = SAPGLPosting.objects.filter(data_file=data_file)
-        trial_balance_records = TrialBalance.objects.filter(data_file__engagement_id=data_file.engagement_id)
+        trial_balance_records = TrialBalance.objects.filter(data_file__engagement=data_file.engagement)
+        
+        logger.info(f"   📈 GL Postings found: {gl_postings.count():,}")
+        logger.info(f"   📋 TB Records found: {trial_balance_records.count():,}")
+        logger.info(f"   🎯 Engagement ID: {data_file.engagement_id}")
         
         # Check if we have both GL and TB data
         if not gl_postings.exists():
@@ -7083,548 +7119,452 @@ def run_gl_completeness_analysis(self, data_file_id):
                 }
             }
         
+        # Get Chart of Accounts data for this engagement
+        coa_records = GLAccount.objects.filter(engagement=data_file.engagement)
+        
         # =======================================================================
-        # STEP 1: Calculate GL totals and compare with TB totals
+        # STEP 1: GL COMPLETENESS CHECK
         # =======================================================================
         
+        logger.info("🔍 STEP 1: Starting GL Completeness Check...")
+        step1_start = timezone.now()
+        
         # Calculate GL totals (debits are positive, credits are negative)
+        logger.info("   📊 Calculating GL totals...")
         gl_total_debit = sum(float(p.amount_local_currency or 0) for p in gl_postings if float(p.amount_local_currency or 0) > 0)
         gl_total_credit = sum(abs(float(p.amount_local_currency or 0)) for p in gl_postings if float(p.amount_local_currency or 0) < 0)
         
-        # Calculate TB totals
-        # Note: TB data structure only has credit amounts, no debit amounts
-        tb_total_debit = sum(float(tb.debit or 0) for tb in trial_balance_records if tb.debit)
-        tb_total_credit = sum(float(tb.credit or 0) for tb in trial_balance_records if tb.credit)
+        # Check if GL is balanced (Credit - Debit = 0)
+        gl_net_balance = gl_total_credit - gl_total_debit
+        gl_is_balanced = abs(gl_net_balance) < 1.00  # Allow 1 unit variance
         
-        # If TB debits are 0 or None (which is the case for this TB structure), 
-        # calculate debit amounts from GL postings for TB accounts
-        if tb_total_debit == 0:
-            logger.info("TB debits are 0, calculating debit amounts from GL postings for TB accounts")
-            # Normalize TB account codes to match GL format
-            tb_accounts = [str(tb.gl_account).replace('.0', '') for tb in trial_balance_records]
-            # Also try with .0 suffix for GL matching
-            tb_accounts_with_suffix = [f"{acc}.0" for acc in tb_accounts]
-            
-            # Try both formats for GL matching
-            gl_debits_for_tb_accounts = gl_postings.filter(
-                models.Q(gl_account__in=tb_accounts) | models.Q(gl_account__in=tb_accounts_with_suffix)
-            ).aggregate(
-                total_debit=models.Sum('amount_local_currency', filter=models.Q(amount_local_currency__gt=0))
-            )['total_debit'] or 0
-            tb_total_debit = float(gl_debits_for_tb_accounts)
-            logger.info(f"Calculated TB debit total from GL: {tb_total_debit:,.2f}")
-            
-            # Also calculate TB credit total from GL for comparison
-            gl_credits_for_tb_accounts = gl_postings.filter(
-                models.Q(gl_account__in=tb_accounts) | models.Q(gl_account__in=tb_accounts_with_suffix)
-            ).aggregate(
-                total_credit=models.Sum('amount_local_currency', filter=models.Q(amount_local_currency__lt=0))
-            )['total_credit'] or 0
-            tb_total_credit_from_gl = abs(float(gl_credits_for_tb_accounts))
-            logger.info(f"TB credit from TB data: {tb_total_credit:,.2f}, from GL: {tb_total_credit_from_gl:,.2f}")
-            
-            # Use the GL-calculated credit total for reconciliation
-            tb_total_credit = tb_total_credit_from_gl
+        # Additional completeness checks
+        transaction_count = gl_postings.count()
+        account_count = gl_postings.values('gl_account').distinct().count()
+        has_tb = trial_balance_records.exists()
         
-        # Step 1 validation
-        debit_reconciles = abs(gl_total_debit - tb_total_debit) < 0.01
-        credit_reconciles = abs(gl_total_credit - tb_total_credit) < 0.01
-        step1_passed = debit_reconciles and credit_reconciles
+        # Volume and data availability check
+        volume_check = transaction_count >= 100 and account_count >= 10
+        data_availability = has_tb and gl_postings.exists()
         
-        step1_result = {
-            'description': 'GL totals should reconcile with TB totals',
+        step1_completeness_passed = gl_is_balanced and volume_check and data_availability
+        
+        logger.info(f"   💰 GL Debit Total: {gl_total_debit:,.2f}")
+        logger.info(f"   💰 GL Credit Total: {gl_total_credit:,.2f}")
+        logger.info(f"   ⚖️  GL Net Balance (Credit - Debit): {gl_net_balance:,.2f}")
+        logger.info(f"   ✅ GL Balanced: {'YES' if gl_is_balanced else 'NO'}")
+        logger.info(f"   📊 Transaction Count: {transaction_count:,}")
+        logger.info(f"   📋 Account Count: {account_count:,}")
+        logger.info(f"   📈 TB Available: {'YES' if has_tb else 'NO'}")
+        logger.info(f"   🎯 Volume Check: {'PASS' if volume_check else 'FAIL'}")
+        
+        step1_completeness = {
+            'description': 'GL completeness verification: Credit - Debit should equal 0 and sufficient data volume',
             'gl_debit_total': round(gl_total_debit, 2),
-            'gl_credit_total': round(gl_total_credit, 2), 
-            'tb_debit_total': round(tb_total_debit, 2),
-            'tb_credit_total': round(tb_total_credit, 2),
-            'debit_variance': round(gl_total_debit - tb_total_debit, 2),
-            'credit_variance': round(gl_total_credit - tb_total_credit, 2),
-            'passed': step1_passed,
-            'explanation': f"GL debits: {gl_total_debit:,.2f}, TB debits: {tb_total_debit:,.2f} | GL credits: {gl_total_credit:,.2f}, TB credits: {tb_total_credit:,.2f}"
+            'gl_credit_total': round(gl_total_credit, 2),
+            'gl_net_balance': round(gl_net_balance, 2),
+            'gl_is_balanced': gl_is_balanced,
+            'transaction_count': transaction_count,
+            'account_count': account_count,
+            'has_tb': has_tb,
+            'volume_check': volume_check,
+            'data_availability': data_availability,
+            'passed': step1_completeness_passed,
+            'explanation': f"GL Balance: {gl_net_balance:.2f} ({'PASS' if gl_is_balanced else 'FAIL'}), Volume: {transaction_count:,} transactions, {account_count} accounts, TB: {'Available' if has_tb else 'Missing'}"
         }
         
+        step1_duration = (timezone.now() - step1_start).total_seconds()
+        logger.info(f"✅ STEP 1 COMPLETED: {'PASS' if step1_completeness_passed else 'FAIL'} (Duration: {step1_duration:.2f}s)")
+        if not step1_completeness_passed:
+            issues = []
+            if not gl_is_balanced:
+                issues.append(f"GL imbalanced by {gl_net_balance:.2f}")
+            if not volume_check:
+                issues.append(f"Low volume: {transaction_count:,} transactions")
+            if not data_availability:
+                issues.append("Missing TB data")
+            logger.warning(f"   ⚠️  Issues: {', '.join(issues)}")
+        
         # =======================================================================
-        # STEP 2: Verify debits equal credits (both in GL and TB)
+        # STEP 2: ACCOUNT-WISE BALANCE VERIFICATION
         # =======================================================================
         
-        gl_balance = gl_total_debit - gl_total_credit
-        tb_balance = tb_total_debit - tb_total_credit
+        logger.info("🔍 STEP 2: Starting Account-wise Balance Verification...")
+        step2_start = timezone.now()
         
-        gl_balanced = abs(gl_balance) < 0.01
-        tb_balanced = abs(tb_balance) < 0.01
-        step2_passed = gl_balanced and tb_balanced
+        logger.info("   📊 Building GL account summaries...")
         
-        step2_result = {
-            'description': 'Total debits should equal total credits in both GL and TB',
-            'gl_balance': round(gl_balance, 2),
-            'tb_balance': round(tb_balance, 2),
-            'gl_balanced': gl_balanced,
-            'tb_balanced': tb_balanced,
-            'passed': step2_passed,
-            'explanation': f"GL balance: {gl_balance:.2f}, TB balance: {tb_balance:.2f} (should both be ~0)"
+        # Build GL account-wise totals
+        gl_account_totals = {}
+        for posting in gl_postings:
+            account_code = str(posting.gl_account).replace('.0', '')
+            amount = float(posting.amount_local_currency or 0)
+            
+            if account_code not in gl_account_totals:
+                gl_account_totals[account_code] = {
+                    'debit_total': 0,
+                    'credit_total': 0,
+                    'net_movement': 0
+                }
+            
+            if amount > 0:
+                gl_account_totals[account_code]['debit_total'] += amount
+            else:
+                gl_account_totals[account_code]['credit_total'] += abs(amount)
+            
+            gl_account_totals[account_code]['net_movement'] = (
+                gl_account_totals[account_code]['debit_total'] - 
+                gl_account_totals[account_code]['credit_total']
+            )
+        
+        logger.info(f"   📋 GL Account Summaries Built: {len(gl_account_totals)} accounts")
+        
+        # Get TB account details with balance verification
+        logger.info("   📊 Verifying account-wise balance equation...")
+        
+        account_verifications = []
+        balance_equation_passed_count = 0
+        balance_equation_failed_count = 0
+        total_variance = 0
+        
+        for tb_record in trial_balance_records:
+            account_code = str(tb_record.gl_account).replace('.0', '')
+            
+            # Get TB data
+            tb_debit = float(tb_record.debit or 0)
+            tb_credit = float(tb_record.credit or 0)
+            opening_balance = float(getattr(tb_record, 'opening_balance', 0) or 0)
+            closing_balance = float(getattr(tb_record, 'closing_balance', 0) or 0)
+            
+            # Get GL data for this account
+            gl_data = gl_account_totals.get(account_code, {
+                'debit_total': 0,
+                'credit_total': 0,
+                'net_movement': 0
+            })
+            
+            # Calculate expected closing balance: Opening + Debits - Credits = Closing
+            calculated_closing = opening_balance + tb_debit - tb_credit
+            balance_variance = abs(calculated_closing - closing_balance)
+            
+            # Check if GL movements match TB movements
+            gl_vs_tb_debit_variance = abs(gl_data['debit_total'] - tb_debit)
+            gl_vs_tb_credit_variance = abs(gl_data['credit_total'] - tb_credit)
+            
+            # Verification result
+            balance_equation_correct = balance_variance < 1.00  # Allow 1 unit variance
+            gl_tb_movements_match = (gl_vs_tb_debit_variance + gl_vs_tb_credit_variance) < 10.00
+            
+            account_verification = {
+                'account_code': account_code,
+                'opening_balance': opening_balance,
+                'tb_debit': tb_debit,
+                'tb_credit': tb_credit,
+                'closing_balance': closing_balance,
+                'calculated_closing': calculated_closing,
+                'balance_variance': balance_variance,
+                'gl_debit_total': gl_data['debit_total'],
+                'gl_credit_total': gl_data['credit_total'],
+                'gl_vs_tb_debit_variance': gl_vs_tb_debit_variance,
+                'gl_vs_tb_credit_variance': gl_vs_tb_credit_variance,
+                'balance_equation_correct': balance_equation_correct,
+                'gl_tb_movements_match': gl_tb_movements_match,
+                'account_passed': balance_equation_correct and gl_tb_movements_match
+            }
+            
+            account_verifications.append(account_verification)
+            total_variance += balance_variance
+            
+            if account_verification['account_passed']:
+                balance_equation_passed_count += 1
+            else:
+                balance_equation_failed_count += 1
+        
+        # Overall Step 2 result
+        total_accounts_verified = len(account_verifications)
+        pass_rate = (balance_equation_passed_count / total_accounts_verified) if total_accounts_verified > 0 else 0
+        step2_account_verification_passed = pass_rate >= 0.90  # 90% pass rate required
+        
+        logger.info(f"   📊 Account Verifications Completed:")
+        logger.info(f"      Total Accounts: {total_accounts_verified}")
+        logger.info(f"      Passed: {balance_equation_passed_count}")
+        logger.info(f"      Failed: {balance_equation_failed_count}")
+        logger.info(f"      Pass Rate: {pass_rate:.1%}")
+        logger.info(f"      Total Variance: {total_variance:,.2f}")
+        logger.info(f"      Result: {'✅ PASS' if step2_account_verification_passed else '❌ FAIL'}")
+        
+        # Show sample of failed accounts for debugging
+        failed_accounts = [acc for acc in account_verifications if not acc['account_passed']]
+        if failed_accounts:
+            logger.warning(f"   ⚠️  Sample Failed Accounts:")
+            for acc in failed_accounts[:5]:  # Show first 5 failed accounts
+                logger.warning(f"      Account {acc['account_code']}: Balance variance {acc['balance_variance']:.2f}")
+        
+        step2_account_verification = {
+            'description': 'Account-wise balance verification: Opening + Debits - Credits = Closing for each GL account',
+            'total_accounts_verified': total_accounts_verified,
+            'accounts_passed': balance_equation_passed_count,
+            'accounts_failed': balance_equation_failed_count,
+            'pass_rate': round(pass_rate, 3),
+            'total_variance': round(total_variance, 2),
+            'account_verifications': account_verifications,
+            'failed_accounts': [acc['account_code'] for acc in failed_accounts],
+            'passed': step2_account_verification_passed,
+            'explanation': f"Account verification: {balance_equation_passed_count}/{total_accounts_verified} passed ({pass_rate:.1%}), Total variance: {total_variance:,.2f}"
         }
         
+        step2_duration = (timezone.now() - step2_start).total_seconds()
+        logger.info(f"✅ STEP 2 COMPLETED: {'PASS' if step2_account_verification_passed else 'FAIL'} (Duration: {step2_duration:.2f}s)")
+        if not step2_account_verification_passed:
+            logger.warning(f"   ⚠️  Issues: {balance_equation_failed_count} accounts failed verification, Pass rate: {pass_rate:.1%}")
+        
         # =======================================================================
-        # STEP 3: Ensure every TB account is present in GL data
+        # CHART GENERATION BASED ON POSTING/DOCUMENT DATES
         # =======================================================================
         
-        # Get unique GL accounts and normalize them (remove .0 suffix)
-        gl_accounts_raw = gl_postings.values_list('gl_account', flat=True).distinct()
-        gl_accounts = set(str(acc).replace('.0', '') if acc else '' for acc in gl_accounts_raw)
+        logger.info("📊 Generating charts based on posting and document dates...")
+        chart_start = timezone.now()
         
-        # Get unique TB accounts and normalize them (remove .0 suffix)
-        tb_accounts_raw = trial_balance_records.values_list('gl_account', flat=True).distinct()
-        tb_accounts = set(str(acc).replace('.0', '') if acc else '' for acc in tb_accounts_raw)
+        # Monthly posting trends
+        monthly_posting_data = {}
+        daily_posting_data = {}
         
-        # Check coverage
-        missing_in_gl = tb_accounts - gl_accounts
-        extra_in_gl = gl_accounts - tb_accounts
+        for posting in gl_postings:
+            # Use posting_date if available, otherwise document_date
+            posting_date = posting.posting_date or posting.document_date
+            if posting_date:
+                month_key = posting_date.strftime('%Y-%m')
+                day_key = posting_date.strftime('%Y-%m-%d')
+                amount = abs(float(posting.amount_local_currency or 0))
+                
+                # Monthly data
+                if month_key not in monthly_posting_data:
+                    monthly_posting_data[month_key] = {'count': 0, 'amount': 0}
+                monthly_posting_data[month_key]['count'] += 1
+                monthly_posting_data[month_key]['amount'] += amount
+                
+                # Daily data (for trend analysis)
+                if day_key not in daily_posting_data:
+                    daily_posting_data[day_key] = {'count': 0, 'amount': 0}
+                daily_posting_data[day_key]['count'] += 1
+                daily_posting_data[day_key]['amount'] += amount
         
-        step3_passed = len(missing_in_gl) == 0
+        # Account-wise posting analysis
+        account_posting_data = {}
+        for account_code, totals in gl_account_totals.items():
+            total_amount = totals['debit_total'] + totals['credit_total']
+            if total_amount > 0:
+                account_posting_data[account_code] = {
+                    'debit_total': totals['debit_total'],
+                    'credit_total': totals['credit_total'],
+                    'total_amount': total_amount,
+                    'net_movement': totals['net_movement']
+                }
         
-        step3_result = {
-            'description': 'Every TB account should be present in GL data',
-            'tb_account_count': len(tb_accounts),
-            'gl_account_count': len(gl_accounts),
-            'missing_in_gl': list(missing_in_gl),
-            'extra_in_gl': list(extra_in_gl),
-            'missing_count': len(missing_in_gl),
-            'coverage_percentage': round((len(tb_accounts - missing_in_gl) / len(tb_accounts) * 100) if tb_accounts else 100, 1),
-            'passed': step3_passed,
-            'explanation': f"TB has {len(tb_accounts)} accounts, {len(missing_in_gl)} missing in GL, {len(extra_in_gl)} extra in GL"
+        # Sort accounts by total activity
+        top_accounts = sorted(account_posting_data.items(), key=lambda x: x[1]['total_amount'], reverse=True)[:20]
+        
+        chart_data = {
+            'monthly_trends': {
+                'labels': sorted(monthly_posting_data.keys()),
+                'transaction_counts': [monthly_posting_data[month]['count'] for month in sorted(monthly_posting_data.keys())],
+                'amounts': [monthly_posting_data[month]['amount'] for month in sorted(monthly_posting_data.keys())]
+            },
+            'top_accounts': {
+                'labels': [acc[0] for acc in top_accounts],
+                'debit_amounts': [acc[1]['debit_total'] for acc in top_accounts],
+                'credit_amounts': [acc[1]['credit_total'] for acc in top_accounts],
+                'net_movements': [acc[1]['net_movement'] for acc in top_accounts]
+            },
+            'chart_metadata': {
+                'total_charts': 2,
+                'data_period': f"{min(monthly_posting_data.keys())} to {max(monthly_posting_data.keys())}" if monthly_posting_data else "No data",
+                'total_months': len(monthly_posting_data),
+                'total_days_with_activity': len(daily_posting_data)
+            }
         }
         
-        # =======================================================================
-        # STEP 4: Detect missing transactions by checking document number gaps
-        # =======================================================================
-        
-        # Get unique document numbers and analyze gaps
-        document_numbers = gl_postings.filter(
-            document_number__isnull=False
-        ).exclude(
-            document_number__exact=''
-        ).values_list('document_number', flat=True).distinct().order_by('document_number')
-        
-        # Initialize comprehensive_statistics early to avoid reference errors
-        comprehensive_statistics = {}
-        
-        # Simple completeness check for transaction gaps
-        # This is a basic check - in a real implementation, you might check for:
-        # - Missing journal entry sequences
-        # - Unusual gaps in posting dates
-        # - Missing expected closing entries
-        # - Incomplete transaction chains
-        
-        # For now, we'll just check if we have a reasonable number of transactions
-        step4_passed = gl_postings.count() >= 10  # Arbitrary threshold for completeness
-        
-        step4_result = {
-            'description': 'Check for transaction completeness',
-            'total_transactions': gl_postings.count(),
-            'passed': step4_passed,
-            'explanation': 'Sufficient transaction volume for completeness test' if step4_passed else f'Low transaction count ({gl_postings.count()}) may indicate incomplete data'
-        }
+        chart_duration = (timezone.now() - chart_start).total_seconds()
+        logger.info(f"📊 Chart generation completed in {chart_duration:.2f}s")
+        logger.info(f"   📈 Monthly trends: {len(monthly_posting_data)} months")
+        logger.info(f"   📋 Top accounts: {len(top_accounts)} accounts")
+        logger.info(f"   📅 Activity period: {chart_data['chart_metadata']['data_period']}")
         
         # =======================================================================
-        # OVERALL COMPLETENESS ASSESSMENT WITH SCORING
+        # OVERALL COMPLETENESS ASSESSMENT (2 STEPS)
         # =======================================================================
         
-        all_steps_passed = step1_passed and step2_passed and step3_passed and step4_passed
         
-        # Calculate weighted completeness score (0-100%)
+        logger.info("📊 Starting overall completeness assessment...")
+        assessment_start = timezone.now()
+        
+        # 2-Step Completeness Assessment
+        all_steps_passed = step1_completeness_passed and step2_account_verification_passed
+        
+        # Calculate weighted completeness score (0-100%) for 2 steps
         weights = {
-            'step1': 30,  # GL-TB reconciliation (most critical)
-            'step2': 25,  # Debit-credit balance (critical)
-            'step3': 25,  # Account coverage (important)
-            'step4': 20   # Transaction gaps (important)
+            'step1': 40,  # GL completeness (fundamental)
+            'step2': 60   # Account-wise verification (critical)
         }
         
         scores = {
-            'step1': 100 if step1_passed else (50 if abs(step1_result.get('debit_variance', 0)) < 100 else 0),
-            'step2': 100 if step2_passed else (30 if abs(step2_result.get('gl_balance', 0)) < 100 else 0),
-            'step3': round(step3_result.get('coverage_percentage', 0), 1) if not step3_passed else 100,
-            'step4': max(0, 100 - (len(gaps_detected) * 5) - (len([a for a in anomalies if a['severity'] == 'high']) * 10))
+            'step1': 100 if step1_completeness_passed else (70 if gl_is_balanced else 30),
+            'step2': round(pass_rate * 100, 1) if pass_rate > 0 else 0
         }
         
         completeness_score = sum(scores[step] * weights[step] / 100 for step in weights.keys())
         
         # Determine overall status
-        critical_issues_count = (
-            (1 if not step1_passed and abs(step1_result.get('debit_variance', 0)) >= 100 else 0) +
-            (1 if not step2_passed and abs(step2_result.get('gl_balance', 0)) >= 100 else 0) +
-            (1 if not step3_passed and len(missing_in_gl) > 5 else 0) +
-            len([a for a in anomalies if a['severity'] in ['high', 'critical']])
-        )
-        
         if all_steps_passed and completeness_score >= 95:
-            overall_status = 'PASS'
-            overall_explanation = 'GL and TB totals reconcile perfectly. All accounts present. No significant gaps detected. Completeness confirmed.'
+            overall_status = 'COMPLETE'
+            overall_explanation = 'GL completeness verified: Credit-Debit balanced and all account equations verified.'
         elif completeness_score >= 80:
-            overall_status = 'PASS'
-            overall_explanation = f'Completeness test passed with minor issues. Score: {completeness_score:.1f}%. Some gaps or variances detected but within acceptable limits.'
+            overall_status = 'COMPLETE'
+            overall_explanation = f'GL mostly complete with minor issues. Score: {completeness_score:.1f}%.'
         else:
-            overall_status = 'FAIL'
+            overall_status = 'INCOMPLETE'
             issues = []
-            if not step1_passed:
-                issues.append('GL-TB totals do not reconcile')
-            if not step2_passed:
-                issues.append('Debits ≠ Credits imbalance detected')
-            if not step3_passed:
-                issues.append(f'{len(missing_in_gl)} TB accounts missing in GL')
-            if not step4_passed:
-                issues.append(f'{len(gaps_detected)} document gaps, {len([a for a in anomalies if a["severity"] == "high"])} high-severity anomalies')
-            overall_explanation = f"Completeness test failed (Score: {completeness_score:.1f}%): {', '.join(issues)}"
+            if not step1_completeness_passed:
+                if not gl_is_balanced:
+                    issues.append(f'GL imbalanced by {gl_net_balance:.2f}')
+                if not volume_check:
+                    issues.append('Insufficient data volume')
+                if not data_availability:
+                    issues.append('Missing TB data')
+            if not step2_account_verification_passed:
+                issues.append(f'{balance_equation_failed_count} accounts failed balance verification')
+            overall_explanation = f"GL incomplete (Score: {completeness_score:.1f}%): {', '.join(issues)}"
         
-        # Detailed summary with comprehensive statistics
+        assessment_duration = (timezone.now() - assessment_start).total_seconds()
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        
+        logger.info(f"📊 Overall Assessment Completed:")
+        logger.info(f"   🎯 Status: {overall_status}")
+        logger.info(f"   📈 Score: {completeness_score:.1f}%")
+        logger.info(f"   ⏱️  Assessment Duration: {assessment_duration:.2f}s")
+        logger.info(f"   ⏱️  Total Processing Duration: {processing_duration:.2f}s")
+        
+        # Prepare comprehensive statistics for charts and analysis
+        comprehensive_statistics = {
+            'document_statistics': {
+                'total_gl_records': transaction_count,
+                'total_tb_records': trial_balance_records.count(),
+                'unique_accounts': account_count,
+                'gl_debit_total': gl_total_debit,
+                'gl_credit_total': gl_total_credit,
+                'gl_net_balance': gl_net_balance
+            },
+            'summary_statistics': {
+                'completeness_score': completeness_score,
+                'steps_passed': 2 if all_steps_passed else (1 if step1_passed else 0),
+                'total_steps': 2,
+                'account_verification_pass_rate': pass_rate,
+                'total_variance': total_variance,
+                'failed_accounts_count': balance_equation_failed_count
+            },
+            'chart_data': chart_data,
+            'monthly_trends': chart_data.get('monthly_trends', {}),
+            'top_accounts': chart_data.get('top_accounts', {})
+        }
+        
+        # Prepare completeness results
         completeness_results = {
             'status': overall_status,
             'explanation': overall_explanation,
             'completeness_score': round(completeness_score, 1),
             'analysis_timestamp': timezone.now().isoformat(),
             'file_name': data_file.file_name,
-            'engagement_id': data_file.engagement_id,
-            'total_gl_records': gl_postings.count(),
+            'engagement_id': str(data_file.engagement_id),
+            'total_gl_records': transaction_count,
             'total_tb_records': trial_balance_records.count(),
-            'step1_gl_tb_reconciliation': step1_result,
-            'step2_debit_credit_balance': step2_result,
-            'step3_account_coverage': step3_result,
-            'step4_transaction_gaps': step4_result,
+            'processing_duration': processing_duration,
+            'step1_completeness': step1_completeness,
+            'step2_account_verification': step2_account_verification,
             'comprehensive_statistics': comprehensive_statistics,
-            'critical_issues_count': critical_issues_count,
             'scoring_breakdown': {
                 'step_scores': scores,
                 'step_weights': weights,
                 'final_score': round(completeness_score, 1)
             },
             'summary': {
-                'tests_passed': sum([step1_passed, step2_passed, step3_passed, step4_passed]),
-                'total_tests': 4,
-                'success_rate': round(sum([step1_passed, step2_passed, step3_passed, step4_passed]) / 4 * 100, 1)
-            },
-            'processing_duration': round((timezone.now() - start_time).total_seconds(), 2)
-        }
-        
-        # =======================================================================
-        # STEP 5: Calculate GL listing completeness statistics and charts
-        # =======================================================================
-        
-        # Basic GL listing statistics
-        total_gl_records = gl_postings.count()
-        unique_documents = gl_postings.values('document_number').distinct().count()
-        unique_accounts = gl_postings.values('gl_account').distinct().count()
-        unique_users = gl_postings.values('user_name').distinct().count()
-        
-        # GL Account completeness analysis
-        gl_account_stats = {}
-        for posting in gl_postings:
-            account_code = posting.gl_account
-            amount = float(posting.amount_local_currency or 0)
-            
-            if account_code not in gl_account_stats:
-                gl_account_stats[account_code] = {
-                    'debit_total': 0, 
-                    'credit_total': 0, 
-                    'debit_count': 0, 
-                    'credit_count': 0
-                }
-            
-            if amount > 0:
-                gl_account_stats[account_code]['debit_total'] += amount
-                gl_account_stats[account_code]['debit_count'] += 1
-            else:
-                gl_account_stats[account_code]['credit_total'] += abs(amount)
-                gl_account_stats[account_code]['credit_count'] += 1
-        
-        # Convert to sorted list format (by total volume)
-        gl_account_completeness = []
-        for account_code, stats in gl_account_stats.items():
-            total_volume = stats['debit_total'] + stats['credit_total']
-            gl_account_completeness.append({
-                'account_code': account_code,
-                'debit_total': round(stats['debit_total'], 2),
-                'credit_total': round(stats['credit_total'], 2),
-                'debit_count': stats['debit_count'],
-                'credit_count': stats['credit_count'],
-                'net_amount': round(stats['debit_total'] - stats['credit_total'], 2),
-                'total_transactions': stats['debit_count'] + stats['credit_count'],
-                'total_volume': round(total_volume, 2)
-            })
-        
-        # Sort by total volume (descending)
-        gl_account_completeness.sort(key=lambda x: x['total_volume'], reverse=True)
-        
-        # GL listing completeness by document type
-        document_type_stats = {}
-        for posting in gl_postings:
-            doc_type = posting.document_type or 'Unknown'
-            amount = float(posting.amount_local_currency or 0)
-            
-            if doc_type not in document_type_stats:
-                document_type_stats[doc_type] = {
-                    'debit_total': 0, 
-                    'credit_total': 0, 
-                    'debit_count': 0, 
-                    'credit_count': 0
-                }
-            
-            if amount > 0:
-                document_type_stats[doc_type]['debit_total'] += amount
-                document_type_stats[doc_type]['debit_count'] += 1
-            else:
-                document_type_stats[doc_type]['credit_total'] += abs(amount)
-                document_type_stats[doc_type]['credit_count'] += 1
-        
-        # Convert to sorted list format
-        gl_document_completeness = []
-        for doc_type, stats in document_type_stats.items():
-            total_volume = stats['debit_total'] + stats['credit_total']
-            gl_document_completeness.append({
-                'document_type': doc_type,
-                'debit_total': round(stats['debit_total'], 2),
-                'credit_total': round(stats['credit_total'], 2),
-                'debit_count': stats['debit_count'],
-                'credit_count': stats['credit_count'],
-                'net_amount': round(stats['debit_total'] - stats['credit_total'], 2),
-                'total_transactions': stats['debit_count'] + stats['credit_count'],
-                'total_volume': round(total_volume, 2)
-            })
-        
-        # Sort by total volume (descending)
-        gl_document_completeness.sort(key=lambda x: x['total_volume'], reverse=True)
-        
-        # =======================================================================
-        # GENERATE GL LISTING COMPLETENESS CHART DATA
-        # =======================================================================
-        
-        # Chart 1: GL Account Completeness (Top 15 accounts by volume)
-        top_accounts_for_chart = gl_account_completeness[:15]  # Top 15 accounts by volume
-        gl_account_chart_data = {
-            'chart_type': 'grouped_bar',
-            'title': 'GL Account Completeness - Debit and Credit Amounts (Top 15)',
-            'x_axis_label': 'GL Accounts',
-            'y_axis_label': 'Amount ($)',
-            'labels': [acc['account_code'] for acc in top_accounts_for_chart],
-            'datasets': [
-                {
-                    'label': 'Debit Amounts',
-                    'data': [acc['debit_total'] for acc in top_accounts_for_chart],
-                    'backgroundColor': '#3B82F6',  # Blue
-                    'borderColor': '#1E40AF',
-                    'borderWidth': 1
-                },
-                {
-                    'label': 'Credit Amounts', 
-                    'data': [acc['credit_total'] for acc in top_accounts_for_chart],
-                    'backgroundColor': '#EF4444',  # Red
-                    'borderColor': '#B91C1C',
-                    'borderWidth': 1
-                }
-            ],
-            'summary': {
-                'total_accounts_shown': len(top_accounts_for_chart),
-                'total_debit_shown': sum(acc['debit_total'] for acc in top_accounts_for_chart),
-                'total_credit_shown': sum(acc['credit_total'] for acc in top_accounts_for_chart)
+                'tests_passed': 2 if all_steps_passed else (1 if step1_passed else 0),
+                'total_tests': 2,
+                'critical_issues_count': balance_equation_failed_count if not step2_account_verification_passed else 0,
+                'all_steps_passed': all_steps_passed
             }
         }
         
-        # Chart 2: GL Document Type Completeness
-        gl_document_chart_data = {
-            'chart_type': 'grouped_bar',
-            'title': 'GL Document Type Completeness - Debit and Credit Amounts',
-            'x_axis_label': 'Document Types',
-            'y_axis_label': 'Amount ($)',
-            'labels': [doc['document_type'] for doc in gl_document_completeness],
-            'datasets': [
-                {
-                    'label': 'Debit Amounts',
-                    'data': [doc['debit_total'] for doc in gl_document_completeness],
-                    'backgroundColor': '#10B981',  # Green
-                    'borderColor': '#047857',
-                    'borderWidth': 1
-                },
-                {
-                    'label': 'Credit Amounts',
-                    'data': [doc['credit_total'] for doc in gl_document_completeness],
-                    'backgroundColor': '#F59E0B',  # Orange
-                    'borderColor': '#D97706',
-                    'borderWidth': 1
-                }
-            ],
-            'summary': {
-                'total_document_types': len(gl_document_completeness),
-                'total_debit': sum(doc['debit_total'] for doc in gl_document_completeness),
-                'total_credit': sum(doc['credit_total'] for doc in gl_document_completeness)
-            }
-        }
-        
-        
-        # Compile GL listing completeness statistics and chart data
-        comprehensive_statistics = {
-            'gl_listing_statistics': {
-                'total_gl_records': total_gl_records,
-                'unique_documents': unique_documents,
-                'unique_accounts': unique_accounts,
-                'unique_users': unique_users,
-                'duplicate_document_ratio': round((total_gl_records - unique_documents) / total_gl_records * 100, 2) if total_gl_records > 0 else 0
-            },
-            'gl_account_completeness': gl_account_completeness,
-            'gl_document_completeness': gl_document_completeness,
-            'chart_data': {
-                'gl_account_completeness': gl_account_chart_data,
-                'gl_document_completeness': gl_document_chart_data,
-                'chart_metadata': {
-                    'generated_at': timezone.now().isoformat(),
-                    'total_charts': 2,
-                    'chart_focus': 'GL Listing Completeness',
-                    'recommended_chart_library': 'Chart.js or similar',
-                    'color_scheme': 'Professional - Blues, Greens, Oranges'
-                }
-            },
-            'summary_statistics': {
-                'total_gl_accounts': len(gl_account_completeness),
-                'total_document_types': len(gl_document_completeness),
-                'most_active_account': gl_account_completeness[0]['account_code'] if gl_account_completeness else 'N/A',
-                'most_active_document_type': gl_document_completeness[0]['document_type'] if gl_document_completeness else 'N/A',
-                'total_debit_amount': round(sum(acc['debit_total'] for acc in gl_account_completeness), 2),
-                'total_credit_amount': round(sum(acc['credit_total'] for acc in gl_account_completeness), 2)
-            }
-        }
-        
-        # =======================================================================
-        # SAVE RESULTS TO DATABASE MODEL
-        # =======================================================================
-        
-        from .models import CompletenessTestResult
-        
+        # Save to database
         try:
-            # Save comprehensive results to database
-            completeness_test = CompletenessTestResult.objects.create(
-                data_file=data_file,
-                engagement_id=data_file.engagement_id,
+            test_result = CompletenessTestResult.objects.create(
+                engagement=data_file.engagement,
+                gl_file=data_file,  # Correct field name
+                tb_file=None,  # We'll find TB file later
+                coa_file=None,  # We'll find COA file later  
                 overall_status=overall_status,
                 overall_explanation=overall_explanation,
-                completeness_score=round(completeness_score, 1),
-                step1_gl_tb_reconciliation=step1_result,
-                step2_debit_credit_balance=step2_result,
-                step3_account_coverage=step3_result,
-                step4_transaction_gaps=step4_result,
-                comprehensive_statistics=comprehensive_statistics,
-                total_gl_records=gl_postings.count(),
+                completeness_score=completeness_score,
+                step1_file_completeness=step1_completeness,
+                step2_gl_tb_reconciliation=step2_account_verification,
+                step3_debit_credit_balance={},  # Not used in 2-step
+                step4_account_coverage={},      # Not used in 2-step
+                step5_coa_hierarchy_validation={},  # Not used in 2-step
+                step6_account_linking={},       # Not used in 2-step
+                step7_transaction_gaps={},      # Not used in 2-step
+                total_gl_records=transaction_count,
                 total_tb_records=trial_balance_records.count(),
-                tests_passed=sum([step1_passed, step2_passed, step3_passed, step4_passed]),
-                total_tests=4,
-                critical_issues_count=critical_issues_count,
-                processing_duration=round((timezone.now() - start_time).total_seconds(), 2)
+                total_coa_records=coa_records.count() if coa_records.exists() else 0,
+                total_accounts_unified=account_count,
+                tests_passed=2 if all_steps_passed else (1 if step1_passed else 0),
+                total_tests=2,
+                critical_issues_count=balance_equation_failed_count if not step2_account_verification_passed else 0,
+                comprehensive_statistics=comprehensive_statistics,
+                processing_duration=processing_duration
             )
             
-            logger.info(f"Completeness test results saved to database: {completeness_test.id}")
-            
-            # =======================================================================
-            # AI FEEDBACK LOOP - Update prediction accuracy
-            # =======================================================================
-            
-            if ai_prediction_result and ai_prediction_result.get('success'):
-                try:
-                    from .models import CompletenessAIPrediction
-                    
-                    # Find the AI prediction record
-                    prediction_id = ai_prediction_result.get('prediction_id')
-                    if prediction_id:
-                        ai_prediction = CompletenessAIPrediction.objects.get(id=prediction_id)
-                        
-                        # Update with actual results
-                        ai_prediction.actual_completeness_score = round(completeness_score, 1)
-                        ai_prediction.actual_status = overall_status
-                        ai_prediction.actual_processing_time = round((timezone.now() - start_time).total_seconds(), 2)
-                        
-                        # Calculate prediction accuracy
-                        accuracy_metrics = ai_prediction.calculate_prediction_accuracy()
-                        
-                        logger.info(f"🤖 AI Prediction Accuracy Assessment:")
-                        logger.info(f"   Score Accuracy: {accuracy_metrics['score_accuracy']:.1f}%")
-                        logger.info(f"   Status Correct: {accuracy_metrics['status_correct']}")
-                        logger.info(f"   Overall Accurate: {accuracy_metrics['overall_accurate']}")
-                        
-                        # If prediction was highly accurate, consider deploying the model
-                        if accuracy_metrics['overall_accurate'] and ai_prediction.ai_model.status == 'TRAINED':
-                            ai_prediction.ai_model.status = 'DEPLOYED'
-                            ai_prediction.ai_model.save()
-                            logger.info(f"🤖 AI Model {ai_prediction.ai_model.model_name} deployed due to high accuracy")
-                            
-                except Exception as feedback_error:
-                    logger.warning(f"🤖 AI feedback loop failed: {feedback_error}")
+            logger.info(f"💾 Completeness test result saved to database (ID: {test_result.id})")
             
         except Exception as db_error:
-            logger.error(f"Failed to save completeness test results to database: {db_error}")
-            # Continue execution - don't fail the entire task due to DB save issues
+            logger.error(f"Failed to save completeness test result: {db_error}")
+            # Continue execution even if DB save fails
         
-        # Log comprehensive results
-        logger.info(f"GL-TB Completeness Test completed for {data_file.file_name}")
-        logger.info(f"Overall Status: {overall_status} (Score: {completeness_score:.1f}%)")
-        logger.info(f"Step 1 (GL-TB Reconciliation): {'PASS' if step1_passed else 'FAIL'}")
-        logger.info(f"Step 2 (Debit=Credit Balance): {'PASS' if step2_passed else 'FAIL'}")
-        logger.info(f"Step 3 (Account Coverage): {'PASS' if step3_passed else 'FAIL'}")
-        logger.info(f"Step 4 (Transaction Gaps): {'PASS' if step4_passed else 'FAIL'}")
-        logger.info(f"Anomalies Detected: {len(anomalies)} ({len([a for a in anomalies if a['severity'] == 'high'])} high severity)")
-        logger.info(f"Explanation: {overall_explanation}")
-        
-        # Log key statistics
-        doc_stats = comprehensive_statistics['document_statistics']
-        summary_stats = comprehensive_statistics['summary_statistics']
-        logger.info(f"Document Statistics: {doc_stats['total_documents']} total, {doc_stats['unique_documents']} unique ({doc_stats['duplicate_document_ratio']:.1f}% duplicate ratio)")
-        logger.info(f"Data Coverage: {summary_stats['total_users']} users, {summary_stats['total_subtypes']} subtypes, {summary_stats['months_covered']} months")
-        logger.info(f"Most Active: User={summary_stats['most_active_user']}, Subtype={summary_stats['most_active_subtype']}, Peak Month={summary_stats['peak_month']}")
-        
-        # Log top 3 users by volume
-        top_users = comprehensive_statistics['credit_debit_by_user'][:3]
-        top_users_str = ', '.join([f'{u["user_name"]}(${u["total_volume"]:,.0f})' for u in top_users])
-        logger.info(f"Top Users by Volume: {top_users_str}")
-        # Log monthly trend summary
-        monthly_data = comprehensive_statistics['monthly_trends']
-        if monthly_data:
-            total_monthly_volume = sum(month['total_volume'] for month in monthly_data)
-            avg_monthly_volume = total_monthly_volume / len(monthly_data)
-            logger.info(f"Monthly Trends: {len(monthly_data)} months, Avg Volume: ${avg_monthly_volume:,.0f}/month")
-        
-        # Log chart data generation
-        chart_info = comprehensive_statistics['chart_data']
-        logger.info(f"Generated {chart_info['chart_metadata']['total_charts']} visualization charts:")
-        logger.info(f"  - Credit/Debit by User: {len(chart_info['credit_debit_by_user']['labels'])} users")
-        logger.info(f"  - Credit/Debit by Subtype: {len(chart_info['credit_debit_by_subtype']['labels'])} subtypes") 
-        logger.info(f"  - Monthly Trends: {len(chart_info['monthly_trends']['labels'])} months")
-        logger.info(f"  - User Volume Distribution: Top {len(chart_info['user_volume_distribution']['labels'])} users")
-        logger.info(f"  - Subtype Volume Distribution: {len(chart_info['subtype_volume_distribution']['labels'])} subtypes")
-        
-        if overall_status == 'FAIL' or critical_issues_count > 0:
-            logger.warning(f"COMPLETENESS TEST ISSUES for {data_file.file_name} (Score: {completeness_score:.1f}%)")
-            if not step1_passed:
-                logger.warning(f"GL-TB Variance: Debits {step1_result['debit_variance']}, Credits {step1_result['credit_variance']}")
-            if not step2_passed:
-                logger.warning(f"Balance Issues: GL {step2_result['gl_balance']}, TB {step2_result['tb_balance']}")
-            if not step3_passed:
-                logger.warning(f"Missing Accounts: {missing_in_gl}")
-            if not step4_passed:
-                logger.warning(f"Transaction Gaps: {len(gaps_detected)} gaps, {len([a for a in anomalies if a['severity'] == 'high'])} high-severity anomalies")
-                
-            # Log top 5 most critical anomalies
-            high_severity_anomalies = [a for a in anomalies if a['severity'] in ['high', 'critical']][:5]
-            for anomaly in high_severity_anomalies:
-                logger.warning(f"Critical Anomaly: {anomaly['type']} - {anomaly['description']}")
+        logger.info("================================================================================")
+        logger.info(f"✅ COMPLETENESS ANALYSIS COMPLETED SUCCESSFULLY")
+        logger.info(f"📊 Status: {overall_status}, Score: {completeness_score:.1f}%")
+        logger.info(f"⏱️  Total Duration: {processing_duration:.2f} seconds")
+        logger.info("================================================================================")
         
         return {
             'success': True,
-            'data_file_id': str(data_file_id),
-            'completeness_test_id': completeness_test.id if 'completeness_test' in locals() else None,
-            'completeness_results': completeness_results
+            'completeness_results': completeness_results,
+            'analysis_duration': processing_duration,
+            'test_result_id': test_result.id if 'test_result' in locals() else None
         }
         
     except Exception as e:
-        logger.error(f"Error in GL-TB completeness test for data file {data_file_id}: {e}")
+        error_message = f"Completeness analysis failed: {str(e)}"
+        logger.error(f"❌ {error_message}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
         return {
             'success': False,
-            'error': str(e),
-            'data_file_id': str(data_file_id)
+            'error': error_message,
+            'analysis_duration': (timezone.now() - start_time).total_seconds() if 'start_time' in locals() else 0
         }
+
+
+# ============================================================================
+# Helper Functions for AI Prediction and Feature Extraction
+# ============================================================================
+
+def _get_feature_names():
+    """Get feature names for AI model prediction"""
+    return [
+        'file_size_mb', 'gl_records_count', 'tb_records_count',
+        'unique_documents', 'duplicate_documents', 'duplicate_ratio',
+        'unique_users', 'unique_accounts', 'unique_months',
+        'step1_passed', 'step2_passed'  # Only 2 steps now
+    ]
 
 
 # ============================================================================
@@ -8157,6 +8097,7 @@ def _get_feature_names():
         'total_documents', 'unique_documents', 'duplicate_ratio',
         'user_count', 'subtype_count', 'months_covered',
         'step1_passed', 'step2_passed', 'step3_passed', 'step4_passed',
+        'step5_passed', 'step6_passed', 'step7_passed',
         'processing_duration', 'anomalies_count', 'critical_issues_count'
     ]
 

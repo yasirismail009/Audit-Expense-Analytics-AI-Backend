@@ -215,10 +215,11 @@ def task_failure_handler(sender, task_id, exception, args, kwargs, traceback, ei
 def get_queue_status():
     """Get current queue status"""
     try:
+        from datetime import datetime
         # Simplified queue status check
         return {
             'status': 'available',
-            'timestamp': str(datetime.now())
+            'timestamp': datetime.now().isoformat()
         }
     except Exception as e:
         logger.error(f"Error getting queue status: {e}")
@@ -238,6 +239,8 @@ def ensure_worker_listening():
 @app.task(bind=True)
 def debug_task(self):
     """Enhanced debug task to test Celery setup and queue listening."""
+    from datetime import datetime
+    
     logger.info(f'Debug task request: {self.request!r}')
     
     # Check queue status
@@ -249,12 +252,14 @@ def debug_task(self):
         'task_id': self.request.id,
         'queue_status': queue_status,
         'worker_listening': worker_listening,
-        'timestamp': str(self.request.timestamp)
+        'timestamp': datetime.now().isoformat()
     }
 
 @app.task(bind=True)
 def health_check(self):
     """Health check task to monitor Celery health"""
+    from datetime import datetime
+    
     try:
         # Check Redis connection
         import redis
@@ -271,7 +276,8 @@ def health_check(self):
         'status': 'healthy' if worker_status and redis_status == 'healthy' else 'unhealthy',
         'redis': redis_status,
         'worker': 'healthy' if worker_status else 'unhealthy',
-        'timestamp': str(self.request.timestamp)
+        'timestamp': datetime.now().isoformat(),
+        'task_id': self.request.id
     }
 
 @app.task(bind=True)

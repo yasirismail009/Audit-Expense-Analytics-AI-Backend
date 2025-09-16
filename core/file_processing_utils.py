@@ -292,7 +292,12 @@ class DataParser:
             cleaned_value = '-' + cleaned_value[1:-1]
         
         try:
-            return Decimal(cleaned_value)
+            decimal_value = Decimal(cleaned_value)
+            
+            # Normalize to remove unnecessary trailing zeros but preserve actual precision
+            # This will convert 1000.000000 to 1000 but keep 1000.50 as 1000.50
+            return decimal_value.normalize()
+            
         except (InvalidOperation, ValueError):
             return Decimal('0')
     
@@ -1088,19 +1093,42 @@ class DataProcessor:
                 logger.warning("Skipping row with missing G/L Account")
                 return None
             
+            # Convert float/int account codes to proper string format
+            gl_account_code = str(gl_account_code).strip()
+            
+            # Handle decimal representations of whole numbers (e.g., "110000.0" → "110000")
+            if '.' in gl_account_code:
+                try:
+                    float_val = float(gl_account_code)
+                    if float_val.is_integer():
+                        gl_account_code = str(int(float_val))
+                except ValueError:
+                    pass  # Keep original string if conversion fails
+            
             # Create or get GL Account
             gl_account = GLAccount.get_or_create_account(
+                engagement=self.data_file.engagement,
                 account_code=gl_account_code,
                 account_name=f'GL Account {gl_account_code}',  # Default name, can be updated later
                 company_code=row.get('Company Code', ''),
-                profit_center=row.get('Profit Center', ''),
-                engagement_id=self.data_file.engagement_id,
-                client_name=self.data_file.client_name
+                profit_center=row.get('Profit Center', '')
             )
+            
+            # Handle document number - convert float/int to proper string format
+            document_number = str(row.get('Document', '')).strip()
+            
+            # Handle decimal representations of whole numbers (e.g., "1234567.0" → "1234567")
+            if '.' in document_number:
+                try:
+                    float_val = float(document_number)
+                    if float_val.is_integer():
+                        document_number = str(int(float_val))
+                except ValueError:
+                    pass  # Keep original string if conversion fails
             
             posting = SAPGLPosting(
                 data_file=self.data_file,
-                document_number=row.get('Document', ''),
+                document_number=document_number,
                 document_type=row.get('Document type', ''),
                 amount_local_currency=DataParser.parse_decimal(row.get('Amount in Local Currency', '0')),
                 local_currency=row.get('Local Currency', 'SAR'),
@@ -1112,10 +1140,10 @@ class DataProcessor:
                 posting_period=DataParser.parse_int(row.get('Posting period', '1')) or 1,
                 text=row.get('Text', ''),
                 segment=row.get('Segment', ''),
-                clearing_document=row.get('Clearing Document', ''),
-                offsetting_account=row.get('Offsetting', ''),
-                invoice_reference=row.get('Invoice Reference', ''),
-                sales_document=row.get('Sales Document', ''),
+                clearing_document=self._convert_decimal_to_int_string(row.get('Clearing Document', '')),
+                offsetting_account=self._convert_decimal_to_int_string(row.get('Offsetting', '')),
+                invoice_reference=self._convert_decimal_to_int_string(row.get('Invoice Reference', '')),
+                sales_document=self._convert_decimal_to_int_string(row.get('Sales Document', '')),
                 assignment=row.get('Assignment', ''),
                 year_month=row.get('Year/Month', '')
             )
@@ -1141,25 +1169,45 @@ class DataProcessor:
                 logger.warning("Skipping row with missing GL Account")
                 return None
             
+            # Convert to string to handle numeric values from Excel
+            gl_account_code = str(gl_account_code).strip()
+            
+            # Handle decimal representations of whole numbers (e.g., "110000.0" → "110000")
+            if '.' in gl_account_code:
+                try:
+                    float_val = float(gl_account_code)
+                    if float_val.is_integer():
+                        gl_account_code = str(int(float_val))
+                except ValueError:
+                    pass  # Keep original string if conversion fails
+            
             # Create or get GL Account
             gl_account = GLAccount.get_or_create_account(
+                engagement=self.data_file.engagement,
                 account_code=gl_account_code,
                 account_name=row.get('Short Text', f'GL Account {gl_account_code}'),
-                company_code=row.get('CoCd', ''),
-                engagement_id=self.data_file.engagement_id,
-                client_name=self.data_file.client_name
+                company_code=row.get('CoCd', '')
             )
+            
+            # Handle flexible column names and company code
+            company_code = str(row.get('CoCd', row.get('Company Code', ''))).strip()
+            if not company_code:
+                company_code = '1000'  # Default company code if missing
+            
+            # Handle debit/credit columns with potential leading spaces
+            debit_value = row.get('Debit', row.get(' Debit', ''))
+            credit_value = row.get('Credit', row.get(' Credit', ''))
             
             tb_record = TrialBalance(
                 data_file=self.data_file,
-                company_code=row.get('CoCd', ''),
+                company_code=company_code,
                 gl_account=gl_account_code,  # Keep legacy field
                 gl_account_ref=gl_account,   # New foreign key reference
                 short_text=row.get('Short Text', ''),
                 currency=row.get('Currency', 'SAR'),
                 opening_balance=DataParser.parse_decimal(row.get('Opening Balance', '0')),
-                debit=DataParser.parse_decimal(row.get('Debit', '')) if row.get('Debit') else None,
-                credit=DataParser.parse_decimal(row.get('Credit', '')) if row.get('Credit') else None,
+                debit=DataParser.parse_decimal(debit_value) if pd.notna(debit_value) and str(debit_value).strip() != '' else None,
+                credit=DataParser.parse_decimal(credit_value) if pd.notna(credit_value) and str(credit_value).strip() != '' else None,
                 closing_balance=DataParser.parse_decimal(row.get('Closing Balance', '0'))
             )
             return tb_record
@@ -1279,13 +1327,12 @@ class DataProcessor:
                 ])
                 
                 gl_account_ref = GLAccount.get_or_create_account(
+                    engagement=self.data_file.engagement,
                     account_code=gl_account_code,
                     account_name=account or f'GL Account {gl_account_code}',
                     company_code=company_code,
                     cost_center=cost_center,
-                    financial_statement_category=financial_statement,
-                    engagement_id=self.data_file.engagement_id,
-                    client_name=self.data_file.client_name
+                    financial_statement_category=financial_statement
                 )
             
             # Map other fields with flexible column names
@@ -1381,6 +1428,24 @@ class DataProcessor:
         except Exception as e:
             logger.error(f"Error creating Chart record from row: {e}")
             return None
+    
+    def _convert_decimal_to_int_string(self, value) -> str:
+        """Convert decimal values like '1234567.0' to '1234567' string"""
+        if not value:
+            return ''
+        
+        value_str = str(value).strip()
+        
+        # Handle decimal representations of whole numbers (e.g., "1234567.0" → "1234567")
+        if '.' in value_str:
+            try:
+                float_val = float(value_str)
+                if float_val.is_integer():
+                    return str(int(float_val))
+            except ValueError:
+                pass  # Keep original string if conversion fails
+        
+        return value_str
     
     def _parse_posting_date(self, date_value) -> datetime:
         """Parse posting date with fallback - handles strings like '1/15/2025', Timestamps, and datetime objects"""

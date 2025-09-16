@@ -1,72 +1,410 @@
 from rest_framework import serializers
 from .models import (
-    SAPGLPosting, DataFile, FileProcessingJob, MLModelTraining, OverallAnalysisResult, RiskScoringDocument, 
+    # Core audit structure models
+    Client, Engagement, DataFile, GLAccount,
+    # Transaction models
+    SAPGLPosting, TrialBalance, ChartOfAccount,
+    # Processing and analysis models
+    FileProcessingJob, CompletenessTestResult,
+    # Analysis result models  
+    OverallAnalysisResult, RiskScoringDocument, 
     DuplicateAnalysisResult, BackdatedAnalysisResult, UserAnalysisResult, 
     ClosingEntriesAnalysisResult, UnusualDaysAnalysisResult, HolidayAnalysisResult, 
-    GeneralAnalysisResult, CompletenessTestResult
+    GeneralAnalysisResult, MLModelTraining,
+    # Utility classes
+    AmountParser
 )
 from decimal import Decimal
 import uuid
 
+# ============================================================================
+# CORE AUDIT STRUCTURE SERIALIZERS
+# ============================================================================
 
-class SAPGLPostingSerializer(serializers.ModelSerializer):
-    """Serializer for SAP GL Posting data"""
+class ClientSerializer(serializers.ModelSerializer):
+    """Serializer for Client model"""
     
     # Computed fields
-    is_high_value = serializers.ReadOnlyField()
-    is_cleared = serializers.ReadOnlyField()
-    has_arabic_text = serializers.ReadOnlyField()
+    active_engagements_count = serializers.SerializerMethodField()
+    total_engagements_count = serializers.SerializerMethodField()
     
-    # GL Account details - removed since GLAccount model was deleted
+    class Meta:
+        model = Client
+        fields = [
+            'id', 'client_code', 'client_name', 'company_name', 'industry', 
+            'country', 'currency', 'primary_contact_name', 'primary_contact_email', 
+            'primary_contact_phone', 'tax_id', 'registration_number', 
+            'fiscal_year_end', 'audit_firm', 'is_active', 'notes',
+            'active_engagements_count', 'total_engagements_count',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+    
+    def get_active_engagements_count(self, obj):
+        """Get count of active engagements"""
+        return obj.get_active_engagements().count()
+    
+    def get_total_engagements_count(self, obj):
+        """Get total count of all engagements"""
+        return obj.engagements.count()
+
+
+class ClientListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for listing clients"""
+    
+    active_engagements_count = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Client
+        fields = [
+            'id', 'client_code', 'client_name', 'company_name', 'industry',
+            'is_active', 'active_engagements_count', 'created_at'
+        ]
+    
+    def get_active_engagements_count(self, obj):
+        return obj.get_active_engagements().count()
+
+
+class EngagementSerializer(serializers.ModelSerializer):
+    """Serializer for Engagement model"""
+    
+    # Related fields
+    client_name = serializers.CharField(source='client.client_name', read_only=True)
+    client_code = serializers.CharField(source='client.client_code', read_only=True)
+    
+    # Computed fields
+    completeness_status = serializers.SerializerMethodField()
+    uploaded_files_info = serializers.SerializerMethodField()
+    file_completeness = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Engagement
+        fields = [
+            'id', 'engagement_id', 'engagement_name', 'client', 'client_name', 'client_code',
+            'fiscal_year', 'fiscal_year_start', 'fiscal_year_end', 
+            'audit_start_date', 'audit_end_date', 'engagement_type', 'audit_opinion',
+            'engagement_partner', 'engagement_manager', 'audit_team_members',
+            'status', 'required_files', 'completeness_threshold',
+            'description', 'notes', 'completeness_status', 'uploaded_files_info',
+            'file_completeness', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+    
+    def get_completeness_status(self, obj):
+        """Get engagement completeness status"""
+        return obj.get_completeness_status()
+    
+    def get_uploaded_files_info(self, obj):
+        """Get information about uploaded files"""
+        files = obj.data_files.all()
+        return {
+            'total_files': files.count(),
+            'file_types': list(files.values_list('file_type', flat=True)),
+            'validated_files': files.filter(is_validated=True).count(),
+        }
+    
+    def get_file_completeness(self, obj):
+        """Check if engagement has all required files"""
+        return obj.is_complete_file_set()
+
+
+class EngagementListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for listing engagements"""
+    
+    client_name = serializers.CharField(source='client.client_name', read_only=True)
+    completeness_status = serializers.SerializerMethodField()
+    files_count = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Engagement
+        fields = [
+            'id', 'engagement_id', 'engagement_name', 'client_name',
+            'fiscal_year', 'status', 'completeness_status', 'files_count', 'created_at'
+        ]
+    
+    def get_completeness_status(self, obj):
+        return obj.get_completeness_status()
+    
+    def get_files_count(self, obj):
+        return obj.data_files.count()
+
+
+class GLAccountSerializer(serializers.ModelSerializer):
+    """Serializer for GL Account unified view"""
+    
+    # Related fields
+    engagement_name = serializers.CharField(source='engagement.engagement_name', read_only=True)
+    client_name = serializers.CharField(source='engagement.client.client_name', read_only=True)
+    
+    # Computed fields
+    unified_view = serializers.SerializerMethodField()
+    has_trial_balance_data = serializers.SerializerMethodField()
+    has_chart_of_accounts_data = serializers.SerializerMethodField()
+    has_gl_transactions = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = GLAccount
+        fields = [
+            'id', 'account_code', 'account_name', 'account_description',
+            'engagement', 'engagement_name', 'client_name',
+            'company_code', 'profit_center', 'cost_center', 'is_active', 'currency',
+            # COA hierarchy
+            'account_type', 'sub_type', 'sub_sub_type',
+            # Trial Balance data
+            'opening_balance', 'closing_balance', 'tb_debit', 'tb_credit',
+            # Financial statement classification
+            'financial_statement_category', 'balance_sheet_category', 'income_statement_category',
+            # Computed fields
+            'unified_view', 'has_trial_balance_data', 'has_chart_of_accounts_data', 'has_gl_transactions',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'engagement_id', 'client_name', 'created_at', 'updated_at']
+    
+    def get_unified_view(self, obj):
+        """Get unified account view combining all data"""
+        return obj.get_unified_view()
+    
+    def get_has_trial_balance_data(self, obj):
+        """Check if account has trial balance data"""
+        return bool(obj.opening_balance or obj.closing_balance)
+    
+    def get_has_chart_of_accounts_data(self, obj):
+        """Check if account has chart of accounts data"""
+        return bool(obj.account_type and obj.sub_type and obj.sub_sub_type)
+    
+    def get_has_gl_transactions(self, obj):
+        """Check if account has GL transactions"""
+        return obj.gl_postings.exists()
+
+
+# ============================================================================
+# TRANSACTION DATA SERIALIZERS
+# ============================================================================
+
+class SAPGLPostingSerializer(serializers.ModelSerializer):
+    """Serializer for SAP GL Posting data with amount parsing support"""
+    
+    # Related fields
+    engagement_name = serializers.CharField(source='data_file.engagement.engagement_name', read_only=True)
+    client_name = serializers.CharField(source='data_file.engagement.client.client_name', read_only=True)
+    file_type = serializers.CharField(source='data_file.file_type', read_only=True)
+    
+    # GL Account details
+    gl_account_name = serializers.CharField(source='gl_account_ref.account_name', read_only=True)
+    account_type = serializers.CharField(source='gl_account_ref.account_type', read_only=True)
+    
+    # Computed fields
+    transaction_type = serializers.ReadOnlyField()
+    debit_amount = serializers.ReadOnlyField()
+    credit_amount = serializers.ReadOnlyField()
+    amount_display = serializers.SerializerMethodField()
+    parsing_info = serializers.SerializerMethodField()
     
     class Meta:
         model = SAPGLPosting
-        fields = '__all__'
+        fields = [
+            'id', 'data_file', 'engagement_name', 'client_name', 'file_type',
+            'document_number', 'document_type', 'amount_local_currency', 'local_currency',
+            'gl_account', 'gl_account_ref', 'gl_account_name', 'account_type',
+            'profit_center', 'user_name', 'posting_date', 'document_date', 'entry_date',
+            'fiscal_year', 'posting_period', 'text', 'segment', 'clearing_document',
+            'offsetting_account', 'invoice_reference', 'sales_document', 'assignment', 'year_month',
+            'transaction_type', 'debit_amount', 'credit_amount', 'amount_display', 'parsing_info',
+            'created_at', 'updated_at'
+        ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+    
+    def get_amount_display(self, obj):
+        """Get formatted amount display"""
+        return obj.get_amount_display()
+    
+    def get_parsing_info(self, obj):
+        """Get amount parsing information"""
+        return obj.get_parsing_info()
 
 class SAPGLPostingListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for listing SAP GL Postings"""
     
-    is_high_value = serializers.ReadOnlyField()
-    is_cleared = serializers.ReadOnlyField()
+    engagement_name = serializers.CharField(source='data_file.engagement.engagement_name', read_only=True)
+    transaction_type = serializers.ReadOnlyField()
+    amount_display = serializers.SerializerMethodField()
     
     class Meta:
         model = SAPGLPosting
         fields = [
             'id', 'document_number', 'document_type', 'posting_date', 
-            'amount_local_currency', 'local_currency', 'transaction_type',
-            'gl_account', 'profit_center', 'user_name', 
-            'fiscal_year', 'posting_period', 'is_high_value', 'is_cleared', 
-            'created_at'
+            'amount_local_currency', 'local_currency', 'transaction_type', 'amount_display',
+            'gl_account', 'profit_center', 'user_name', 'engagement_name',
+            'fiscal_year', 'posting_period', 'created_at'
         ]
+    
+    def get_amount_display(self, obj):
+        return obj.get_amount_display()
+
+
+class TrialBalanceSerializer(serializers.ModelSerializer):
+    """Serializer for Trial Balance data with amount parsing support"""
+    
+    # Related fields
+    engagement_name = serializers.CharField(source='data_file.engagement.engagement_name', read_only=True)
+    client_name = serializers.CharField(source='data_file.engagement.client.client_name', read_only=True)
+    gl_account_name = serializers.CharField(source='gl_account_ref.account_name', read_only=True)
+    
+    # Computed fields
+    balance_movement = serializers.SerializerMethodField()
+    amounts_display = serializers.SerializerMethodField()
+    parsing_validation = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = TrialBalance
+        fields = [
+            'id', 'data_file', 'engagement_name', 'client_name',
+            'company_code', 'gl_account', 'gl_account_ref', 'gl_account_name',
+            'short_text', 'currency', 'opening_balance', 'closing_balance',
+            'debit', 'credit', 'balance_movement', 'amounts_display', 'parsing_validation',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+    
+    def get_balance_movement(self, obj):
+        """Get balance movement"""
+        return obj.get_balance_movement()
+    
+    def get_amounts_display(self, obj):
+        """Get formatted amounts display"""
+        return obj.get_amounts_display()
+    
+    def get_parsing_validation(self, obj):
+        """Get parsing validation results"""
+        return obj.get_parsing_validation()
+
+
+class ChartOfAccountSerializer(serializers.ModelSerializer):
+    """Serializer for Chart of Accounts data with hierarchy support"""
+    
+    # Related fields
+    engagement_name = serializers.CharField(source='data_file.engagement.engagement_name', read_only=True)
+    client_name = serializers.CharField(source='data_file.engagement.client.client_name', read_only=True)
+    gl_account_name = serializers.CharField(source='gl_account_ref.account_name', read_only=True)
+    
+    # Computed fields
+    hierarchy_path = serializers.SerializerMethodField()
+    hierarchy_dict = serializers.SerializerMethodField()
+    amounts_display = serializers.SerializerMethodField()
+    hierarchy_validation = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = ChartOfAccount
+        fields = [
+            'id', 'data_file', 'engagement_name', 'client_name',
+            'account', 'type', 'sub_type', 'sub_sub_type', 'hierarchy_path', 'hierarchy_dict',
+            'gl_account', 'gl_account_ref', 'gl_account_name', 'company', 'branch',
+            'cost_center', 'code', 'gl_account_long_text', 'ref_to_fs', 'financial_statement',
+            'ref_to_note', 'fiscal_year', 'q1_amount', 'adj_reclas', 'fin_q1_amount',
+            'amounts_display', 'hierarchy_validation', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+    
+    def get_hierarchy_path(self, obj):
+        """Get hierarchy path"""
+        return obj.get_hierarchy_path()
+    
+    def get_hierarchy_dict(self, obj):
+        """Get hierarchy as dictionary"""
+        return obj.get_hierarchy_dict()
+    
+    def get_amounts_display(self, obj):
+        """Get formatted amounts display"""
+        return obj.get_amounts_display()
+    
+    def get_hierarchy_validation(self, obj):
+        """Get hierarchy validation"""
+        return obj.get_hierarchy_validation()
+
+# ============================================================================
+# FILE MANAGEMENT SERIALIZERS
+# ============================================================================
 
 class DataFileSerializer(serializers.ModelSerializer):
-    """Serializer for uploaded data files"""
+    """Serializer for uploaded data files with engagement support"""
+    
+    # Related fields
+    engagement_name = serializers.CharField(source='engagement.engagement_name', read_only=True)
+    client_name = serializers.CharField(source='engagement.client.client_name', read_only=True)
+    
+    # Computed fields
+    file_type_display = serializers.CharField(source='get_file_type_display', read_only=True)
+    validation_status = serializers.SerializerMethodField()
     
     class Meta:
         model = DataFile
         fields = [
-            'id', 'file_name', 'file_size', 'engagement_id', 'client_name', 
-            'company_name', 'fiscal_year', 'audit_start_date', 'audit_end_date',
+            'id', 'file_name', 'file_size', 'file_hash', 'engagement', 'engagement_name',
+            'file_type', 'file_type_display', 'is_validated', 'validation_errors',
+            'client_name', 'company_name', 'fiscal_year', 'audit_start_date', 'audit_end_date',
             'total_records', 'processed_records', 'failed_records', 'status',
             'uploaded_at', 'processed_at', 'error_message', 'min_date', 
-            'max_date', 'min_amount', 'max_amount'
+            'max_date', 'min_amount', 'max_amount', 'validation_status',
+            'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'uploaded_at', 'processed_at']
+        read_only_fields = [
+            'id', 'uploaded_at', 'processed_at', 'engagement_id', 'client_name', 
+            'company_name', 'fiscal_year', 'audit_start_date', 'audit_end_date',
+            'created_at', 'updated_at'
+        ]
+    
+    def get_validation_status(self, obj):
+        """Get file validation status"""
+        return {
+            'is_validated': obj.is_validated,
+            'error_count': len(obj.validation_errors) if obj.validation_errors else 0,
+            'has_errors': bool(obj.validation_errors),
+        }
 
 class DataFileUploadSerializer(serializers.Serializer):
-    """Serializer for file upload requests"""
+    """Serializer for file upload requests with engagement support"""
     
-    file = serializers.FileField(help_text='CSV or Excel file (xlsx, xls, xlsb) containing SAP GL posting data')
+    file = serializers.FileField(help_text='CSV or Excel file containing audit data (TB, GL, COA)')
     description = serializers.CharField(max_length=500, required=False, help_text='Optional description of the file')
     
-    # New fields for enhanced file upload flow
-    engagement_id = serializers.CharField(max_length=100, help_text='Engagement ID for the audit')
-    client_name = serializers.CharField(max_length=255, help_text='Client name')
-    company_name = serializers.CharField(max_length=255, help_text='Company name')
-    fiscal_year = serializers.IntegerField(help_text='Fiscal year for the audit')
-    audit_start_date = serializers.DateField(help_text='Audit start date')
-    audit_end_date = serializers.DateField(help_text='Audit end date')
+    # Engagement reference (primary method)
+    engagement = serializers.UUIDField(required=False, help_text='Engagement UUID (preferred method)')
+    
+    # File type specification
+    file_type = serializers.ChoiceField(
+        choices=[('TB', 'Trial Balance'), ('GL', 'General Ledger'), ('COA', 'Chart of Accounts'), ('OTHER', 'Other')],
+        help_text='Type of audit file being uploaded'
+    )
+    
+    # Legacy fields for backward compatibility (will be used to create/find engagement)
+    engagement_id = serializers.CharField(max_length=100, required=False, help_text='Engagement ID (legacy)')
+    client_name = serializers.CharField(max_length=255, required=False, help_text='Client name (legacy)')
+    company_name = serializers.CharField(max_length=255, required=False, help_text='Company name (legacy)')
+    fiscal_year = serializers.IntegerField(required=False, help_text='Fiscal year (legacy)')
+    audit_start_date = serializers.DateField(required=False, help_text='Audit start date (legacy)')
+    audit_end_date = serializers.DateField(required=False, help_text='Audit end date (legacy)')
+    
+    def validate(self, data):
+        """Validate that either engagement UUID or legacy fields are provided"""
+        engagement = data.get('engagement')
+        engagement_id = data.get('engagement_id')
+        
+        if not engagement and not engagement_id:
+            raise serializers.ValidationError(
+                'Either engagement UUID or engagement_id must be provided'
+            )
+        
+        # If using legacy fields, ensure all required fields are present
+        if not engagement and engagement_id:
+            required_legacy_fields = ['client_name', 'company_name', 'fiscal_year', 'audit_start_date', 'audit_end_date']
+            missing_fields = [field for field in required_legacy_fields if not data.get(field)]
+            
+            if missing_fields:
+                raise serializers.ValidationError(
+                    f'When using legacy mode, these fields are required: {", ".join(missing_fields)}'
+                )
+        
+        return data
 
 
 
@@ -972,48 +1310,171 @@ class HolidayListSerializer(serializers.Serializer):
 # COMPLETENESS TEST RESULT SERIALIZER
 # ============================================================================
 
+# ============================================================================
+# ENHANCED COMPLETENESS TEST SERIALIZERS
+# ============================================================================
+
 class CompletenessTestResultSerializer(serializers.ModelSerializer):
-    """Serializer for Completeness Test Results"""
+    """Serializer for Engagement-level Completeness Test Results"""
+    
+    # Related fields
+    engagement_name = serializers.CharField(source='engagement.engagement_name', read_only=True)
+    client_name = serializers.CharField(source='engagement.client.client_name', read_only=True)
+    
+    # File information
+    gl_file_name = serializers.CharField(source='gl_file.file_name', read_only=True)
+    tb_file_name = serializers.CharField(source='tb_file.file_name', read_only=True)
+    coa_file_name = serializers.CharField(source='coa_file.file_name', read_only=True)
     
     # Computed fields
     status_display = serializers.CharField(source='get_overall_status_display', read_only=True)
     test_duration = serializers.SerializerMethodField()
-    data_file_name = serializers.CharField(source='data_file.file_name', read_only=True)
+    test_summary = serializers.SerializerMethodField()
+    engagement_completeness_status = serializers.SerializerMethodField()
+    failed_tests = serializers.SerializerMethodField()
     
     class Meta:
         model = CompletenessTestResult
         fields = [
-            'id', 'data_file', 'data_file_name', 'engagement_id', 'test_timestamp',
+            'id', 'engagement', 'engagement_name', 'client_name', 'test_timestamp', 'test_version',
+            'gl_file', 'tb_file', 'coa_file', 'gl_file_name', 'tb_file_name', 'coa_file_name',
             'overall_status', 'status_display', 'overall_explanation', 'completeness_score',
-            'step1_gl_tb_reconciliation', 'step2_debit_credit_balance', 
-            'step3_account_coverage', 'step4_transaction_gaps',
-            'total_gl_records', 'total_tb_records', 'tests_passed', 'total_tests',
-            'critical_issues_count', 'comprehensive_statistics',
-            'processing_duration', 'test_duration'
+            # Enhanced test steps
+            'step1_file_completeness', 'step2_gl_tb_reconciliation',
+            # Enhanced statistics
+            'total_gl_records', 'total_tb_records', 'total_coa_records', 'total_accounts_unified',
+            'tests_passed', 'total_tests', 'critical_issues_count', 'comprehensive_statistics',
+            'processing_duration', 'test_duration', 'test_summary', 'engagement_completeness_status', 'failed_tests',
+            'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'test_timestamp', 'processing_duration']
+        read_only_fields = ['id', 'test_timestamp', 'processing_duration', 'engagement_id', 'created_at', 'updated_at']
     
     def get_test_duration(self, obj):
         """Get formatted test duration"""
         if obj.processing_duration:
             return f"{obj.processing_duration:.2f} seconds"
         return None
+    
+    def get_test_summary(self, obj):
+        """Get comprehensive test summary"""
+        return obj.get_summary()
+    
+    def get_engagement_completeness_status(self, obj):
+        """Get engagement-level completeness status"""
+        return obj.get_engagement_completeness_status()
+    
+    def get_failed_tests(self, obj):
+        """Get list of failed tests"""
+        return obj.get_failed_tests()
 
 
 class CompletenessTestSummarySerializer(serializers.ModelSerializer):
     """Simplified serializer for completeness test summary"""
     
-    data_file_name = serializers.CharField(source='data_file.file_name', read_only=True)
+    engagement_name = serializers.CharField(source='engagement.engagement_name', read_only=True)
+    client_name = serializers.CharField(source='engagement.client.client_name', read_only=True)
     status_display = serializers.CharField(source='get_overall_status_display', read_only=True)
     
     class Meta:
         model = CompletenessTestResult
         fields = [
-            'id', 'engagement_id', 'data_file_name', 'test_timestamp',
+            'id', 'engagement', 'engagement_name', 'client_name', 'test_timestamp',
             'overall_status', 'status_display', 'completeness_score',
             'tests_passed', 'total_tests', 'critical_issues_count',
-            'total_gl_records', 'total_tb_records'
+            'total_gl_records', 'total_tb_records', 'total_coa_records', 'total_accounts_unified'
         ]
+
+
+# ============================================================================
+# AMOUNT PARSING UTILITY SERIALIZERS
+# ============================================================================
+
+class AmountParsingTestSerializer(serializers.Serializer):
+    """Serializer for testing amount parsing functionality"""
+    
+    amount_string = serializers.CharField(help_text='Amount string to parse')
+    default_zero = serializers.BooleanField(default=False, help_text='Return zero for invalid amounts')
+    
+    def validate_and_parse(self):
+        """Validate and parse the amount"""
+        amount_str = self.validated_data['amount_string']
+        default_zero = self.validated_data['default_zero']
+        
+        # Parse the amount
+        parsed_amount = AmountParser.parse_amount(amount_str, default_zero)
+        debit, credit = AmountParser.parse_debit_credit_amounts(amount_str)
+        is_valid, error = AmountParser.validate_amount_format(amount_str)
+        
+        return {
+            'input': amount_str,
+            'parsed_amount': str(parsed_amount) if parsed_amount is not None else None,
+            'debit_amount': str(debit) if debit is not None else None,
+            'credit_amount': str(credit) if credit is not None else None,
+            'is_valid': is_valid,
+            'error_message': error,
+            'transaction_type': 'DEBIT' if parsed_amount and parsed_amount > 0 else 'CREDIT' if parsed_amount and parsed_amount < 0 else 'UNKNOWN',
+            'formatted_display': AmountParser.format_amount(parsed_amount) if parsed_amount is not None else None
+        }
+
+
+class EngagementCreateSerializer(serializers.ModelSerializer):
+    """Serializer for creating new engagements"""
+    
+    class Meta:
+        model = Engagement
+        fields = [
+            'engagement_id', 'engagement_name', 'client', 'fiscal_year',
+            'fiscal_year_start', 'fiscal_year_end', 'audit_start_date', 'audit_end_date',
+            'engagement_type', 'engagement_partner', 'engagement_manager', 
+            'audit_team_members', 'required_files', 'completeness_threshold',
+            'description', 'notes'
+        ]
+
+
+class ClientCreateSerializer(serializers.ModelSerializer):
+    """Serializer for creating new clients"""
+    
+    class Meta:
+        model = Client
+        fields = [
+            'client_code', 'client_name', 'company_name', 'industry', 'country', 'currency',
+            'primary_contact_name', 'primary_contact_email', 'primary_contact_phone',
+            'tax_id', 'registration_number', 'fiscal_year_end', 'audit_firm', 'notes'
+        ]
+
+
+# ============================================================================
+# UNIFIED ACCOUNT VIEW SERIALIZERS
+# ============================================================================
+
+class UnifiedAccountViewSerializer(serializers.Serializer):
+    """Serializer for unified account view across TB, GL, and COA"""
+    
+    account_code = serializers.CharField()
+    account_name = serializers.CharField()
+    engagement = serializers.CharField()
+    client = serializers.CharField()
+    
+    # Trial Balance data
+    opening_balance = serializers.DecimalField(max_digits=20, decimal_places=2, allow_null=True)
+    closing_balance = serializers.DecimalField(max_digits=20, decimal_places=2, allow_null=True)
+    tb_debit = serializers.DecimalField(max_digits=20, decimal_places=2, allow_null=True)
+    tb_credit = serializers.DecimalField(max_digits=20, decimal_places=2, allow_null=True)
+    
+    # Chart of Accounts hierarchy
+    account_type = serializers.CharField(allow_null=True)
+    sub_type = serializers.CharField(allow_null=True)
+    sub_sub_type = serializers.CharField(allow_null=True)
+    
+    # GL Posting statistics
+    gl_transaction_count = serializers.IntegerField()
+    gl_total_debits = serializers.DecimalField(max_digits=20, decimal_places=2, allow_null=True)
+    gl_total_credits = serializers.DecimalField(max_digits=20, decimal_places=2, allow_null=True)
+    
+    # Financial statement classification
+    financial_statement_category = serializers.CharField(allow_null=True)
+    balance_sheet_category = serializers.CharField(allow_null=True)
+    income_statement_category = serializers.CharField(allow_null=True)
 
 
 # ============================================================================
