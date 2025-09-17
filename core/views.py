@@ -58,56 +58,54 @@ class FileUploadView(generics.CreateAPIView):
             # Get or create engagement from metadata
             engagement = self._get_or_create_engagement_from_metadata(metadata)
             
-            # Process each file based on its type
+            # Process files in order: TB first (sync), then COA, then GL (both threaded)
+            # This ensures COA is available before GL processing starts
             results = []
-            for file_type, file_obj in files.items():
-                try:
-                    # Map old file type names to new ones
-                    type_mapping = {
-                        'trial_balance': 'TB',
-                        'chart_of_accounts': 'COA', 
-                        'gl_accounts': 'GL'
-                    }
-                    new_file_type = type_mapping[file_type]
-                    
-                    # Create or get DataFile record for each file
-                    data_file = self._create_data_file_record(file_obj, engagement, new_file_type, metadata)
-                    
-                    # Check if this is a duplicate file (already processed)
-                    if data_file.status == 'COMPLETED' and data_file.file_hash == hashlib.sha256(file_obj.read()).hexdigest():
-                        file_obj.seek(0)  # Reset file pointer
-                        # File already processed with same content, return existing result
-                        result = {
-                            'file_type': new_file_type,
-                            'file_name': file_obj.name,
-                            'file_id': str(data_file.id),
-                            'engagement_id': engagement.engagement_id,
-                            'status': 'duplicate',
-                            'message': f'File with identical content already exists and has been processed for this engagement',
-                            'records_processed': data_file.processed_records,
-                            'total_records': data_file.total_records
-                        }
-                    else:
-                        # Process files based on type and size
-                        if new_file_type == 'GL':
-                            # GL Listing: Check size and use threading for large files
-                            result = self._process_gl_file_with_threading(data_file, file_obj)
-                        else:
-                            # TB and Chart of Accounts: Process synchronously from memory
-                            result = self._process_file_sync(data_file, file_obj, new_file_type)
-                    
-                    results.append(result)
-                        
-                except Exception as e:
-                    logger.error(f"Error processing {file_type} file: {e}")
-                    results.append({
-                        'file_type': type_mapping.get(file_type, file_type),
-                        'file_name': file_obj.name,
-                        'status': 'failed',
-                        'error': str(e)
-                    })
             
-            # Return success response
+            # 1. Process TB files first (synchronously) - REQUEST COMPLETES AFTER THIS
+            tb_processed = False
+            for file_type, file_obj in files.items():
+                if file_type == 'trial_balance':
+                    try:
+                        new_file_type = 'TB'
+                        data_file = self._create_data_file_record(file_obj, engagement, new_file_type, metadata)
+                        
+                        # Check if this is a duplicate file
+                        if data_file.status == 'COMPLETED' and data_file.file_hash == hashlib.sha256(file_obj.read()).hexdigest():
+                            file_obj.seek(0)
+                            result = {
+                                'file_type': new_file_type,
+                                'file_name': file_obj.name,
+                                'file_id': str(data_file.id),
+                                'engagement_id': engagement.engagement_id,
+                                'status': 'duplicate',
+                                'message': f'File with identical content already exists and has been processed for this engagement',
+                                'records_processed': data_file.processed_records,
+                                'total_records': data_file.total_records
+                            }
+                        else:
+                            # Process TB synchronously
+                            result = self._process_file_sync(data_file, file_obj, new_file_type)
+                        
+                        results.append(result)
+                        tb_processed = True
+                        logger.info(f"✅ TB processing completed: {result.get('message', 'Success')}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing TB file: {e}")
+                        results.append({
+                            'file_type': 'TB',
+                            'file_name': file_obj.name,
+                            'status': 'failed',
+                            'error': str(e)
+                        })
+                        tb_processed = True  # Still mark as processed even if failed
+            
+            # Start background processing for COA and GL files (non-blocking)
+            self._start_background_file_processing(files, engagement, metadata, results)
+            
+            # Return response immediately after TB processing
+            logger.info("🚀 Returning response immediately after TB processing - COA/GL processing in background")
             return self._create_success_response(results, engagement)
                 
         except Exception as e:
@@ -296,41 +294,7 @@ class FileUploadView(generics.CreateAPIView):
             file_hash.update(chunk)
         file_obj.seek(0)  # Reset file pointer
         
-        # Check for existing file of same type in this engagement (due to unique constraint)
-        existing_file = DataFile.objects.filter(
-            engagement=engagement,
-            file_type=file_type
-        ).first()
-        
-        if existing_file:
-            # Check if it's the same file content
-            if existing_file.file_hash == file_hash.hexdigest():
-                logger.warning(f"Duplicate file detected for engagement {engagement.engagement_id}, file type {file_type}")
-                # Same content, return existing file
-                return existing_file
-            else:
-                logger.info(f"Replacing existing {file_type} file for engagement {engagement.engagement_id}")
-                # Different content, update the existing file record
-                existing_file.file_name = file_obj.name
-                existing_file.file_size = file_obj.size
-                existing_file.file_hash = file_hash.hexdigest()
-                existing_file.status = 'PENDING'
-                existing_file.is_validated = False
-                existing_file.validation_errors = []
-                existing_file.uploaded_at = timezone.now()
-                existing_file.save()
-                
-                # Clear any existing data for this file (since we're replacing it)
-                if file_type == 'GL':
-                    existing_file.sapglposting_set.all().delete()
-                elif file_type == 'TB':
-                    existing_file.trial_balances.all().delete()
-                elif file_type == 'COA':
-                    existing_file.chart_of_accounts.all().delete()
-                
-                return existing_file
-        
-        # Create new DataFile record
+        # Create new DataFile record (multiple files of same type now allowed per engagement)
         data_file = DataFile.objects.create(
             file_name=file_obj.name,
             file_size=file_obj.size,
@@ -359,12 +323,28 @@ class FileUploadView(generics.CreateAPIView):
         successful_uploads = [r for r in results if r.get('status') == 'completed']
         failed_uploads = [r for r in results if r.get('status') == 'failed']
         duplicate_uploads = [r for r in results if r.get('status') == 'duplicate']
+        processing_uploads = [r for r in results if r.get('status') == 'processing']
+        
+        # Determine overall status
+        if failed_uploads:
+            overall_status = 'partial_success'
+        elif processing_uploads:
+            overall_status = 'processing'
+        else:
+            overall_status = 'success'
+        
+        # Create appropriate message
+        if processing_uploads:
+            message = f'File upload initiated. {len(successful_uploads)} completed, {len(processing_uploads)} processing in background, {len(failed_uploads)} failed, {len(duplicate_uploads)} duplicates skipped.'
+        else:
+            message = f'File upload completed. {len(successful_uploads)} successful, {len(failed_uploads)} failed, {len(duplicate_uploads)} duplicates skipped.'
         
         response_data = {
-            'message': f'File upload completed. {len(successful_uploads)} successful, {len(failed_uploads)} failed, {len(duplicate_uploads)} duplicates skipped.',
-            'status': 'success' if not failed_uploads else 'partial_success',
+            'message': message,
+            'status': overall_status,
             'total_files': len(results),
             'successful_uploads': len(successful_uploads),
+            'processing_uploads': len(processing_uploads),
             'failed_uploads': len(failed_uploads),
             'duplicate_uploads': len(duplicate_uploads),
             'engagement': {
@@ -378,6 +358,91 @@ class FileUploadView(generics.CreateAPIView):
         }
         
         return Response(response_data, status=status.HTTP_201_CREATED)
+    
+    def _start_background_file_processing(self, files, engagement, metadata, results):
+        """
+        Start background processing for COA and GL files (non-blocking)
+        This method starts the background threads and returns immediately
+        """
+        import threading
+        
+        # Process COA files in background thread
+        coa_files = []
+        for file_type, file_obj in files.items():
+            if file_type == 'chart_of_accounts':
+                coa_files.append(('COA', file_obj))
+        
+        for new_file_type, file_obj in coa_files:
+            try:
+                data_file = self._create_data_file_record(file_obj, engagement, new_file_type, metadata)
+                
+                # Check if this is a duplicate file
+                if data_file.status == 'COMPLETED' and data_file.file_hash == hashlib.sha256(file_obj.read()).hexdigest():
+                    file_obj.seek(0)
+                    result = {
+                        'file_type': new_file_type,
+                        'file_name': file_obj.name,
+                        'file_id': str(data_file.id),
+                        'engagement_id': engagement.engagement_id,
+                        'status': 'duplicate',
+                        'message': f'File with identical content already exists and has been processed for this engagement',
+                        'records_processed': data_file.processed_records,
+                        'total_records': data_file.total_records
+                    }
+                    results.append(result)
+                else:
+                    # Process COA with threading
+                    result = self._process_gl_coa_file_with_threading(data_file, file_obj, new_file_type)
+                    results.append(result)
+                    
+            except Exception as e:
+                logger.error(f"Error starting COA background processing: {e}")
+                results.append({
+                    'file_type': 'COA',
+                    'file_name': file_obj.name,
+                    'status': 'failed',
+                    'error': str(e)
+                })
+        
+        # Process GL files in background thread
+        gl_files = []
+        for file_type, file_obj in files.items():
+            if file_type == 'gl_accounts':
+                gl_files.append(('GL', file_obj))
+        
+        for new_file_type, file_obj in gl_files:
+            try:
+                data_file = self._create_data_file_record(file_obj, engagement, new_file_type, metadata)
+                
+                # Check if this is a duplicate file
+                if data_file.status == 'COMPLETED' and data_file.file_hash == hashlib.sha256(file_obj.read()).hexdigest():
+                    file_obj.seek(0)
+                    result = {
+                        'file_type': new_file_type,
+                        'file_name': file_obj.name,
+                        'file_id': str(data_file.id),
+                        'engagement_id': engagement.engagement_id,
+                        'status': 'duplicate',
+                        'message': f'File with identical content already exists and has been processed for this engagement',
+                        'records_processed': data_file.processed_records,
+                        'total_records': data_file.total_records
+                    }
+                    results.append(result)
+                else:
+                    # Process GL with threading (after COA)
+                    result = self._process_gl_coa_file_with_threading(data_file, file_obj, new_file_type)
+                    results.append(result)
+                    
+            except Exception as e:
+                logger.error(f"Error starting GL background processing: {e}")
+                results.append({
+                    'file_type': 'GL',
+                    'file_name': file_obj.name,
+                    'status': 'failed',
+                    'error': str(e)
+                })
+        
+        logger.info("🚀 Background processing started for COA and GL files")
     
     def _process_gl_file_with_threading(self, data_file: DataFile, file_obj):
         """
@@ -412,7 +477,11 @@ class FileUploadView(generics.CreateAPIView):
             raise e
     
     def _process_gl_large_file_threaded(self, data_file: DataFile, file_obj, row_count: int):
-        """Process large GL files in background thread"""
+        """
+        Process large GL files in background thread with temp file management
+        🗂️ TEMP STORAGE: Only GL files are saved to temp due to large size and async processing
+        🗑️ AUTO CLEANUP: Temp files are automatically deleted after processing completion
+        """
         try:
             # Save file to temporary location
             file_extension = file_obj.name.split('.')[-1]
@@ -462,9 +531,9 @@ class FileUploadView(generics.CreateAPIView):
         try:
             logger.info(f"Background thread started for GL file {data_file.file_name}")
             
-            # Process using chunked processing
+            # Process using optimized chunked processing
             processor = DataProcessor(data_file)
-            result = processor.process_gl_data_chunked(file_path, chunk_size=5000)
+            result = processor.process_gl_data_chunked(file_path, chunk_size=25000)
             
             # Update data file with results
             data_file.status = 'COMPLETED' if result['failed_count'] == 0 else 'PARTIAL'
@@ -476,11 +545,12 @@ class FileUploadView(generics.CreateAPIView):
             
             logger.info(f"Background processing completed for GL file {data_file.file_name}: {result}")
             
-            # Trigger completeness test
+            # Trigger completeness test in Celery after GL processing completion
             try:
-                from .tasks import run_gl_completeness_analysis, train_ai_completeness_model
+                from .tasks import run_gl_completeness_analysis
                 completeness_task = run_gl_completeness_analysis.delay(str(data_file.id))
-                logger.info(f"Completeness analysis queued: {completeness_task.id}")
+                logger.info(f"✅ Completeness test queued in Celery: {completeness_task.id}")
+                logger.info(f"📊 GL processing completed, starting completeness analysis for file: {data_file.file_name}")
                         
             except Exception as e:
                 logger.warning(f"Could not queue completeness analysis: {e}")
@@ -493,13 +563,167 @@ class FileUploadView(generics.CreateAPIView):
             logger.error(f"Background processing failed for GL file {data_file.file_name}: {e}")
             
         finally:
-            # Clean up temporary file
+            # 🗑️ Clean up temporary file after GL processing completion
+            try:
+                if os.path.exists(file_path):
+                    file_size = os.path.getsize(file_path)
+                    os.unlink(file_path)
+                    logger.info(f"🗑️ Cleaned up GL temp file: {file_path} ({file_size:,} bytes)")
+                else:
+                    logger.info(f"🗑️ GL temp file already cleaned up: {file_path}")
+            except Exception as cleanup_error:
+                logger.error(f"❌ Error cleaning up GL temp file {file_path}: {cleanup_error}")
+            
+            # 🧹 Clean up all engagement temp files after GL processing completion
+            try:
+                self._cleanup_engagement_temp_files(data_file.engagement)
+                logger.info(f"🧹 Engagement temp files cleanup completed for: {data_file.engagement.engagement_id}")
+            except Exception as cleanup_error:
+                logger.error(f"❌ Error cleaning up engagement temp files: {cleanup_error}")
+    
+    def _process_gl_coa_file_with_threading(self, data_file: DataFile, file_obj, file_type: str):
+        """
+        Process GL or COA files with intelligent threading strategy:
+        - Small files (< 10k rows): Process synchronously
+        - Large files (>= 10k rows): Process in background thread
+        - COA files are processed first, then GL files
+        """
+        try:
+            # Check file size first
+            file_obj.seek(0)
+            file_reader = FileReader()
+            df = file_reader.read_file(file_obj)
+            
+            if df is None or df.empty:
+                raise Exception("File is empty or could not be read")
+            
+            row_count = len(df)
+            logger.info(f"{file_type} file {data_file.file_name} has {row_count} rows")
+            
+            if row_count < 10000:
+                # Small file: process synchronously
+                return self._process_file_sync(data_file, file_obj, file_type)
+            else:
+                # Large file: process in background thread
+                return self._process_gl_coa_large_file_threaded(data_file, file_obj, row_count, file_type)
+                
+        except Exception as e:
+            data_file.status = 'FAILED'
+            data_file.error_message = str(e)
+            data_file.processed_at = timezone.now()
+            data_file.save()
+            raise e
+    
+    def _process_gl_coa_large_file_threaded(self, data_file: DataFile, file_obj, row_count: int, file_type: str):
+        """
+        Process large GL or COA files in background thread with temp file management
+        🗂️ TEMP STORAGE: Large files are saved to temp due to size and async processing
+        🗑️ AUTO CLEANUP: Temp files are automatically deleted after processing completion
+        """
+        try:
+            # Save file to temporary location
+            file_extension = file_obj.name.split('.')[-1]
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_extension}')
+            
+            file_obj.seek(0)
+            for chunk in file_obj.chunks():
+                temp_file.write(chunk)
+            temp_file.close()
+            
+            # Update data file status
+            data_file.status = 'PROCESSING'
+            data_file.total_records = row_count
+            data_file.save()
+            
+            # Start background thread for processing
+            thread = threading.Thread(
+                target=self._process_gl_coa_background_thread,
+                args=(data_file, temp_file.name, row_count, file_type)
+            )
+            thread.daemon = True
+            thread.start()
+            
+            logger.info(f"Background thread started for {file_type} file {data_file.file_name}")
+            
+            return {
+                'file_type': file_type,
+                'file_id': str(data_file.id),
+                'file_name': data_file.file_name,
+                'file_size': data_file.file_size,
+                'status': 'processing',
+                'total_records': row_count,
+                'message': f"Started background processing for large {file_type} file {data_file.file_name} ({row_count} rows)"
+            }
+            
+        except Exception as e:
+            # Clean up temp file on error
+            try:
+                if 'temp_file' in locals():
+                    os.unlink(temp_file.name)
+            except:
+                pass
+            raise e
+    
+    def _process_gl_coa_background_thread(self, data_file: DataFile, file_path: str, row_count: int, file_type: str):
+        """Background thread for processing large GL or COA files"""
+        try:
+            logger.info(f"Background thread started for {file_type} file {data_file.file_name}")
+            
+            if file_type == 'COA':
+                # Process COA file
+                processor = DataProcessor(data_file)
+                result = processor.process_chart_data_from_file(file_path)
+                
+                # Update data file with results
+                data_file.status = 'COMPLETED' if result['failed_count'] == 0 else 'PARTIAL'
+                data_file.total_records = result['processed_count'] + result['failed_count']
+                data_file.processed_records = result['processed_count']
+                data_file.failed_records = result['failed_count']
+                data_file.processed_at = timezone.now()
+                data_file.save()
+                
+                logger.info(f"Background COA processing completed for file {data_file.file_name}: {result}")
+                
+            elif file_type == 'GL':
+                # Process GL file using optimized chunked processing
+                processor = DataProcessor(data_file)
+                result = processor.process_gl_data_chunked(file_path, chunk_size=25000)
+                
+                # Update data file with results
+                data_file.status = 'COMPLETED' if result['failed_count'] == 0 else 'PARTIAL'
+                data_file.total_records = result['processed_count'] + result['failed_count']
+                data_file.processed_records = result['processed_count']
+                data_file.failed_records = result['failed_count']
+                data_file.processed_at = timezone.now()
+                data_file.save()
+                
+                logger.info(f"Background GL processing completed for file {data_file.file_name}: {result}")
+                
+                # Trigger completeness test in Celery after GL processing completion
+                try:
+                    from .tasks import run_gl_completeness_analysis
+                    completeness_task = run_gl_completeness_analysis.delay(str(data_file.id))
+                    logger.info(f"✅ Completeness test queued in Celery: {completeness_task.id}")
+                    logger.info(f"📊 GL processing completed, starting completeness analysis for file: {data_file.file_name}")
+                            
+                except Exception as e:
+                    logger.warning(f"Could not queue completeness analysis: {e}")
+            
+        except Exception as e:
+            data_file.status = 'FAILED'
+            data_file.error_message = str(e)
+            data_file.processed_at = timezone.now()
+            data_file.save()
+            logger.error(f"Background processing failed for {file_type} file {data_file.file_name}: {e}")
+            
+        finally:
+            # Clean up temp file
             try:
                 if os.path.exists(file_path):
                     os.unlink(file_path)
-                    logger.info(f"Cleaned up temporary file: {file_path}")
+                    logger.info(f"Cleaned up temp file: {file_path}")
             except Exception as cleanup_error:
-                logger.error(f"Error cleaning up temporary file {file_path}: {cleanup_error}")
+                logger.error(f"Error cleaning up temp file {file_path}: {cleanup_error}")
     
     def _process_gl_file_sync(self, data_file: DataFile, file_obj):
         """Process GL Listing file synchronously for better reliability"""
@@ -529,16 +753,24 @@ class FileUploadView(generics.CreateAPIView):
             
             logger.info(f"Successfully processed GL file {data_file.file_name} from memory: {result}")
             
-            # Trigger completeness test
+            # Trigger completeness test in Celery after synchronous GL processing completion
             try:
-                from .tasks import run_gl_completeness_analysis, train_ai_completeness_model
+                from .tasks import run_gl_completeness_analysis
                 completeness_task = run_gl_completeness_analysis.delay(str(data_file.id))
-                logger.info(f"Completeness analysis queued: {completeness_task.id}")
+                logger.info(f"✅ Completeness test queued in Celery: {completeness_task.id}")
+                logger.info(f"📊 Sync GL processing completed, starting completeness analysis for file: {data_file.file_name}")
                 completeness_queued = True
                         
             except Exception as e:
                 logger.warning(f"Could not queue completeness analysis: {e}")
                 completeness_queued = False
+            
+            # 🧹 Clean up engagement temp files after successful synchronous GL processing
+            try:
+                self._cleanup_engagement_temp_files(data_file.engagement)
+                logger.info(f"🧹 Engagement temp files cleanup completed for sync GL: {data_file.engagement.engagement_id}")
+            except Exception as cleanup_error:
+                logger.error(f"❌ Error cleaning up engagement temp files: {cleanup_error}")
             
             return {
                 'file_type': 'GL',
@@ -568,7 +800,8 @@ class FileUploadView(generics.CreateAPIView):
     def _process_file_sync(self, data_file: DataFile, file_obj, file_type: str):
         """
         Process TB and COA files synchronously during upload
-        Files are processed directly from memory - no disk saving/deletion
+        ⚡ OPTIMIZED: Files are processed directly from memory - NO temp file saving/deletion needed!
+        Only GL files use temp storage due to their large size and background processing requirements.
         """
         try:
             # Update data file status to processing
@@ -649,6 +882,92 @@ class FileUploadView(generics.CreateAPIView):
             
             logger.error(f"Error processing {file_type} file {data_file.file_name}: {e}")
             raise e
+
+    def _cleanup_engagement_temp_files(self, engagement):
+        """
+        Clean up all temporary files for a specific engagement after GL processing completion
+        
+        This function removes:
+        1. Files in temp_uploads/ directory that belong to this engagement
+        2. Any orphaned temporary files older than 1 hour
+        
+        Args:
+            engagement: Engagement object to clean up temp files for
+        """
+        if not engagement:
+            logger.warning("No engagement provided for temp file cleanup")
+            return
+            
+        logger.info(f"🧹 Starting temp file cleanup for engagement: {engagement.engagement_id}")
+        
+        try:
+            from django.conf import settings
+            import glob
+            from datetime import datetime, timedelta
+            
+            temp_dir = getattr(settings, 'FILE_UPLOAD_TEMP_DIR', os.path.join(settings.BASE_DIR, 'temp_uploads'))
+            
+            if not os.path.exists(temp_dir):
+                logger.info(f"Temp directory {temp_dir} does not exist, nothing to clean")
+                return
+            
+            cleaned_count = 0
+            total_size = 0
+            
+            # Get all data files for this engagement
+            engagement_files = engagement.data_files.all()
+            engagement_file_names = [df.file_name for df in engagement_files]
+            
+            logger.info(f"📋 Found {len(engagement_file_names)} files for engagement {engagement.engagement_id}")
+            
+            # Clean up files in temp_uploads directory
+            temp_files = glob.glob(os.path.join(temp_dir, "*"))
+            
+            for temp_file_path in temp_files:
+                try:
+                    if not os.path.isfile(temp_file_path):
+                        continue
+                        
+                    file_name = os.path.basename(temp_file_path)
+                    file_size = os.path.getsize(temp_file_path)
+                    file_age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(temp_file_path))
+                    
+                    should_delete = False
+                    reason = ""
+                    
+                    # Check if this file belongs to the current engagement
+                    # Look for engagement-related patterns or older files
+                    if any(eng_name in file_name for eng_name in engagement_file_names):
+                        should_delete = True
+                        reason = f"belongs to engagement {engagement.engagement_id}"
+                    elif file_age > timedelta(hours=1):
+                        should_delete = True
+                        reason = f"older than 1 hour (age: {file_age})"
+                    elif file_name.startswith('tmp') and file_name.endswith(('.xlsx', '.csv', '.xls')):
+                        # Clean up temporary upload files that are old
+                        if file_age > timedelta(minutes=30):
+                            should_delete = True
+                            reason = f"temporary upload file older than 30 minutes"
+                    
+                    if should_delete:
+                        os.unlink(temp_file_path)
+                        cleaned_count += 1
+                        total_size += file_size
+                        logger.info(f"🗑️  Deleted temp file: {file_name} ({file_size} bytes) - {reason}")
+                        
+                except Exception as file_error:
+                    logger.error(f"❌ Error deleting temp file {temp_file_path}: {file_error}")
+                    continue
+            
+            # Summary log
+            if cleaned_count > 0:
+                logger.info(f"✅ Temp cleanup completed for engagement {engagement.engagement_id}")
+                logger.info(f"📊 Cleaned {cleaned_count} files, freed {total_size:,} bytes ({total_size/1024/1024:.2f} MB)")
+            else:
+                logger.info(f"🔍 No temp files to clean for engagement {engagement.engagement_id}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error during temp file cleanup for engagement {engagement.engagement_id}: {e}")
 
 
 # ============================================================================
@@ -950,7 +1269,7 @@ def get_account_verifications_by_engagement(request, engagement_id):
     Query Parameters:
     - page: Page number for pagination
     - page_size: Number of results per page (max 500)
-    - failed_only: boolean (default: false) - Return only failed verifications
+    - failed_only: boolean (default: false) - true=failed accounts, false=passed accounts
     - latest: boolean (default: true) - Return only from latest test result
     - account_code: Filter by specific account code
     - min_variance: Filter by minimum balance variance
@@ -1004,9 +1323,11 @@ def get_account_verifications_by_engagement(request, engagement_id):
         # Apply filters
         filtered_verifications = account_verifications
         
-        # Filter by failed only
+        # Filter by status: failed_only=true shows failed, failed_only=false shows passed
         if failed_only:
             filtered_verifications = [v for v in filtered_verifications if not v.get('account_passed', True)]
+        else:
+            filtered_verifications = [v for v in filtered_verifications if v.get('account_passed', True)]
         
         # Filter by account code
         if account_code_filter:
@@ -1024,9 +1345,19 @@ def get_account_verifications_by_engagement(request, engagement_id):
         
         # Sort results
         sort_reverse = sort_order.lower() == 'desc'
+        def get_audit_variance(x):
+            """Calculate audit variance for sorting: closing_balance - (gl_debit - gl_credit + opening_balance)"""
+            gl_debit = float(x.get('gl_debit_total', 0) or 0)
+            gl_credit = float(x.get('gl_credit_total', 0) or 0)
+            opening_balance = float(x.get('opening_balance', 0) or 0)
+            closing_balance = float(x.get('closing_balance', 0) or 0)
+            calculated_closing = gl_debit - gl_credit + opening_balance
+            audit_variance = closing_balance - calculated_closing
+            return abs(audit_variance)
+        
         sort_key_mapping = {
             'account_code': lambda x: str(x.get('account_code', '')),
-            'balance_variance': lambda x: abs(float(x.get('balance_variance', 0))),
+            'balance_variance': get_audit_variance,
             'gl_debit_total': lambda x: float(x.get('gl_debit_total', 0)),
             'gl_credit_total': lambda x: float(x.get('gl_credit_total', 0)),
             'tb_debit': lambda x: float(x.get('tb_debit', 0)),
@@ -1044,14 +1375,65 @@ def get_account_verifications_by_engagement(request, engagement_id):
         
         # Add computed fields for better display
         for verification in filtered_verifications:
-            verification['balance_variance_abs'] = abs(float(verification.get('balance_variance', 0)))
-            verification['variance_formatted'] = f"{verification['balance_variance_abs']:,.2f}"
-            verification['gl_debit_formatted'] = f"{float(verification.get('gl_debit_total', 0)):,.2f}"
-            verification['gl_credit_formatted'] = f"{float(verification.get('gl_credit_total', 0)):,.2f}"
-            verification['tb_debit_formatted'] = f"{float(verification.get('tb_debit', 0)):,.2f}"
-            verification['tb_credit_formatted'] = f"{float(verification.get('tb_credit', 0)):,.2f}"
+            # Handle balance_variance - ensure we get the actual value
+            balance_variance = verification.get('balance_variance', 0)
+            try:
+                balance_variance_float = float(balance_variance) if balance_variance is not None else 0.0
+            except (ValueError, TypeError):
+                balance_variance_float = 0.0
+            
+            # Calculate variance using proper audit formula: 
+            # closing_balance - (gl_debit - gl_credit + opening_balance)
+            gl_debit = float(verification.get('gl_debit_total', 0) or 0)
+            gl_credit = float(verification.get('gl_credit_total', 0) or 0)
+            opening_balance = float(verification.get('opening_balance', 0) or 0)
+            closing_balance = float(verification.get('closing_balance', 0) or 0)
+            
+            # Proper variance formula
+            calculated_closing = gl_debit - gl_credit + opening_balance
+            audit_variance = closing_balance - calculated_closing
+            
+            # Also calculate movement variances for additional context
+            gl_debit_var = abs(float(verification.get('gl_vs_tb_debit_variance', 0) or 0))
+            gl_credit_var = abs(float(verification.get('gl_vs_tb_credit_variance', 0) or 0))
+            total_movement_variance = gl_debit_var + gl_credit_var
+            
+            # Use the audit variance as the primary variance
+            display_variance = abs(audit_variance)
+            
+            verification['balance_variance_abs'] = abs(balance_variance_float)
+            verification['audit_variance'] = audit_variance
+            verification['audit_variance_abs'] = abs(audit_variance)
+            verification['calculated_closing_balance'] = calculated_closing
+            verification['movement_variance_total'] = total_movement_variance
+            verification['variance_formatted'] = f"{display_variance:,.2f}"
+            verification['variance_type'] = 'audit_variance'
+            verification['variance_note'] = 'Closing - (GL_Debit - GL_Credit + Opening)'
+            
+            # Format other fields with error handling
+            verification['gl_debit_formatted'] = f"{float(verification.get('gl_debit_total', 0) or 0):,.2f}"
+            verification['gl_credit_formatted'] = f"{float(verification.get('gl_credit_total', 0) or 0):,.2f}"
+            verification['tb_debit_formatted'] = f"{float(verification.get('tb_debit', 0) or 0):,.2f}"
+            verification['tb_credit_formatted'] = f"{float(verification.get('tb_credit', 0) or 0):,.2f}"
+            verification['opening_balance_formatted'] = f"{float(verification.get('opening_balance', 0) or 0):,.2f}"
+            verification['closing_balance_formatted'] = f"{float(verification.get('closing_balance', 0) or 0):,.2f}"
+            verification['calculated_closing_formatted'] = f"{verification['calculated_closing_balance']:,.2f}"
+            verification['audit_variance_formatted'] = f"{verification['audit_variance']:,.2f}"
+            
+            # Status and additional verification details
             verification['status'] = 'PASS' if verification.get('account_passed', False) else 'FAIL'
             verification['status_icon'] = '✅' if verification.get('account_passed', False) else '❌'
+            verification['balance_equation_correct'] = verification.get('balance_equation_correct', False)
+            verification['gl_tb_movements_match'] = verification.get('gl_tb_movements_match', False)
+            
+            # Add failure reasons for failed accounts
+            if not verification.get('account_passed', False):
+                failure_reasons = []
+                if not verification.get('balance_equation_correct', False):
+                    failure_reasons.append('Balance equation incorrect')
+                if not verification.get('gl_tb_movements_match', False):
+                    failure_reasons.append('GL vs TB movements mismatch')
+                verification['failure_reasons'] = failure_reasons
         
         # Apply pagination
         paginator = AccountVerificationsPagination()
@@ -1111,4 +1493,6 @@ def get_account_verifications_by_engagement(request, engagement_id):
             'error': 'Internal server error',
             'details': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
 

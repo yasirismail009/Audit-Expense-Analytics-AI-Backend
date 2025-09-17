@@ -25,12 +25,74 @@ from .models import (
     FileProcessingTask, CompletenessJob, TrialBalance, ChartOfAccount, CompletenessTestResult,
     GLAccount, Engagement
 )
+
+# Import notification tasks
+try:
+    from notifications.tasks import (
+        notify_file_processing_status, 
+        notify_analysis_status,
+        notify_system_status
+    )
+    NOTIFICATIONS_AVAILABLE = True
+except ImportError:
+    NOTIFICATIONS_AVAILABLE = False
+    logger.warning("Notifications app not available - notifications will be disabled")
 from .specialized_analysis_models import AnalysisModelManager
 from .ml_models import MLModelTrainer
 from .overall_analysis import OverallAnalyzer
 from .sync_analysis import _determine_risk_level
 
 logger = logging.getLogger(__name__)
+
+# Import AI training functions
+try:
+    from .gl_prediction_tasks import (
+        train_gl_anomaly_detection_model,
+        train_gl_volume_prediction_model,
+        predict_gl_anomalies
+    )
+    AI_TRAINING_AVAILABLE = True
+except ImportError:
+    AI_TRAINING_AVAILABLE = False
+    logger.warning("AI training tasks not available")
+
+# ============================================================================
+# NOTIFICATION HELPER FUNCTIONS
+# ============================================================================
+
+def send_notification_if_available(notification_func, *args, **kwargs):
+    """
+    Send notification if notifications app is available
+    
+    Args:
+        notification_func: The notification function to call
+        *args, **kwargs: Arguments to pass to the notification function
+    """
+    if NOTIFICATIONS_AVAILABLE:
+        try:
+            notification_func.delay(*args, **kwargs)
+        except Exception as e:
+            logger.warning(f"Failed to send notification: {e}")
+
+def get_user_from_job(job):
+    """
+    Extract user from job for notifications
+    
+    Args:
+        job: FileProcessingJob instance
+        
+    Returns:
+        User ID or None
+    """
+    try:
+        if hasattr(job, 'data_file') and job.data_file and hasattr(job.data_file, 'engagement'):
+            engagement = job.data_file.engagement
+            if hasattr(engagement, 'created_by') and engagement.created_by:
+                return engagement.created_by.id
+        return None
+    except Exception as e:
+        logger.warning(f"Could not extract user from job: {e}")
+        return None
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -7524,6 +7586,21 @@ def run_gl_completeness_analysis(self, data_file_id):
             
             logger.info(f"💾 Completeness test result saved to database (ID: {test_result.id})")
             
+            # Trigger comprehensive AI training after successful completeness test
+            try:
+                if AI_TRAINING_AVAILABLE:
+                    logger.info("🚀 Triggering comprehensive AI training after completeness test...")
+                    ai_training_task = train_comprehensive_ai_models.delay(
+                        engagement_id=str(data_file.engagement.id),
+                        client_name=data_file.engagement.client.client_name
+                    )
+                    logger.info(f"🤖 AI training task queued: {ai_training_task.id}")
+                else:
+                    logger.warning("AI training not available - skipping automatic training")
+            except Exception as ai_error:
+                logger.error(f"Failed to queue AI training: {ai_error}")
+                # Don't fail the completeness test if AI training fails to queue
+            
         except Exception as db_error:
             logger.error(f"Failed to save completeness test result: {db_error}")
             # Continue execution even if DB save fails
@@ -7557,15 +7634,145 @@ def run_gl_completeness_analysis(self, data_file_id):
 # Helper Functions for AI Prediction and Feature Extraction
 # ============================================================================
 
-def _get_feature_names():
-    """Get feature names for AI model prediction"""
-    return [
-        'file_size_mb', 'gl_records_count', 'tb_records_count',
-        'unique_documents', 'duplicate_documents', 'duplicate_ratio',
-        'unique_users', 'unique_accounts', 'unique_months',
-        'step1_passed', 'step2_passed'  # Only 2 steps now
-    ]
+# This function is now defined at the end of the file - remove duplicate
 
+
+# ============================================================================
+# COMPREHENSIVE AI TRAINING TASKS
+# ============================================================================
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=300, time_limit=1800, soft_time_limit=1500)
+def train_comprehensive_ai_models(self, engagement_id=None, client_name=None):
+    """
+    Train comprehensive AI models on GL + TB + COA data after completeness test
+    
+    This task trains multiple AI models on the complete dataset:
+    - Anomaly detection model (identifies unusual patterns)
+    - Volume prediction model (forecasts transaction volumes)
+    - Risk assessment model (evaluates engagement risk)
+    
+    Args:
+        engagement_id: Specific engagement to train on (optional)
+        client_name: Specific client for client-specific models (optional)
+        
+    Returns:
+        Training results for all models
+    """
+    task_name = "train_comprehensive_ai_models"
+    start_time = timezone.now()
+    
+    try:
+        if not AI_TRAINING_AVAILABLE:
+            logger.warning("AI training not available - skipping comprehensive training")
+            return {
+                'success': False,
+                'error': 'AI training modules not available',
+                'models_trained': 0
+            }
+        
+        logger.info(f"🚀 Starting comprehensive AI training for engagement: {engagement_id or 'ALL'}, client: {client_name or 'General'}")
+        
+        # Get engagement info for logging
+        if engagement_id:
+            try:
+                engagement = Engagement.objects.get(id=engagement_id)
+                logger.info(f"🎯 Training on engagement: {engagement.engagement_name}")
+                logger.info(f"👤 Client: {engagement.client.client_name}")
+                
+                # Count data available
+                gl_count = SAPGLPosting.objects.filter(data_file__engagement=engagement).count()
+                tb_count = engagement.data_files.filter(file_type='TB').count()
+                coa_count = engagement.data_files.filter(file_type='COA').count()
+                
+                logger.info(f"📊 Data available - GL: {gl_count:,} transactions, TB: {tb_count} files, COA: {coa_count} files")
+                
+            except Engagement.DoesNotExist:
+                logger.error(f"Engagement {engagement_id} not found")
+                return {
+                    'success': False,
+                    'error': f'Engagement {engagement_id} not found',
+                    'models_trained': 0
+                }
+        
+        results = {}
+        models_trained = 0
+        
+        # 1. Train Anomaly Detection Model
+        logger.info("🔍 Training anomaly detection model...")
+        try:
+            anomaly_result = train_gl_anomaly_detection_model(
+                engagement_id=engagement_id,
+                client_name=client_name
+            )
+            results['anomaly_detection'] = anomaly_result
+            if anomaly_result.get('success'):
+                models_trained += 1
+                logger.info(f"✅ Anomaly detection model trained successfully")
+            else:
+                logger.error(f"❌ Anomaly detection training failed: {anomaly_result.get('error')}")
+        except Exception as e:
+            logger.error(f"❌ Anomaly detection training error: {e}")
+            results['anomaly_detection'] = {'success': False, 'error': str(e)}
+        
+        # 2. Train Volume Prediction Model
+        logger.info("📈 Training volume prediction model...")
+        try:
+            volume_result = train_gl_volume_prediction_model(
+                engagement_id=engagement_id,
+                client_name=client_name
+            )
+            results['volume_prediction'] = volume_result
+            if volume_result.get('success'):
+                models_trained += 1
+                logger.info(f"✅ Volume prediction model trained successfully")
+            else:
+                logger.error(f"❌ Volume prediction training failed: {volume_result.get('error')}")
+        except Exception as e:
+            logger.error(f"❌ Volume prediction training error: {e}")
+            results['volume_prediction'] = {'success': False, 'error': str(e)}
+        
+        # 3. Run Prediction Test (if models were trained)
+        if models_trained > 0 and engagement_id:
+            logger.info("🔮 Testing predictions...")
+            try:
+                prediction_result = predict_gl_anomalies(engagement_id)
+                results['prediction_test'] = prediction_result
+                if prediction_result.get('success'):
+                    logger.info(f"✅ Prediction test successful - Risk: {prediction_result.get('risk_level')}")
+                else:
+                    logger.error(f"❌ Prediction test failed: {prediction_result.get('error')}")
+            except Exception as e:
+                logger.error(f"❌ Prediction test error: {e}")
+                results['prediction_test'] = {'success': False, 'error': str(e)}
+        
+        # Calculate total duration
+        total_duration = (timezone.now() - start_time).total_seconds()
+        
+        success = models_trained > 0
+        
+        logger.info(f"🎉 Comprehensive AI training completed:")
+        logger.info(f"  ✅ Models trained: {models_trained}/2")
+        logger.info(f"  ⏱️ Total duration: {total_duration:.1f}s")
+        logger.info(f"  🎯 Overall success: {success}")
+        
+        return {
+            'success': success,
+            'models_trained': models_trained,
+            'total_duration': total_duration,
+            'engagement_id': engagement_id,
+            'client_name': client_name,
+            'results': results
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Comprehensive AI training failed: {e}")
+        return {
+            'success': False,
+            'error': str(e),
+            'models_trained': 0,
+            'engagement_id': engagement_id,
+            'client_name': client_name
+        }
 
 # ============================================================================
 # AI/ML COMPLETENESS TASKS
@@ -7613,21 +7820,27 @@ def train_ai_completeness_model(self, model_type='COMPLETENESS_PREDICTOR', clien
             model_type=model_type,
             client_name=client_name,
             status='TRAINING',
-            training_started_at=start_time
+            training_started_at=start_time,
+            training_data_size=0  # Will be updated after training data is processed
         )
         
         # Gather training data from historical completeness tests
         query_filter = {'overall_status__in': ['PASS', 'FAIL']}
         if client_name:
             # Client-specific training
-            query_filter['data_file__client_name__icontains'] = client_name
+            query_filter['engagement__client__client_name__icontains'] = client_name
         
-        historical_tests = CompletenessTestResult.objects.filter(**query_filter).select_related('data_file')
+        historical_tests = CompletenessTestResult.objects.filter(**query_filter).select_related('engagement__client', 'gl_file', 'tb_file', 'coa_file')
+        training_data_count = historical_tests.count()
         
-        if historical_tests.count() < 10:
-            raise Exception(f"Insufficient training data: {historical_tests.count()} records (minimum 10 required)")
+        if training_data_count < 10:
+            raise Exception(f"Insufficient training data: {training_data_count} records (minimum 10 required)")
         
-        logger.info(f"Found {historical_tests.count()} historical completeness tests for training")
+        # Update training data size
+        ai_model.training_data_size = training_data_count
+        ai_model.save()
+        
+        logger.info(f"Found {training_data_count} historical completeness tests for training")
         
         # Extract features and targets
         features_list = []
@@ -7645,12 +7858,10 @@ def train_ai_completeness_model(self, model_type='COMPLETENESS_PREDICTOR', clien
                 elif model_type == 'SCORE_ESTIMATOR':
                     targets_list.append(test.completeness_score)
                 elif model_type == 'STEP_PREDICTOR':
-                    # Multi-target for each step (4 steps)
+                    # Multi-target for each step (2 steps in current implementation)
                     step_targets = [
-                        1 if test.step1_gl_tb_reconciliation.get('passed', False) else 0,
-                        1 if test.step2_debit_credit_balance.get('passed', False) else 0,
-                        1 if test.step3_account_coverage.get('passed', False) else 0,
-                        1 if test.step4_transaction_gaps.get('passed', False) else 0,
+                        1 if test.step1_file_completeness.get('passed', False) else 0,
+                        1 if test.step2_gl_tb_reconciliation.get('passed', False) else 0,
                     ]
                     targets_list.append(step_targets)
                 
@@ -7833,7 +8044,7 @@ def predict_completeness_with_ai(self, data_file_id, model_type='COMPLETENESS_PR
         
         # Get data file
         data_file = DataFile.objects.get(id=data_file_id)
-        client_name = data_file.client_name
+        client_name = data_file.engagement.client.client_name if data_file.engagement and data_file.engagement.client else ''
         
         logger.info(f"Starting AI prediction for {data_file.file_name} (Client: {client_name})")
         
@@ -7858,9 +8069,25 @@ def predict_completeness_with_ai(self, data_file_id, model_type='COMPLETENESS_PR
         
         if not ai_model:
             logger.warning(f"No trained {model_type} model available for predictions. Using fallback prediction.")
+            
+            # Create fallback prediction record
+            fallback_prediction = CompletenessAIPrediction.objects.create(
+                data_file=data_file,
+                ai_model=None,  # No model used
+                prediction_confidence=60.0,
+                predicted_completeness_score=85.0,
+                predicted_status='PASS',
+                predicted_step_results={
+                    'predicted_via': 'fallback',
+                    'overall_prediction_only': True
+                },
+                predicted_processing_time=30.0,
+                input_features={'fallback': 'No trained model available'}
+            )
+            
             return {
                 'success': True,
-                'prediction_id': None,
+                'prediction_id': str(fallback_prediction.id),
                 'model_used': 'Fallback Prediction',
                 'client_specific': False,
                 'predicted_status': 'PASS',  # Optimistic fallback
@@ -7960,10 +8187,8 @@ def predict_completeness_with_ai(self, data_file_id, model_type='COMPLETENESS_PR
         # Predict step-specific results based on model type
         if model_type == 'STEP_PREDICTOR':
             predicted_step_results = {
-                'step1_gl_tb_reconciliation': bool(step_predictions[0]),
-                'step2_debit_credit_balance': bool(step_predictions[1]),
-                'step3_account_coverage': bool(step_predictions[2]),
-                'step4_transaction_gaps': bool(step_predictions[3]),
+                'step1_file_completeness': bool(step_predictions[0]),
+                'step2_gl_tb_reconciliation': bool(step_predictions[1]),
                 'step_confidences': [float(conf) for conf in step_confidences]
             }
         else:
@@ -7992,7 +8217,7 @@ def predict_completeness_with_ai(self, data_file_id, model_type='COMPLETENESS_PR
         logger.info(f"  Predicted Score: {predicted_score:.2f}%")
         logger.info(f"  Confidence: {confidence:.2f}%")
         if model_type == 'STEP_PREDICTOR':
-            logger.info(f"  Step Predictions: {sum(step_predictions)}/4 steps expected to pass")
+            logger.info(f"  Step Predictions: {sum(step_predictions)}/2 steps expected to pass")
         logger.info(f"  Estimated Processing Time: {predicted_processing_time:.1f}s")
         
         return {
@@ -8019,7 +8244,11 @@ def predict_completeness_with_ai(self, data_file_id, model_type='COMPLETENESS_PR
 
 def _extract_ai_features(completeness_test):
     """Extract ML features from a completed completeness test"""
-    data_file = completeness_test.data_file
+    # Use GL file as primary data file (fallback to other files if GL not available)
+    data_file = completeness_test.gl_file or completeness_test.tb_file or completeness_test.coa_file
+    if not data_file:
+        raise ValueError("No data file found in completeness test")
+    
     stats = completeness_test.comprehensive_statistics
     
     features = [
@@ -8038,11 +8267,9 @@ def _extract_ai_features(completeness_test):
         len(stats.get('credit_debit_by_subtype', [])),
         len(stats.get('monthly_trends', [])),
         
-        # Step results
-        1 if completeness_test.step1_gl_tb_reconciliation.get('passed', False) else 0,
-        1 if completeness_test.step2_debit_credit_balance.get('passed', False) else 0,
-        1 if completeness_test.step3_account_coverage.get('passed', False) else 0,
-        1 if completeness_test.step4_transaction_gaps.get('passed', False) else 0,
+        # Step results (current 2-step approach)
+        1 if completeness_test.step1_file_completeness.get('passed', False) else 0,
+        1 if completeness_test.step2_gl_tb_reconciliation.get('passed', False) else 0,
         
         # Processing characteristics
         completeness_test.processing_duration,
@@ -8076,14 +8303,11 @@ def _extract_ai_features_from_file(data_file):
         12,  # Assume monthly data
         
         # Step predictions (estimated based on data quality)
-        1,  # Assume reconciliation will pass initially
-        1,  # Assume balance will pass initially
-        1,  # Assume coverage will pass initially
-        1,  # Assume no gaps initially
+        1,  # Assume file completeness will pass initially
+        1,  # Assume GL-TB reconciliation will pass initially
         
         # Processing characteristics (estimated)
         max(10, gl_postings.count() * 0.001),  # Estimated processing time
-        0,  # Anomalies (unknown)
         0,  # Critical issues (unknown)
     ]
     
@@ -8095,10 +8319,9 @@ def _get_feature_names():
     return [
         'file_size_mb', 'gl_records_count', 'tb_records_count',
         'total_documents', 'unique_documents', 'duplicate_ratio',
-        'user_count', 'subtype_count', 'months_covered',
-        'step1_passed', 'step2_passed', 'step3_passed', 'step4_passed',
-        'step5_passed', 'step6_passed', 'step7_passed',
-        'processing_duration', 'anomalies_count', 'critical_issues_count'
+        'user_count', 'account_count', 'months_covered',
+        'step1_passed', 'step2_passed',
+        'processing_duration', 'critical_issues_count'
     ]
 
 
@@ -8254,6 +8477,339 @@ def _get_optimization_suggestions(features, ai_model):
             })
     
     return suggestions
+
+
+# ============================================================================
+# COMPLETENESS RECOMMENDATION ML TASKS
+# ============================================================================
+
+@shared_task(bind=True, max_retries=1, default_retry_delay=300, time_limit=1800, soft_time_limit=1500)
+def train_completeness_recommendation_model(self, client_name=''):
+    """
+    Train comprehensive completeness recommendation model using historical data
+    
+    This task trains an advanced ML model that:
+    1. Predicts completeness test failures before they happen
+    2. Provides specific recommendations for fixing issues
+    3. Estimates completion times and success probabilities
+    4. Prioritizes actions based on impact and urgency
+    
+    Args:
+        client_name (str): Optional client name for client-specific model training
+        
+    Returns:
+        dict: Training results and model performance metrics
+    """
+    task_name = "train_completeness_recommendation_model"
+    start_time = timezone.now()
+    
+    try:
+        from .models import GeneralAnalysisResult, DataFile, Client
+        from .ml_models import CompletenessRecommendationModel
+        import joblib
+        import os
+        from django.conf import settings
+        
+        logger.info(f"🤖 Starting completeness recommendation model training (Client: {client_name or 'General'})")
+        
+        # Prepare historical data for training
+        historical_data = []
+        
+        # Get completed general analysis results with completeness data
+        analysis_results = GeneralAnalysisResult.objects.filter(
+            status='COMPLETED'
+        ).select_related('data_file', 'data_file__engagement', 'data_file__engagement__client')
+        
+        if client_name:
+            analysis_results = analysis_results.filter(
+                data_file__engagement__client__client_name__icontains=client_name
+            )
+        
+        # Limit to recent results for training (last 6 months)
+        from datetime import timedelta
+        cutoff_date = timezone.now() - timedelta(days=180)
+        analysis_results = analysis_results.filter(created_at__gte=cutoff_date)
+        
+        logger.info(f"Found {analysis_results.count()} analysis results for training")
+        
+        if analysis_results.count() < 10:
+            logger.warning("Insufficient historical data for training")
+            return {
+                'success': False,
+                'error': 'Insufficient historical data (minimum 10 records required)',
+                'client_name': client_name,
+                'records_found': analysis_results.count()
+            }
+        
+        # Extract features from historical results
+        for result in analysis_results:
+            try:
+                # Extract completeness test data
+                completeness_tests = result.analysis_summary.get('completeness_tests', {})
+                
+                # Calculate features
+                record = {
+                    # File characteristics
+                    'file_size_mb': result.data_file.file_size / (1024 * 1024) if result.data_file.file_size else 0,
+                    'gl_records_count': len(result.analysis_summary.get('transactions', [])),
+                    'tb_records_count': len(result.analysis_summary.get('trial_balance', [])),
+                    'total_documents': result.analysis_summary.get('document_statistics', {}).get('total_documents', 0),
+                    'unique_documents': result.analysis_summary.get('document_statistics', {}).get('unique_documents', 0),
+                    
+                    # Data quality features
+                    'duplicate_ratio': result.analysis_summary.get('duplicate_analysis', {}).get('duplicate_ratio', 0),
+                    'missing_dates_ratio': result.analysis_summary.get('data_quality', {}).get('missing_dates_ratio', 0),
+                    'missing_amounts_ratio': result.analysis_summary.get('data_quality', {}).get('missing_amounts_ratio', 0),
+                    'invalid_accounts_ratio': result.analysis_summary.get('data_quality', {}).get('invalid_accounts_ratio', 0),
+                    'zero_amount_ratio': result.analysis_summary.get('data_quality', {}).get('zero_amount_ratio', 0),
+                    
+                    # Complexity features
+                    'user_count': result.analysis_summary.get('user_statistics', {}).get('total_users', 0),
+                    'account_count': len(completeness_tests.get('gl_account_balances', [])),
+                    'months_covered': result.analysis_summary.get('period_analysis', {}).get('months_covered', 0),
+                    'transaction_types_count': result.analysis_summary.get('transaction_analysis', {}).get('types_count', 0),
+                    'currency_count': result.analysis_summary.get('currency_analysis', {}).get('currencies_count', 1),
+                    
+                    # Balance and reconciliation features
+                    'trial_balance_matches': 1 if result.analysis_summary.get('trial_balance_reconciliation', {}).get('matches', False) else 0,
+                    'opening_balance_available': 1 if result.analysis_summary.get('opening_balances', {}).get('available', False) else 0,
+                    'closing_balance_calculated': 1 if result.analysis_summary.get('closing_balances', {}).get('calculated', True) else 0,
+                    'balance_discrepancy_ratio': result.analysis_summary.get('balance_reconciliation', {}).get('discrepancy_ratio', 0),
+                    
+                    # Historical performance features
+                    'previous_completeness_score': 85,  # Default assumption
+                    'client_avg_score': 80,  # Default assumption
+                    'processing_duration_minutes': result.processing_duration / 60 if result.processing_duration else 0,
+                    
+                    # Account verification specific features
+                    'unrecognized_accounts_count': completeness_tests.get('accounts_with_issues', 0),
+                    'inactive_accounts_used': result.analysis_summary.get('account_analysis', {}).get('inactive_accounts', 0),
+                    'account_hierarchy_issues': result.analysis_summary.get('account_analysis', {}).get('hierarchy_issues', 0),
+                    
+                    # Target variables
+                    'final_completeness_score': result.analysis_summary.get('completeness_score', 85),
+                    'critical_issues_count': completeness_tests.get('total_issues', 0),
+                    'primary_issue_category': result.analysis_summary.get('primary_issue', 'data_quality')
+                }
+                
+                historical_data.append(record)
+                
+            except Exception as e:
+                logger.warning(f"Error processing record {result.id}: {e}")
+                continue
+        
+        logger.info(f"Prepared {len(historical_data)} training records")
+        
+        # Train the model
+        model = CompletenessRecommendationModel()
+        training_results = model.train_completeness_recommendation_model(historical_data)
+        
+        # Save the trained model
+        model_dir = os.path.join(settings.BASE_DIR, 'trained_models')
+        os.makedirs(model_dir, exist_ok=True)
+        
+        model_filename = f'completeness_recommendation_model_{client_name or "general"}.joblib'
+        model_path = os.path.join(model_dir, model_filename)
+        
+        joblib.dump(model, model_path)
+        
+        # Calculate training duration
+        training_duration = (timezone.now() - start_time).total_seconds()
+        
+        logger.info(f"✅ Completeness recommendation model training completed in {training_duration:.1f}s")
+        
+        return {
+            'success': True,
+            'client_name': client_name or 'general',
+            'model_path': model_path,
+            'training_results': training_results,
+            'training_duration_seconds': training_duration,
+            'historical_records_used': len(historical_data),
+            'model_file': model_filename
+        }
+        
+    except Exception as e:
+        logger.error(f"Completeness recommendation model training failed: {e}")
+        return {
+            'success': False,
+            'error': str(e),
+            'client_name': client_name
+        }
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=300, soft_time_limit=240)
+def predict_completeness_recommendations(self, data_file_id, client_name=''):
+    """
+    Predict completeness issues and provide actionable recommendations
+    
+    This task provides:
+    1. Early failure prediction before full completeness testing
+    2. Specific recommendations for fixing identified issues
+    3. Priority-ordered action items with time estimates
+    4. Risk assessment and success probability calculations
+    
+    Args:
+        data_file_id (str): UUID of the DataFile to analyze
+        client_name (str): Optional client name for client-specific predictions
+        
+    Returns:
+        dict: Predictions, recommendations, and action plan
+    """
+    task_name = "predict_completeness_recommendations"
+    start_time = timezone.now()
+    
+    try:
+        from .models import DataFile, SAPGLPosting
+        from .ml_models import CompletenessRecommendationModel
+        import joblib
+        import os
+        from django.conf import settings
+        
+        # Get data file
+        data_file = DataFile.objects.get(id=data_file_id)
+        transactions = SAPGLPosting.objects.filter(data_file=data_file)
+        
+        logger.info(f"🔮 Starting completeness prediction for {data_file.file_name}")
+        
+        # Load the trained model
+        model_dir = os.path.join(settings.BASE_DIR, 'trained_models')
+        
+        # Try client-specific model first, then general model
+        model_filenames = []
+        if client_name:
+            model_filenames.append(f'completeness_recommendation_model_{client_name}.joblib')
+        model_filenames.append('completeness_recommendation_model_general.joblib')
+        
+        model = None
+        model_used = None
+        
+        for filename in model_filenames:
+            model_path = os.path.join(model_dir, filename)
+            if os.path.exists(model_path):
+                try:
+                    model = joblib.load(model_path)
+                    model_used = filename
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed to load model {filename}: {e}")
+                    continue
+        
+        if not model:
+            # Create new model instance for fallback prediction
+            model = CompletenessRecommendationModel()
+            model_used = 'fallback_rules'
+        
+        # Extract features from current data file
+        data_features = _extract_data_file_features(data_file, transactions)
+        
+        # Get predictions and recommendations
+        prediction_results = model.predict_completeness_issues(data_features)
+        
+        # Calculate prediction duration
+        prediction_duration = (timezone.now() - start_time).total_seconds()
+        
+        logger.info(f"✅ Completeness prediction completed in {prediction_duration:.1f}s")
+        
+        # Enhance results with additional metadata
+        enhanced_results = {
+            **prediction_results,
+            'data_file_info': {
+                'id': str(data_file.id),
+                'filename': data_file.file_name,
+                'file_size_mb': data_file.file_size / (1024 * 1024) if data_file.file_size else 0,
+                'transaction_count': transactions.count()
+            },
+            'model_info': {
+                'model_used': model_used,
+                'client_specific': client_name and model_used.endswith(f'{client_name}.joblib'),
+                'prediction_duration_seconds': prediction_duration
+            },
+            'timestamp': timezone.now().isoformat(),
+            'task_id': str(self.request.id)
+        }
+        
+        return enhanced_results
+        
+    except Exception as e:
+        logger.error(f"Completeness prediction failed: {e}")
+        return {
+            'success': False,
+            'error': str(e),
+            'data_file_id': data_file_id,
+            'client_name': client_name
+        }
+
+
+def _extract_data_file_features(data_file, transactions) -> Dict[str, Any]:
+    """Extract features from a data file for completeness prediction"""
+    
+    # Basic file features
+    features = {
+        'file_size_mb': data_file.file_size / (1024 * 1024) if data_file.file_size else 0,
+        'gl_records_count': transactions.count(),
+        'tb_records_count': 0,  # Will be updated if trial balance data is available
+        'total_documents': 0,
+        'unique_documents': 0
+    }
+    
+    if transactions.exists():
+        # Document analysis
+        document_numbers = list(transactions.values_list('document_number', flat=True))
+        features['total_documents'] = len(document_numbers)
+        features['unique_documents'] = len(set(doc for doc in document_numbers if doc))
+        
+        # Data quality features
+        total_count = transactions.count()
+        features['duplicate_ratio'] = 0.0  # Will be calculated by duplicate analysis
+        features['missing_dates_ratio'] = transactions.filter(posting_date__isnull=True).count() / total_count
+        features['missing_amounts_ratio'] = transactions.filter(amount_local_currency__isnull=True).count() / total_count
+        features['zero_amount_ratio'] = transactions.filter(amount_local_currency=0).count() / total_count
+        
+        # Complexity features
+        features['user_count'] = transactions.values('user_name').distinct().count()
+        features['account_count'] = transactions.values('gl_account').distinct().count()
+        
+        # Date range analysis
+        date_range = transactions.aggregate(
+            min_date=timezone.models.Min('posting_date'),
+            max_date=timezone.models.Max('posting_date')
+        )
+        if date_range['min_date'] and date_range['max_date']:
+            date_diff = date_range['max_date'] - date_range['min_date']
+            features['months_covered'] = max(1, date_diff.days / 30)
+        else:
+            features['months_covered'] = 1
+        
+        # Transaction types
+        features['transaction_types_count'] = transactions.values('transaction_type').distinct().count()
+        features['currency_count'] = transactions.values('local_currency').distinct().count()
+        
+        # Account verification features
+        features['unrecognized_accounts_count'] = 0  # Will be updated by account verification
+        features['invalid_accounts_ratio'] = 0.0
+        features['inactive_accounts_used'] = 0
+        features['account_hierarchy_issues'] = 0
+    else:
+        # Default values for empty dataset
+        for key in ['duplicate_ratio', 'missing_dates_ratio', 'missing_amounts_ratio', 
+                   'invalid_accounts_ratio', 'zero_amount_ratio', 'user_count', 
+                   'account_count', 'months_covered', 'transaction_types_count', 
+                   'currency_count', 'unrecognized_accounts_count', 'inactive_accounts_used', 
+                   'account_hierarchy_issues']:
+            features[key] = 0
+    
+    # Balance and reconciliation features (defaults)
+    features.update({
+        'trial_balance_matches': 0,
+        'opening_balance_available': 0,
+        'closing_balance_calculated': 1,
+        'balance_discrepancy_ratio': 0.0,
+        'previous_completeness_score': 85,  # Default assumption
+        'client_avg_score': 80,  # Default assumption
+        'processing_duration_minutes': 0
+    })
+    
+    return features
 
 
 # ============================================================================

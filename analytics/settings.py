@@ -41,8 +41,10 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'corsheaders',
+    'channels',
     'core',
     'users',
+    'notifications',  # New notifications app
 ]
 
 MIDDLEWARE = [
@@ -74,6 +76,22 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'analytics.wsgi.application'
+ASGI_APPLICATION = 'analytics.asgi.application'
+
+# Redis URL for WebSocket channels and other services
+redis_url = os.environ.get('REDIS_URL', 'redis://redis:6379/0')
+
+# Channels Configuration
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            "hosts": [redis_url],
+            "capacity": 1500,  # Maximum number of messages to hold
+            "expiry": 60,      # Message expiry time in seconds
+        },
+    },
+}
 
 
 # Database
@@ -88,12 +106,16 @@ DATABASES = {
         'PASSWORD': os.getenv('POSTGRES_PASSWORD', 'analytics_password'),
         'HOST': os.getenv('POSTGRES_HOST', 'db'),
         'PORT': os.getenv('POSTGRES_PORT', '5432'),
-        'OPTIONS': {
-            'client_encoding': 'UTF8',
-        },
-        # Django connection settings for better reliability
+        # Django connection settings for better reliability and performance
         'CONN_MAX_AGE': 600,  # Keep connections alive for 10 minutes
         'CONN_HEALTH_CHECKS': True,  # Enable connection health checks
+        'OPTIONS': {
+            'client_encoding': 'UTF8',
+            # PostgreSQL connection options for performance
+            'options': '-c synchronous_commit=off',
+            'connect_timeout': 10,
+            'application_name': 'analytics_app',
+        }
     }
 }
 
@@ -148,6 +170,18 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Database performance optimizations
+DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB for large file uploads
+FILE_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB in memory before temp file
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 10000  # Allow more fields for large datasets
+
+# Batch processing optimizations
+BULK_CREATE_BATCH_SIZE = 10000  # Large batch size for bulk operations
+BULK_UPDATE_BATCH_SIZE = 5000   # Batch size for bulk updates
+
+# Database query optimizations  
+DATABASE_ROUTERS = []  # Can add read/write splitting later if needed
 
 # Custom User Model
 AUTH_USER_MODEL = 'users.User'
@@ -207,9 +241,6 @@ CORS_ALLOW_HEADERS = [
 # Celery Configuration
 # All Celery settings are now handled in analytics/celery.py for consistency
 # This prevents conflicts between settings.py and celery.py configurations
-
-# Redis URL for other services that might need it
-redis_url = os.environ.get('REDIS_URL', 'redis://redis:6379/0')
 
 # File upload settings
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB

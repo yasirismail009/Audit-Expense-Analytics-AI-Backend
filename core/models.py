@@ -533,7 +533,6 @@ class DataFile(BaseModel):
     class Meta:
         db_table = 'data_files'
         ordering = ['-uploaded_at']
-        unique_together = [['engagement', 'file_type']]  # One file per type per engagement
         indexes = [
             models.Index(fields=['status', 'uploaded_at']),
             models.Index(fields=['engagement', 'file_type']),
@@ -838,6 +837,39 @@ class SAPGLPosting(BaseModel):
     sales_document = models.CharField(max_length=20, blank=True, help_text='Sales Document')
     assignment = models.CharField(max_length=20, blank=True, help_text='Assignment')
     year_month = models.CharField(max_length=7, blank=True, help_text='Year/Month')
+    
+    # Additional transaction currency fields
+    amount_transaction_currency = models.DecimalField(
+        max_digits=30, 
+        decimal_places=10, 
+        null=True,
+        blank=True,
+        help_text='Amount in transaction currency'
+    )
+    transaction_currency = models.CharField(max_length=3, blank=True, help_text='Transaction currency code')
+    exchange_rate = models.DecimalField(
+        max_digits=15, 
+        decimal_places=6, 
+        null=True,
+        blank=True,
+        help_text='Exchange rate'
+    )
+    
+    # Additional posting fields
+    posting_key = models.CharField(max_length=10, blank=True, help_text='Posting Key')
+    reference_document = models.CharField(max_length=20, blank=True, help_text='Reference Document')
+    document_header_text = models.CharField(max_length=200, blank=True, help_text='Document Header Text')
+    company_code = models.CharField(max_length=10, blank=True, help_text='Company Code')
+    fiscal_period = models.IntegerField(null=True, blank=True, help_text='Fiscal Period')
+    
+    # Cost center and organizational fields
+    cost_center = models.CharField(max_length=10, blank=True, help_text='Cost Center')
+    wbs_element = models.CharField(max_length=20, blank=True, help_text='WBS Element')
+    order_number = models.CharField(max_length=20, blank=True, help_text='Order Number')
+    asset_number = models.CharField(max_length=20, blank=True, help_text='Asset Number')
+    sub_number = models.CharField(max_length=10, blank=True, help_text='Sub Number')
+    business_area = models.CharField(max_length=10, blank=True, help_text='Business Area')
+    partner_business_area = models.CharField(max_length=10, blank=True, help_text='Partner Business Area')
     
     class Meta:
         db_table = 'sap_gl_postings'

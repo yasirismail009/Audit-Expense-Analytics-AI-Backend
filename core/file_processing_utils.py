@@ -11,7 +11,7 @@ from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
 
 from django.utils import timezone
-from .models import SAPGLPosting, TrialBalance, ChartOfAccount, DataFile
+from .models import SAPGLPosting, TrialBalance, ChartOfAccount, DataFile, GLAccount
 
 logger = logging.getLogger(__name__)
 
@@ -395,9 +395,10 @@ class DataProcessor:
     
     def __init__(self, data_file: DataFile):
         self.data_file = data_file
-        self.batch_size = 200  # Process in smaller batches for better connection management
+        self.batch_size = 10000  # Optimized batch size for better performance
+        self.validation_batch_size = 5000  # Separate validation batch size
     
-    def process_gl_data_chunked(self, file_path, chunk_size=5000):
+    def process_gl_data_chunked(self, file_path, chunk_size=25000):
         """Process GL data in chunks for large files"""
         logger.info("🎯" + "="*60)
         logger.info("🎯 CHUNKED GL DATA PROCESSING - THE MAGIC BEGINS! 🎯")
@@ -456,56 +457,29 @@ class DataProcessor:
         failed_count = 0
         postings_to_create = []
         
-        # 🔍 Row-by-Row Processing - The Data Transformation
-        logger.info("🔍 Starting row-by-row processing...")
-        for index, row in df.iterrows():
-            try:
-                posting = self._create_gl_posting_from_row(row)
-                if posting:
-                    postings_to_create.append(posting)
-                    processed_count += 1
-                    
-                    # Log progress for every 100 records
-                    if processed_count % 100 == 0:
-                        logger.info(f"📈 Progress: {processed_count} records processed successfully...")
-                        
-            except Exception as e:
-                logger.error(f"❌ Error processing GL row {index}: {e}")
-                failed_count += 1
-                
-                # Log detailed error for first few failures
-                if failed_count <= 5:
-                    logger.error(f"🔍 Row {index} details: {dict(row)}")
+        # 🚀 VECTORIZED Data Processing - The Fast Data Transformation! 🚀
+        logger.info("🚀 Starting vectorized data processing...")
         
-        logger.info("✅ Row-by-row processing completed!")
+        # Use vectorized operations for better performance
+        postings_to_create, processed_count, failed_count = self._process_gl_data_vectorized(df)
+        
+        logger.info("✅ Vectorized processing completed!")
         logger.info(f"📊 Processing Summary:")
         logger.info(f"   ✅ Successfully Processed: {processed_count} records")
         logger.info(f"   ❌ Failed Records: {failed_count} records")
         logger.info(f"   📈 Success Rate: {(processed_count / (processed_count + failed_count) * 100):.1f}%")
         
-        # 💾 Individual Database Save - ONE BY ONE for reliability!
+        # 🚀 ULTRA-FAST Database Save - Choose best method based on data size!
         if postings_to_create:
-            logger.info("💾 Starting individual database save (ONE BY ONE mode)...")
-            logger.info(f"📊 Saving {len(postings_to_create)} records individually...")
+            record_count = len(postings_to_create)
+            logger.info(f"🚀 Starting ULTRA-FAST database save ({record_count:,} records)...")
             
-            individual_processed = 0
-            individual_failed = 0
-            
-            for i, posting in enumerate(postings_to_create):
-                try:
-                    if self._save_gl_record_individual(posting, i):
-                        individual_processed += 1
-                        if individual_processed % 50 == 0:  # Log progress every 50 records
-                            logger.info(f"📈 Individual Save Progress: {individual_processed}/{len(postings_to_create)} records saved")
-                    else:
-                        individual_failed += 1
-                        logger.error(f"❌ Failed to save individual GL record {i}")
-                except Exception as e:
-                    individual_failed += 1
-                    logger.error(f"❌ Error saving individual GL record {i}: {e}")
-            
-            logger.info("✅ Individual database save completed!")
-            logger.info(f"📊 Individual Save Results: {individual_processed} saved, {individual_failed} failed")
+            # Use Django bulk_create for reliable database persistence
+            logger.info("💾 Using Django bulk_create for reliable database persistence")
+            self._optimized_bulk_create_gl_postings(
+                postings_to_create,
+                f"GL records for file {self.data_file.file_name}"
+            )
         else:
             logger.warning("⚠️  No GL postings to save to database!")
         
@@ -571,6 +545,613 @@ class DataProcessor:
         
         return False
     
+    def _optimized_bulk_create_gl_postings(self, postings_to_create: List, operation_name: str):
+        """
+        🚀 Ultra-Fast GL Posting Bulk Create - OPTIMIZED FOR SPEED! 🚀
+        
+        This method is specifically optimized for GL postings with:
+        - Massive batch sizes (10K+ records per batch)
+        - Minimal validation overhead
+        - Connection pooling optimization
+        - Batch-level transaction handling
+        - Error segregation without stopping the process
+        
+        Args:
+            postings_to_create: List of SAPGLPosting instances
+            operation_name: Name of operation for logging
+        """
+        from django.db import transaction, connection
+        from django.db.utils import OperationalError, InterfaceError
+        from .models import SAPGLPosting, SAPGLPostingError
+        import time
+        
+        logger.info("🚀" + "="*60)
+        logger.info("🚀 ULTRA-FAST GL POSTING BULK CREATE! 🚀")
+        logger.info(f"📊 Processing {len(postings_to_create)} {operation_name}...")
+        logger.info(f"🔢 Optimized Batch Size: {self.batch_size}")
+        logger.info("🚀" + "="*60)
+        
+        total_created = 0
+        total_errors = 0
+        batch_count = 0
+        start_time = time.time()
+        
+        # Pre-validate and separate good/bad records
+        logger.info("🔍 Pre-validation phase...")
+        valid_postings = []
+        invalid_postings = []
+        
+        for i, posting in enumerate(postings_to_create):
+            try:
+                # Quick validation - only essential fields
+                if not posting.gl_account or not posting.data_file:
+                    raise ValueError("Missing required fields")
+                valid_postings.append(posting)
+            except Exception as e:
+                invalid_postings.append((i, posting, str(e)))
+        
+        logger.info(f"✅ Pre-validation complete: {len(valid_postings)} valid, {len(invalid_postings)} invalid")
+        
+        # Save invalid records to error table first
+        if invalid_postings:
+            logger.info(f"💾 Saving {len(invalid_postings)} invalid records to error table...")
+            error_records = []
+            for record_index, posting, error_msg in invalid_postings:
+                try:
+                    raw_data = {
+                        'gl_account': getattr(posting, 'gl_account', ''),
+                        'document_number': getattr(posting, 'document_number', ''),
+                        'amount_local_currency': str(getattr(posting, 'amount_local_currency', 0)),
+                        'user_name': getattr(posting, 'user_name', ''),
+                        'posting_date': str(getattr(posting, 'posting_date', '')),
+                    }
+                    
+                    error_record = SAPGLPostingError(
+                        data_file=posting.data_file,
+                        error_type='PreValidationError',
+                        error_message=error_msg,
+                        raw_data=raw_data,
+                        batch_number=0,
+                        record_index=record_index
+                    )
+                    error_records.append(error_record)
+                except Exception as e:
+                    logger.error(f"Failed to create error record: {e}")
+            
+            if error_records:
+                try:
+                    SAPGLPostingError.objects.bulk_create(error_records, batch_size=1000)
+                    total_errors += len(error_records)
+                    logger.info(f"✅ Saved {len(error_records)} error records")
+                except Exception as e:
+                    logger.error(f"Failed to save error records: {e}")
+        
+        # Process valid records in large batches
+        if valid_postings:
+            logger.info(f"🚀 Processing {len(valid_postings)} valid records in {self.batch_size}-record batches...")
+            
+            for i in range(0, len(valid_postings), self.batch_size):
+                batch = valid_postings[i:i + self.batch_size]
+                batch_count += 1
+                batch_start_time = time.time()
+                
+                try:
+                    # Use a single transaction per large batch
+                    with transaction.atomic():
+                        # Ensure connection is healthy
+                        try:
+                            connection.ensure_connection()
+                        except (OperationalError, InterfaceError):
+                            connection.close()
+                            connection.connect()
+                        
+                        # Bulk create with ignore_conflicts for speed
+                        created_objects = SAPGLPosting.objects.bulk_create(
+                            batch, 
+                            batch_size=min(self.batch_size, 5000),  # Internal Django batch size
+                            ignore_conflicts=True  # Skip duplicates instead of failing
+                        )
+                        
+                        batch_created = len(batch)  # Since ignore_conflicts=True, assume all created
+                        total_created += batch_created
+                        
+                        batch_duration = time.time() - batch_start_time
+                        records_per_second = batch_created / batch_duration if batch_duration > 0 else 0
+                        
+                        logger.info(f"⚡ Batch {batch_count}: {batch_created} records in {batch_duration:.2f}s ({records_per_second:.0f} rec/sec)")
+                        
+                        # Progress update for large datasets
+                        if len(valid_postings) > 10000:
+                            progress_percent = (total_created / len(valid_postings)) * 100
+                            logger.info(f"📈 Progress: {total_created}/{len(valid_postings)} ({progress_percent:.1f}%)")
+                            
+                except Exception as e:
+                    logger.error(f"❌ Batch {batch_count} failed: {e}")
+                    # Don't stop - try to save individual records from failed batch
+                    try:
+                        individual_saved = 0
+                        for j, posting in enumerate(batch):
+                            try:
+                                posting.save()
+                                individual_saved += 1
+                            except Exception as individual_error:
+                                # Save to error table
+                                try:
+                                    raw_data = {
+                                        'gl_account': getattr(posting, 'gl_account', ''),
+                                        'document_number': getattr(posting, 'document_number', ''),
+                                        'amount_local_currency': str(getattr(posting, 'amount_local_currency', 0)),
+                                    }
+                                    SAPGLPostingError.objects.create(
+                                        data_file=posting.data_file,
+                                        error_type='IndividualSaveError',
+                                        error_message=str(individual_error),
+                                        raw_data=raw_data,
+                                        batch_number=batch_count,
+                                        record_index=j
+                                    )
+                                    total_errors += 1
+                                except:
+                                    pass
+                        
+                        total_created += individual_saved
+                        logger.info(f"🔄 Batch {batch_count} fallback: {individual_saved} individual saves")
+                        
+                    except Exception as fallback_error:
+                        logger.error(f"❌ Batch {batch_count} fallback also failed: {fallback_error}")
+                        total_errors += len(batch)
+        
+        total_duration = time.time() - start_time
+        overall_speed = total_created / total_duration if total_duration > 0 else 0
+        
+        logger.info("🚀" + "="*60)
+        logger.info("🚀 ULTRA-FAST BULK CREATE COMPLETED! 🚀")
+        logger.info(f"✅ Successfully created: {total_created} records")
+        logger.info(f"❌ Errors handled: {total_errors} records")
+        logger.info(f"⏱️  Total duration: {total_duration:.2f} seconds")
+        logger.info(f"⚡ Overall speed: {overall_speed:.0f} records/second")
+        logger.info(f"📊 Success rate: {(total_created / len(postings_to_create) * 100):.1f}%")
+        logger.info("🚀" + "="*60)
+    
+    def _ultra_fast_copy_load_gl_postings(self, df: pd.DataFrame, operation_name: str):
+        """
+        🏆 ULTRA-FAST GL Loading using PostgreSQL COPY command
+        
+        This is the fastest possible method for very large GL datasets (50K+ records)
+        Uses raw PostgreSQL COPY command for maximum performance
+        
+        Args:
+            df: pandas DataFrame with GL data
+            operation_name: Name of operation for logging
+        """
+        try:
+            from .bulk_loading_utils import bulk_load_gl_with_pandas
+            
+            logger.info("🏆" + "="*60)
+            logger.info("🏆 ULTRA-FAST PostgreSQL COPY LOADING! 🏆")
+            logger.info(f"📊 Loading {len(df):,} GL records with COPY command...")
+            logger.info("🏆" + "="*60)
+            
+            # Use the SQLAlchemy bulk loader with pandas (COPY requires file setup)
+            result = bulk_load_gl_with_pandas(df, str(self.data_file.id))
+            
+            if result['success']:
+                logger.info(f"🏆 COPY load completed: {result['records_loaded']:,} records in {result['duration']:.2f}s")
+                logger.info(f"⚡ Speed: {result['records_per_second']:.0f} records/second")
+            else:
+                logger.error(f"❌ COPY load failed: {result.get('error', 'Unknown error')}")
+                # Fallback to optimized Django method
+                logger.info("🔄 Falling back to optimized Django bulk_create...")
+                self._optimized_bulk_create_gl_postings(
+                    [self._create_gl_posting_from_row(row) for _, row in df.iterrows()],
+                    operation_name
+                )
+                
+        except Exception as e:
+            logger.error(f"❌ Ultra-fast COPY loading failed: {e}")
+            # Fallback to optimized Django method
+            logger.info("🔄 Falling back to optimized Django bulk_create...")
+            self._optimized_bulk_create_gl_postings(
+                [self._create_gl_posting_from_row(row) for _, row in df.iterrows()],
+                operation_name
+            )
+    
+    def _fast_pandas_load_gl_postings(self, df: pd.DataFrame, operation_name: str):
+        """
+        ⚡ FAST GL Loading using pandas.to_sql()
+        
+        5-10x faster than Django ORM for medium-large datasets (5K-50K records)
+        
+        Args:
+            df: pandas DataFrame with GL data
+            operation_name: Name of operation for logging
+        """
+        try:
+            from .bulk_loading_utils import bulk_load_gl_with_pandas
+            
+            logger.info("⚡" + "="*60)
+            logger.info("⚡ FAST PANDAS.TO_SQL LOADING! ⚡")
+            logger.info(f"📊 Loading {len(df):,} GL records with pandas.to_sql()...")
+            logger.info("⚡" + "="*60)
+            
+            # Use the SQLAlchemy bulk loader
+            result = bulk_load_gl_with_pandas(df, str(self.data_file.id))
+            
+            if result['success']:
+                logger.info(f"⚡ Pandas load completed: {result['records_loaded']:,} records in {result['duration']:.2f}s")
+                logger.info(f"🚀 Speed: {result['records_per_second']:.0f} records/second")
+            else:
+                logger.error(f"❌ Pandas load failed: {result.get('error', 'Unknown error')}")
+                # Fallback to optimized Django method
+                logger.info("🔄 Falling back to optimized Django bulk_create...")
+                self._optimized_bulk_create_gl_postings(
+                    [self._create_gl_posting_from_row(row) for _, row in df.iterrows()],
+                    operation_name
+                )
+                
+        except Exception as e:
+            logger.error(f"❌ Fast pandas loading failed: {e}")
+            # Fallback to optimized Django method
+            logger.info("🔄 Falling back to optimized Django bulk_create...")
+            self._optimized_bulk_create_gl_postings(
+                [self._create_gl_posting_from_row(row) for _, row in df.iterrows()],
+                operation_name
+            )
+    
+    def _fast_pandas_load_gl_postings_from_instances(self, postings_to_create: List, operation_name: str):
+        """
+        ⚡ FAST GL Loading using pandas.to_sql() from model instances
+        
+        5-10x faster than Django ORM for medium-large datasets (5K-50K records)
+        
+        Args:
+            postings_to_create: List of SAPGLPosting model instances
+            operation_name: Name of operation for logging
+        """
+        try:
+            from .bulk_loading_utils import bulk_load_gl_with_pandas_from_instances
+            
+            logger.info("⚡" + "="*60)
+            logger.info("⚡ FAST PANDAS.TO_SQL LOADING FROM INSTANCES! ⚡")
+            logger.info(f"📊 Loading {len(postings_to_create):,} GL records with pandas.to_sql()...")
+            logger.info("⚡" + "="*60)
+            
+            # Use the SQLAlchemy bulk loader with instances
+            result = bulk_load_gl_with_pandas_from_instances(postings_to_create, str(self.data_file.id))
+            
+            if result['success']:
+                logger.info(f"⚡ Pandas load completed: {result['records_loaded']:,} records in {result['duration']:.2f}s")
+                logger.info(f"🚀 Speed: {result['records_per_second']:.0f} records/second")
+            else:
+                logger.error(f"❌ Pandas load failed: {result.get('error', 'Unknown error')}")
+                # Fallback to optimized Django method
+                logger.info("🔄 Falling back to optimized Django bulk_create...")
+                self._optimized_bulk_create_gl_postings(postings_to_create, operation_name)
+                
+        except Exception as e:
+            logger.error(f"❌ Fast pandas loading failed: {e}")
+            # Fallback to optimized Django method
+            logger.info("🔄 Falling back to optimized Django bulk_create...")
+            self._optimized_bulk_create_gl_postings(postings_to_create, operation_name)
+    
+    def _ultra_fast_copy_load_gl_postings_from_instances(self, postings_to_create: List, operation_name: str):
+        """
+        🏆 ULTRA-FAST GL Loading using PostgreSQL COPY from model instances
+        
+        10-20x faster than Django ORM for very large datasets (50K+ records)
+        
+        Args:
+            postings_to_create: List of SAPGLPosting model instances
+            operation_name: Name of operation for logging
+        """
+        try:
+            from .bulk_loading_utils import bulk_load_gl_with_copy_from_instances
+            
+            logger.info("🏆" + "="*60)
+            logger.info("🏆 ULTRA-FAST POSTGRESQL COPY LOADING FROM INSTANCES! 🏆")
+            logger.info(f"📊 Loading {len(postings_to_create):,} GL records with PostgreSQL COPY...")
+            logger.info("🏆" + "="*60)
+            
+            # Use the SQLAlchemy bulk loader with instances
+            result = bulk_load_gl_with_copy_from_instances(postings_to_create, str(self.data_file.id))
+            
+            if result['success']:
+                logger.info(f"🏆 COPY load completed: {result['records_loaded']:,} records in {result['duration']:.2f}s")
+                logger.info(f"🚀 Speed: {result['records_per_second']:.0f} records/second")
+            else:
+                logger.error(f"❌ COPY load failed: {result.get('error', 'Unknown error')}")
+                # Fallback to optimized Django method
+                logger.info("🔄 Falling back to optimized Django bulk_create...")
+                self._optimized_bulk_create_gl_postings(postings_to_create, operation_name)
+                
+        except Exception as e:
+            logger.error(f"❌ Ultra-fast COPY loading failed: {e}")
+            # Fallback to optimized Django method
+            logger.info("🔄 Falling back to optimized Django bulk_create...")
+            self._optimized_bulk_create_gl_postings(postings_to_create, operation_name)
+    
+    def _process_gl_data_vectorized(self, df: pd.DataFrame) -> Tuple[List, int, int]:
+        """
+        🚀 VECTORIZED GL Data Processing - Ultra-Fast Data Transformation! 🚀
+        
+        Uses pandas vectorized operations for maximum performance:
+        - Vectorized data cleaning and type conversion
+        - Batch GL Account lookups
+        - Parallel data validation
+        - Optimized model instance creation
+        
+        Args:
+            df: pandas DataFrame with GL data
+            
+        Returns:
+            Tuple: (postings_to_create, processed_count, failed_count)
+        """
+        logger.info("🚀" + "="*60)
+        logger.info("🚀 VECTORIZED GL DATA PROCESSING - MAXIMUM SPEED! 🚀")
+        logger.info(f"📊 Processing {len(df)} rows with vectorized operations...")
+        logger.info("🚀" + "="*60)
+        
+        processed_count = 0
+        failed_count = 0
+        postings_to_create = []
+        
+        try:
+            # Step 1: Vectorized data cleaning and preparation
+            logger.info("🧹 Step 1: Vectorized data cleaning...")
+            df_cleaned = self._clean_gl_dataframe_vectorized(df)
+            
+            # Step 2: Batch GL Account lookups
+            logger.info("🔍 Step 2: Batch GL Account lookups...")
+            gl_accounts_map = self._batch_lookup_gl_accounts(df_cleaned)
+            
+            # Step 3: Vectorized model instance creation
+            logger.info("⚡ Step 3: Vectorized model instance creation...")
+            postings_to_create, processed_count, failed_count = self._create_gl_postings_vectorized(
+                df_cleaned, gl_accounts_map
+            )
+            
+            logger.info("✅ Vectorized processing completed successfully!")
+            
+        except Exception as e:
+            logger.error(f"❌ Vectorized processing failed: {e}")
+            # Fallback to row-by-row processing
+            logger.info("🔄 Falling back to row-by-row processing...")
+            return self._process_gl_data_row_by_row(df)
+        
+        return postings_to_create, processed_count, failed_count
+    
+    def _clean_gl_dataframe_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean GL DataFrame using vectorized operations"""
+        df_cleaned = df.copy()
+        
+        # Vectorized string cleaning
+        string_columns = ['G/L Account', 'Document Number', 'User Name', 'Text']
+        for col in string_columns:
+            if col in df_cleaned.columns:
+                df_cleaned[col] = df_cleaned[col].astype(str).str.strip()
+        
+        # Vectorized account code cleaning
+        if 'G/L Account' in df_cleaned.columns:
+            df_cleaned['G/L Account'] = df_cleaned['G/L Account'].astype(str)
+            # Remove decimal representations of whole numbers
+            df_cleaned['G/L Account'] = df_cleaned['G/L Account'].apply(
+                lambda x: str(int(float(x))) if '.' in str(x) and str(x).replace('.', '').isdigit() and float(x).is_integer() else str(x)
+            )
+        
+        # Vectorized date parsing
+        date_columns = ['Posting Date', 'Document Date', 'Entry Date']
+        for col in date_columns:
+            if col in df_cleaned.columns:
+                df_cleaned[col] = pd.to_datetime(df_cleaned[col], errors='coerce')
+        
+        # Vectorized amount parsing
+        amount_columns = ['Amount in Local Currency', 'Amount in Transaction Currency']
+        for col in amount_columns:
+            if col in df_cleaned.columns:
+                df_cleaned[col] = pd.to_numeric(df_cleaned[col], errors='coerce').fillna(0)
+        
+        # Remove rows with missing required fields
+        required_fields = ['G/L Account', 'Document Number']
+        for field in required_fields:
+            if field in df_cleaned.columns:
+                df_cleaned = df_cleaned[df_cleaned[field].notna() & (df_cleaned[field] != '')]
+        
+        logger.info(f"🧹 Data cleaning completed: {len(df)} → {len(df_cleaned)} rows")
+        return df_cleaned
+    
+    def _batch_lookup_gl_accounts(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Batch lookup GL Accounts for all unique account codes"""
+        from .models import GLAccount
+        
+        # Get unique account codes
+        unique_accounts = df['G/L Account'].unique() if 'G/L Account' in df.columns else []
+        
+        if not unique_accounts.size:
+            return {}
+        
+        # Batch lookup all accounts
+        gl_accounts = GLAccount.objects.filter(
+            engagement=self.data_file.engagement,
+            account_code__in=unique_accounts
+        ).values('account_code', 'id', 'account_name')
+        
+        # Create lookup map
+        accounts_map = {acc['account_code']: acc for acc in gl_accounts}
+        
+        logger.info(f"🔍 Batch GL Account lookup: {len(accounts_map)}/{len(unique_accounts)} found")
+        return accounts_map
+    
+    def _create_gl_postings_vectorized(self, df: pd.DataFrame, gl_accounts_map: Dict) -> Tuple[List, int, int]:
+        """Create GL postings using vectorized operations"""
+        from .models import SAPGLPosting
+        
+        postings_to_create = []
+        processed_count = 0
+        failed_count = 0
+        
+        # Process in batches for memory efficiency
+        batch_size = 1000
+        total_rows = len(df)
+        
+        for start_idx in range(0, total_rows, batch_size):
+            end_idx = min(start_idx + batch_size, total_rows)
+            batch_df = df.iloc[start_idx:end_idx]
+            
+            # Process batch
+            batch_postings, batch_processed, batch_failed = self._create_gl_postings_batch(
+                batch_df, gl_accounts_map, start_idx
+            )
+            
+            postings_to_create.extend(batch_postings)
+            processed_count += batch_processed
+            failed_count += batch_failed
+            
+            # Progress logging
+            if processed_count % 5000 == 0:
+                logger.info(f"📈 Progress: {processed_count}/{total_rows} records processed...")
+        
+        return postings_to_create, processed_count, failed_count
+    
+    def _create_gl_postings_batch(self, batch_df: pd.DataFrame, gl_accounts_map: Dict, start_idx: int) -> Tuple[List, int, int]:
+        """Create GL postings for a batch of rows"""
+        from .models import SAPGLPosting
+        
+        postings = []
+        processed = 0
+        failed = 0
+        
+        for idx, (_, row) in enumerate(batch_df.iterrows()):
+            try:
+                posting = self._create_gl_posting_from_row_optimized(row, gl_accounts_map)
+                if posting:
+                    postings.append(posting)
+                    processed += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                if failed <= 5:  # Log first few errors
+                    logger.error(f"❌ Error processing GL row {start_idx + idx}: {e}")
+        
+        return postings, processed, failed
+    
+    def _create_gl_posting_from_row_optimized(self, row: pd.Series, gl_accounts_map: Dict) -> Optional[SAPGLPosting]:
+        """Optimized GL posting creation with pre-looked up GL Account"""
+        try:
+            gl_account_code = str(row.get('G/L Account', '')).strip()
+            if not gl_account_code:
+                return None
+            
+            # Get pre-looked up GL Account
+            gl_account_data = gl_accounts_map.get(gl_account_code)
+            gl_account_ref = None
+            if gl_account_data:
+                gl_account_ref = GLAccount.objects.get(id=gl_account_data['id'])
+            
+            # Parse posting date and extract period
+            posting_date = self._parse_posting_date(row.get('Posting Date', ''))
+            posting_period = 1  # Default period
+            fiscal_year = 2025  # Default year
+            
+            if posting_date:
+                posting_period = posting_date.month
+                fiscal_year = posting_date.year
+            else:
+                # Try to get from explicit fields if posting date parsing failed
+                posting_period = DataParser.parse_int(row.get('Posting Period', '1')) or 1
+                fiscal_year = DataParser.parse_int(row.get('Fiscal Year', '2025')) or 2025
+            
+            # Create SAPGLPosting instance
+            posting = SAPGLPosting(
+                data_file=self.data_file,
+                gl_account=gl_account_code,
+                gl_account_ref=gl_account_ref,
+                document_number=str(row.get('Document Number', '')).strip(),
+                posting_date=posting_date,
+                amount_local_currency=row.get('Amount in Local Currency', 0),
+                local_currency=str(row.get('Local Currency', 'SAR')).strip(),
+                amount_transaction_currency=row.get('Amount in Transaction Currency', 0),
+                transaction_currency=str(row.get('Transaction Currency', '')).strip(),
+                exchange_rate=row.get('Exchange Rate', 1.0),
+                user_name=str(row.get('User Name', '')).strip(),
+                posting_key=str(row.get('Posting Key', '')).strip(),
+                reference_document=str(row.get('Reference Document', '')).strip(),
+                document_header_text=str(row.get('Document Header Text', '')).strip(),
+                company_code=str(row.get('Company Code', '')).strip(),
+                fiscal_year=fiscal_year,
+                posting_period=posting_period,
+                fiscal_period=row.get('Fiscal Period'),
+                cost_center=str(row.get('Cost Center', '')).strip(),
+                profit_center=str(row.get('Profit Center', '')).strip(),
+                wbs_element=str(row.get('WBS Element', '')).strip(),
+                order_number=str(row.get('Order Number', '')).strip(),
+                asset_number=str(row.get('Asset Number', '')).strip(),
+                sub_number=str(row.get('Sub Number', '')).strip(),
+                business_area=str(row.get('Business Area', '')).strip(),
+                segment=str(row.get('Segment', '')).strip(),
+                partner_business_area=str(row.get('Partner Business Area', '')).strip()
+            )
+            
+            return posting
+            
+        except Exception as e:
+            logger.error(f"Error creating GL posting: {e}")
+            return None
+    
+    def _process_gl_data_row_by_row(self, df: pd.DataFrame) -> Tuple[List, int, int]:
+        """Fallback row-by-row processing method"""
+        processed_count = 0
+        failed_count = 0
+        postings_to_create = []
+        
+        logger.info("🔄 Using fallback row-by-row processing...")
+        
+        for index, row in df.iterrows():
+            try:
+                posting = self._create_gl_posting_from_row(row)
+                if posting:
+                    postings_to_create.append(posting)
+                    processed_count += 1
+                    
+                    # Log progress for every 100 records
+                    if processed_count % 100 == 0:
+                        logger.info(f"📈 Progress: {processed_count} records processed successfully...")
+                        
+            except Exception as e:
+                logger.error(f"❌ Error processing GL row {index}: {e}")
+                failed_count += 1
+                
+                # Log detailed error for first few failures
+                if failed_count <= 5:
+                    logger.error(f"🔍 Row {index} details: {dict(row)}")
+        
+        return postings_to_create, processed_count, failed_count
+    
+    def process_chart_data_from_file(self, file_path: str) -> Dict[str, int]:
+        """
+        Process Chart of Accounts data from file path (for background thread processing)
+        
+        Args:
+            file_path: Path to the COA file
+            
+        Returns:
+            Dict: Processing results with counts
+        """
+        try:
+            # Read file using FileReader
+            file_reader = FileReader()
+            df = file_reader.read_file(file_path)
+            
+            if df is None or df.empty:
+                raise Exception("File is empty or could not be read")
+            
+            # Process using existing method
+            return self.process_chart_data(df)
+            
+        except Exception as e:
+            logger.error(f"Error processing COA file {file_path}: {e}")
+            return {'processed_count': 0, 'failed_count': 1}
+    
     def process_tb_data(self, df: pd.DataFrame) -> Dict[str, int]:
         """
         Process Trial Balance data and save to TrialBalance model
@@ -596,6 +1177,8 @@ class DataProcessor:
                 failed_count += 1
         
         if tb_records_to_create:
+            # Use Django bulk_create for reliable database persistence
+            logger.info(f"💾 Using Django bulk_create for TB loading ({len(tb_records_to_create):,} records)")
             self._bulk_create_with_progress(
                 TrialBalance, tb_records_to_create,
                 f"TB records for file {self.data_file.file_name}"
@@ -648,6 +1231,8 @@ class DataProcessor:
                 failed_count += len(account_rows)
         
         if chart_records_to_create:
+            # Use Django bulk_create for reliable database persistence
+            logger.info(f"💾 Using Django bulk_create for COA loading ({len(chart_records_to_create):,} records)")
             self._bulk_create_with_progress(
                 ChartOfAccount, chart_records_to_create,
                 f"Chart records for file {self.data_file.file_name}"

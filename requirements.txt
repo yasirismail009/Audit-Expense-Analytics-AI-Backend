@@ -57,3 +57,7 @@ flower==2.0.1
 
 # JWT Authentication
 PyJWT==2.8.0
+
+# WebSocket support
+channels==4.0.0
+channels-redis==4.2.0
