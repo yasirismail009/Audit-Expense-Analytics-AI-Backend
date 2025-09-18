@@ -361,88 +361,374 @@ class FileUploadView(generics.CreateAPIView):
     
     def _start_background_file_processing(self, files, engagement, metadata, results):
         """
-        Start background processing for COA and GL files (non-blocking)
-        This method starts the background threads and returns immediately
+        Start single background thread for sequential processing:
+        - If COA file exists: Process COA first, then GL only if COA succeeds
+        - If NO COA file: Process GL directly
         """
         import threading
+        import tempfile
+        import os
         
-        # Process COA files in background thread
-        coa_files = []
-        for file_type, file_obj in files.items():
-            if file_type == 'chart_of_accounts':
-                coa_files.append(('COA', file_obj))
+        # Save files with real names to avoid "read of closed file" error
+        real_files = {}
+        temp_dir = os.path.join(settings.MEDIA_ROOT, 'temp_uploads')
+        os.makedirs(temp_dir, exist_ok=True)
         
-        for new_file_type, file_obj in coa_files:
-            try:
-                data_file = self._create_data_file_record(file_obj, engagement, new_file_type, metadata)
-                
-                # Check if this is a duplicate file
-                if data_file.status == 'COMPLETED' and data_file.file_hash == hashlib.sha256(file_obj.read()).hexdigest():
-                    file_obj.seek(0)
-                    result = {
-                        'file_type': new_file_type,
-                        'file_name': file_obj.name,
-                        'file_id': str(data_file.id),
-                        'engagement_id': engagement.engagement_id,
-                        'status': 'duplicate',
-                        'message': f'File with identical content already exists and has been processed for this engagement',
-                        'records_processed': data_file.processed_records,
-                        'total_records': data_file.total_records
-                    }
-                    results.append(result)
-                else:
-                    # Process COA with threading
-                    result = self._process_gl_coa_file_with_threading(data_file, file_obj, new_file_type)
-                    results.append(result)
+        try:
+            for file_type, file_obj in files.items():
+                if file_type in ['chart_of_accounts', 'gl_accounts']:
+                    # Save file with real name
+                    real_file_name = file_obj.name
+                    real_file_path = os.path.join(temp_dir, real_file_name)
                     
-            except Exception as e:
-                logger.error(f"Error starting COA background processing: {e}")
-                results.append({
+                    file_obj.seek(0)
+                    with open(real_file_path, 'wb') as f:
+                        for chunk in file_obj.chunks():
+                            f.write(chunk)
+                    
+                    real_files[file_type] = real_file_path
+                    logger.info(f"💾 Saved {file_type} file with real name: {real_file_name}")
+            
+            # Start single background thread for all processing (OUTSIDE the loop!)
+            if real_files:  # Only start thread if there are files to process
+                logger.info(f"🚀 Starting background processing for {len(real_files)} files")
+                logger.info(f"📁 Files to process: {list(real_files.keys())}")
+                
+                thread = threading.Thread(
+                    target=self._process_files_sequentially,
+                    args=(real_files, engagement, metadata, results)
+                )
+                thread.daemon = True
+                thread.start()
+                
+                logger.info("🚀 Single background thread started for sequential file processing")
+            else:
+                logger.info("ℹ️ No files to process in background")
+                
+        except Exception as e:
+            # Clean up temp files on error
+            for temp_path in real_files.values():
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+            logger.error(f"❌ Error setting up background processing: {e}")
+            raise e
+    
+    def _process_files_sequentially(self, real_files, engagement, metadata, results):
+        """
+        Process files in single background thread using temp file paths:
+        - If COA file exists: COA first, then GL only if COA succeeds
+        - If NO COA file: GL processes directly
+        """
+        import os
+        import hashlib
+        
+        coa_success = False
+        
+        try:
+            # Step 1: Process COA files if they exist
+            if 'chart_of_accounts' in real_files:
+                logger.info("🎯" + "="*60)
+                logger.info("🎯 STEP 1: PROCESSING CHART OF ACCOUNTS 🎯")
+                logger.info("🎯" + "="*60)
+                
+                real_file_path = real_files['chart_of_accounts']
+                file_name = os.path.basename(real_file_path)  # This is now the real file name
+                
+                try:
+                    # Create a mock file object for data file record creation
+                    class MockFile:
+                        def __init__(self, name, path):
+                            self.name = name
+                            self.path = path
+                            # Get file size
+                            self.size = os.path.getsize(path)
+                        
+                        def read(self):
+                            with open(self.path, 'rb') as f:
+                                return f.read()
+                        
+                        def seek(self, pos):
+                            pass
+                        
+                        def chunks(self, chunk_size=8192):
+                            """Generator that yields chunks of the file"""
+                            with open(self.path, 'rb') as f:
+                                while True:
+                                    chunk = f.read(chunk_size)
+                                    if not chunk:
+                                        break
+                                    yield chunk
+                    
+                    mock_file = MockFile(file_name, real_file_path)
+                    data_file = self._create_data_file_record(mock_file, engagement, 'COA', metadata)
+                
+                    # Check if this is a duplicate file
+                    file_hash = hashlib.sha256(mock_file.read()).hexdigest()
+                    if data_file.status == 'COMPLETED' and data_file.file_hash == file_hash:
+                        result = {
+                            'file_type': 'COA',
+                            'file_name': file_name,
+                            'file_id': str(data_file.id),
+                            'engagement_id': engagement.engagement_id,
+                            'status': 'duplicate',
+                            'message': f'File with identical content already exists and has been processed for this engagement',
+                            'records_processed': data_file.processed_records,
+                            'total_records': data_file.total_records
+                        }
+                        results.append(result)
+                        coa_success = True
+                        logger.info(f"✅ COA file already processed: {file_name}")
+                    else:
+                        # Process COA file using real file path
+                        logger.info(f"🔄 Processing COA file: {file_name}")
+                        result = self._process_coa_file_from_temp_path(data_file, real_file_path, file_name)
+                        results.append(result)
+                        
+                        # Check if COA processing was successful
+                        if result.get('status') in ['completed', 'partial']:
+                            coa_success = True
+                            logger.info(f"✅ COA processing successful: {file_name}")
+                        else:
+                            logger.error(f"❌ COA processing failed: {file_name}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error processing COA file {file_name}: {e}")
+                    results.append({
+                        'file_type': 'COA',
+                        'file_name': file_name,
+                        'status': 'failed',
+                        'error': str(e)
+                    })
+                    coa_success = False
+            else:
+                logger.info("ℹ️ No COA file provided - GL will process directly")
+                coa_success = True  # No COA file means we can process GL directly
+            
+            # Step 2: Process GL files
+            if 'gl_accounts' in real_files:
+                if coa_success:
+                    logger.info("🎯" + "="*60)
+                    logger.info("🎯 STEP 2: PROCESSING GL ACCOUNTS 🎯")
+                    logger.info("🎯" + "="*60)
+                    
+                    real_file_path = real_files['gl_accounts']
+                    file_name = os.path.basename(real_file_path)  # This is now the real file name
+                    
+                    try:
+                        # Create a mock file object for data file record creation
+                        class MockFile:
+                            def __init__(self, name, path):
+                                self.name = name
+                                self.path = path
+                                # Get file size
+                                self.size = os.path.getsize(path)
+                            
+                            def read(self):
+                                with open(self.path, 'rb') as f:
+                                    return f.read()
+                            
+                            def seek(self, pos):
+                                pass
+                            
+                            def chunks(self, chunk_size=8192):
+                                """Generator that yields chunks of the file"""
+                                with open(self.path, 'rb') as f:
+                                    while True:
+                                        chunk = f.read(chunk_size)
+                                        if not chunk:
+                                            break
+                                        yield chunk
+                        
+                        mock_file = MockFile(file_name, real_file_path)
+                        data_file = self._create_data_file_record(mock_file, engagement, 'GL', metadata)
+                
+                        # Check if this is a duplicate file
+                        file_hash = hashlib.sha256(mock_file.read()).hexdigest()
+                        if data_file.status == 'COMPLETED' and data_file.file_hash == file_hash:
+                            result = {
+                                'file_type': 'GL',
+                                'file_name': file_name,
+                                'file_id': str(data_file.id),
+                                'engagement_id': engagement.engagement_id,
+                                'status': 'duplicate',
+                                'message': f'File with identical content already exists and has been processed for this engagement',
+                                'records_processed': data_file.processed_records,
+                                'total_records': data_file.total_records
+                            }
+                            results.append(result)
+                            logger.info(f"✅ GL file already processed: {file_name}")
+                        else:
+                            # Process GL file using real file path
+                            logger.info(f"🔄 Processing GL file: {file_name}")
+                            result = self._process_gl_file_from_temp_path(data_file, real_file_path, file_name)
+                            results.append(result)
+                    
+                    except Exception as e:
+                        logger.error(f"❌ Error processing GL file {file_name}: {e}")
+                        results.append({
+                            'file_type': 'GL',
+                            'file_name': file_name,
+                            'status': 'failed',
+                            'error': str(e)
+                        })
+                else:
+                    logger.error("❌" + "="*60)
+                    logger.error("❌ GL PROCESSING SKIPPED - COA FAILED ❌")
+                    logger.error("❌" + "="*60)
+                    logger.error("COA processing failed, so GL processing is skipped to maintain data integrity")
+                    
+                    real_file_path = real_files['gl_accounts']
+                    file_name = os.path.basename(real_file_path)
+                    results.append({
+                        'file_type': 'GL',
+                        'file_name': file_name,
+                        'status': 'skipped',
+                        'message': 'GL processing skipped because COA processing failed'
+                    })
+            
+            logger.info("🎯" + "="*60)
+            logger.info("🎯 SINGLE THREAD PROCESSING COMPLETED! 🎯")
+            logger.info("🎯" + "="*60)
+            
+        finally:
+            # Clean up real files
+            logger.info(f"🧹 Starting cleanup of {len(real_files)} files")
+            for file_type, real_path in real_files.items():
+                try:
+                    if os.path.exists(real_path):
+                        os.unlink(real_path)
+                        logger.info(f"🗑️ Cleaned up {file_type} file: {real_path}")
+                    else:
+                        logger.warning(f"⚠️ File not found for cleanup: {real_path}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not clean up {file_type} file {real_path}: {e}")
+    
+    def _process_coa_file_from_temp_path(self, data_file, temp_file_path, file_name):
+        """Process COA file from temporary file path"""
+        try:
+            # Check if file is already being processed or completed
+            if data_file.status in ['PROCESSING', 'COMPLETED']:
+                logger.warning(f"⚠️ COA file {file_name} already processed or processing (status: {data_file.status})")
+                return {
                     'file_type': 'COA',
-                    'file_name': file_obj.name,
-                    'status': 'failed',
-                    'error': str(e)
-                })
-        
-        # Process GL files in background thread
-        gl_files = []
-        for file_type, file_obj in files.items():
-            if file_type == 'gl_accounts':
-                gl_files.append(('GL', file_obj))
-        
-        for new_file_type, file_obj in gl_files:
+                    'file_name': file_name,
+                    'file_id': str(data_file.id),
+                    'engagement_id': data_file.engagement.engagement_id,
+                    'status': 'skipped',
+                    'message': f'File already processed (status: {data_file.status})'
+                }
+            
+            logger.info(f"🔄 Starting COA processing for file: {file_name}")
+            logger.info(f"📁 File path: {temp_file_path}")
+            logger.info(f"📊 DataFile ID: {data_file.id}")
+            logger.info(f"🎯 Engagement ID: {data_file.engagement.engagement_id}")
+            
+            # Mark as processing to prevent duplicate processing
+            data_file.status = 'PROCESSING'
+            data_file.save()
+            
+            # Since we're already in a background thread, process synchronously
+            from .file_processing_utils import DataProcessor
+            processor = DataProcessor(data_file)
+            result = processor.process_chart_data_from_file(temp_file_path)
+            
+            logger.info(f"✅ COA processing completed for file: {file_name}")
+            logger.info(f"📊 Processed: {result['processed_count']}, Failed: {result['failed_count']}")
+            
+            # Update data file with results
+            data_file.status = 'COMPLETED' if result['failed_count'] == 0 else 'PARTIAL'
+            data_file.total_records = result['processed_count'] + result['failed_count']
+            data_file.processed_records = result['processed_count']
+            data_file.failed_records = result['failed_count']
+            data_file.processed_at = timezone.now()
+            data_file.save()
+            
+            return {
+                'file_type': 'COA',
+                'file_name': file_name,
+                'file_id': str(data_file.id),
+                'engagement_id': data_file.engagement.engagement_id,
+                'status': 'completed' if result['failed_count'] == 0 else 'partial',
+                'processed_count': result['processed_count'],
+                'failed_count': result['failed_count'],
+                'message': f"COA processing completed: {result['processed_count']} records processed, {result['failed_count']} failed"
+            }
+        except Exception as e:
+            logger.error(f"❌ Error processing COA file from temp path: {e}")
+            data_file.status = 'FAILED'
+            data_file.error_message = str(e)
+            data_file.processed_at = timezone.now()
+            data_file.save()
+            return {
+                'file_type': 'COA',
+                'file_name': file_name,
+                'status': 'failed',
+                'error': str(e)
+            }
+    
+    def _process_gl_file_from_temp_path(self, data_file, temp_file_path, file_name):
+        """Process GL file from temporary file path"""
+        try:
+            logger.info(f"🔄 Starting GL processing for file: {file_name}")
+            logger.info(f"📁 File path: {temp_file_path}")
+            logger.info(f"📊 DataFile ID: {data_file.id}")
+            logger.info(f"🎯 Engagement ID: {data_file.engagement.engagement_id}")
+            logger.info(f"🔧 Processing method: _process_gl_file_from_temp_path (Sequential)")
+            
+            # Since we're already in a background thread, process synchronously
+            from .file_processing_utils import DataProcessor
+            processor = DataProcessor(data_file)
+            result = processor.process_gl_data_chunked(temp_file_path, chunk_size=25000)
+            
+            # Update data file with results
+            data_file.status = 'COMPLETED' if result['failed_count'] == 0 else 'PARTIAL'
+            data_file.total_records = result['processed_count'] + result['failed_count']
+            data_file.processed_records = result['processed_count']
+            data_file.failed_records = result['failed_count']
+            data_file.processed_at = timezone.now()
+            data_file.save()
+            
+            # Trigger completeness test in Celery after GL processing completion
             try:
-                data_file = self._create_data_file_record(file_obj, engagement, new_file_type, metadata)
+                from .tasks import run_gl_completeness_analysis
+                from django.db import connection
                 
-                # Check if this is a duplicate file
-                if data_file.status == 'COMPLETED' and data_file.file_hash == hashlib.sha256(file_obj.read()).hexdigest():
-                    file_obj.seek(0)
-                    result = {
-                        'file_type': new_file_type,
-                        'file_name': file_obj.name,
-                        'file_id': str(data_file.id),
-                        'engagement_id': engagement.engagement_id,
-                        'status': 'duplicate',
-                        'message': f'File with identical content already exists and has been processed for this engagement',
-                        'records_processed': data_file.processed_records,
-                        'total_records': data_file.total_records
-                    }
-                    results.append(result)
-                else:
-                    # Process GL with threading (after COA)
-                    result = self._process_gl_coa_file_with_threading(data_file, file_obj, new_file_type)
-                    results.append(result)
-                    
+                # Ensure database connection is closed before task execution
+                connection.close()
+                
+                completeness_task = run_gl_completeness_analysis.delay(str(data_file.id))
+                logger.info(f"✅ Completeness test queued in Celery: {completeness_task.id}")
+                logger.info(f"📊 GL processing completed, starting completeness analysis for file: {file_name}")
+                logger.info(f"🔗 Task details: {completeness_task.id} - {completeness_task.state}")
             except Exception as e:
-                logger.error(f"Error starting GL background processing: {e}")
-                results.append({
-                    'file_type': 'GL',
-                    'file_name': file_obj.name,
-                    'status': 'failed',
-                    'error': str(e)
-                })
-        
-        logger.info("🚀 Background processing started for COA and GL files")
+                logger.error(f"❌ Could not queue completeness analysis: {e}")
+                import traceback
+                logger.error(f"❌ Traceback: {traceback.format_exc()}")
+            
+            return {
+                'file_type': 'GL',
+                'file_name': file_name,
+                'file_id': str(data_file.id),
+                'engagement_id': data_file.engagement.engagement_id,
+                'status': 'completed' if result['failed_count'] == 0 else 'partial',
+                'processed_count': result['processed_count'],
+                'failed_count': result['failed_count'],
+                'message': f"GL processing completed: {result['processed_count']} records processed, {result['failed_count']} failed"
+            }
+        except Exception as e:
+            logger.error(f"❌ Error processing GL file from temp path: {e}")
+            data_file.status = 'FAILED'
+            data_file.error_message = str(e)
+            data_file.processed_at = timezone.now()
+            data_file.save()
+            return {
+                'file_type': 'GL',
+                'file_name': file_name,
+                'status': 'failed',
+                'error': str(e)
+            }
     
     def _process_gl_file_with_threading(self, data_file: DataFile, file_obj):
         """
@@ -530,6 +816,7 @@ class FileUploadView(generics.CreateAPIView):
         """Background thread for processing large GL files"""
         try:
             logger.info(f"Background thread started for GL file {data_file.file_name}")
+            logger.info(f"🔧 Processing method: _process_gl_background_thread (OLD METHOD)")
             
             # Process using optimized chunked processing
             processor = DataProcessor(data_file)
@@ -581,18 +868,27 @@ class FileUploadView(generics.CreateAPIView):
             except Exception as cleanup_error:
                 logger.error(f"❌ Error cleaning up engagement temp files: {cleanup_error}")
     
-    def _process_gl_coa_file_with_threading(self, data_file: DataFile, file_obj, file_type: str):
+    def _process_gl_coa_file_with_threading(self, data_file: DataFile, file_obj_or_path, file_type: str):
         """
         Process GL or COA files with intelligent threading strategy:
         - Small files (< 10k rows): Process synchronously
         - Large files (>= 10k rows): Process in background thread
         - COA files are processed first, then GL files
+        - Can handle both file objects and file paths
         """
         try:
-            # Check file size first
-            file_obj.seek(0)
-            file_reader = FileReader()
-            df = file_reader.read_file(file_obj)
+            # Handle both file objects and file paths
+            if isinstance(file_obj_or_path, str):
+                # It's a file path (from temp file)
+                file_path = file_obj_or_path
+                file_reader = FileReader()
+                df = file_reader.read_file(file_path)
+            else:
+                # It's a file object
+                file_obj = file_obj_or_path
+                file_obj.seek(0)
+                file_reader = FileReader()
+                df = file_reader.read_file(file_obj)
             
             if df is None or df.empty:
                 raise Exception("File is empty or could not be read")
@@ -602,10 +898,10 @@ class FileUploadView(generics.CreateAPIView):
             
             if row_count < 10000:
                 # Small file: process synchronously
-                return self._process_file_sync(data_file, file_obj, file_type)
+                return self._process_file_sync(data_file, file_obj_or_path, file_type)
             else:
                 # Large file: process in background thread
-                return self._process_gl_coa_large_file_threaded(data_file, file_obj, row_count, file_type)
+                return self._process_gl_coa_large_file_threaded(data_file, file_obj_or_path, row_count, file_type)
                 
         except Exception as e:
             data_file.status = 'FAILED'
@@ -614,21 +910,31 @@ class FileUploadView(generics.CreateAPIView):
             data_file.save()
             raise e
     
-    def _process_gl_coa_large_file_threaded(self, data_file: DataFile, file_obj, row_count: int, file_type: str):
+    def _process_gl_coa_large_file_threaded(self, data_file: DataFile, file_obj_or_path, row_count: int, file_type: str):
         """
         Process large GL or COA files in background thread with temp file management
         🗂️ TEMP STORAGE: Large files are saved to temp due to size and async processing
         🗑️ AUTO CLEANUP: Temp files are automatically deleted after processing completion
+        - Can handle both file objects and file paths
         """
         try:
-            # Save file to temporary location
-            file_extension = file_obj.name.split('.')[-1]
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_extension}')
-            
-            file_obj.seek(0)
-            for chunk in file_obj.chunks():
-                temp_file.write(chunk)
-            temp_file.close()
+            # Handle both file objects and file paths
+            if isinstance(file_obj_or_path, str):
+                # It's already a file path (from temp file)
+                temp_file_path = file_obj_or_path
+                logger.info(f"Using existing temp file path: {temp_file_path}")
+            else:
+                # It's a file object - save to temporary location
+                file_obj = file_obj_or_path
+                file_extension = file_obj.name.split('.')[-1]
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_extension}')
+                
+                file_obj.seek(0)
+                for chunk in file_obj.chunks():
+                    temp_file.write(chunk)
+                temp_file.close()
+                temp_file_path = temp_file.name
+                logger.info(f"Created new temp file: {temp_file_path}")
             
             # Update data file status
             data_file.status = 'PROCESSING'
@@ -638,7 +944,7 @@ class FileUploadView(generics.CreateAPIView):
             # Start background thread for processing
             thread = threading.Thread(
                 target=self._process_gl_coa_background_thread,
-                args=(data_file, temp_file.name, row_count, file_type)
+                args=(data_file, temp_file_path, row_count, file_type)
             )
             thread.daemon = True
             thread.start()
@@ -656,9 +962,9 @@ class FileUploadView(generics.CreateAPIView):
             }
             
         except Exception as e:
-            # Clean up temp file on error
+            # Clean up temp file on error (only if we created it)
             try:
-                if 'temp_file' in locals():
+                if not isinstance(file_obj_or_path, str) and 'temp_file' in locals():
                     os.unlink(temp_file.name)
             except:
                 pass
@@ -671,6 +977,7 @@ class FileUploadView(generics.CreateAPIView):
             
             if file_type == 'COA':
                 # Process COA file
+                logger.info(f"🎯 Starting COA background processing for file {data_file.file_name}")
                 processor = DataProcessor(data_file)
                 result = processor.process_chart_data_from_file(file_path)
                 
@@ -682,7 +989,13 @@ class FileUploadView(generics.CreateAPIView):
                 data_file.processed_at = timezone.now()
                 data_file.save()
                 
-                logger.info(f"Background COA processing completed for file {data_file.file_name}: {result}")
+                logger.info("🎯" + "="*60)
+                logger.info(f"🎯 COA BACKGROUND PROCESSING COMPLETED! 🎯")
+                logger.info(f"📊 File: {data_file.file_name}")
+                logger.info(f"📊 Records processed: {result['processed_count']}")
+                logger.info(f"📊 Records failed: {result['failed_count']}")
+                logger.info(f"📊 Status: {data_file.status}")
+                logger.info("🎯" + "="*60)
                 
             elif file_type == 'GL':
                 # Process GL file using optimized chunked processing

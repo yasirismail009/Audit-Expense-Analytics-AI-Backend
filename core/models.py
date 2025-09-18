@@ -7,6 +7,9 @@ from django.core.cache import cache
 from django.db.models import JSONField
 import json
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # UTILITY CLASSES FOR DATA PARSING
@@ -672,8 +675,8 @@ class GLAccount(BaseModel):
                 self.account_code = account_code_str
             
             # Ensure account code is numeric or alphanumeric without decimals
-            if not re.match(r'^[A-Za-z0-9]+$', account_code_str):
-                raise ValidationError({'account_code': 'Account code must be alphanumeric without special characters'})
+            if not re.match(r'^[A-Za-z0-9_]+$', account_code_str):
+                raise ValidationError({'account_code': 'Account code must be alphanumeric with underscores allowed'})
     
     def save(self, *args, **kwargs):
         """Auto-populate legacy fields from engagement"""
@@ -920,8 +923,8 @@ class SAPGLPosting(BaseModel):
                 gl_account_str = gl_account_str.replace(',', '')
                 self.gl_account = gl_account_str
             
-            if not re.match(r'^[A-Za-z0-9]+$', gl_account_str):
-                raise ValidationError({'gl_account': 'GL Account must be alphanumeric without special characters'})
+            if not re.match(r'^[A-Za-z0-9_]+$', gl_account_str):
+                raise ValidationError({'gl_account': 'GL Account must be alphanumeric with underscores allowed'})
         
         # Validate document number
         if self.document_number:
@@ -1113,8 +1116,8 @@ class TrialBalance(BaseModel):
                 gl_account_str = gl_account_str.replace(',', '')
                 self.gl_account = gl_account_str
             
-            if not re.match(r'^[A-Za-z0-9]+$', gl_account_str):
-                raise ValidationError({'gl_account': 'GL Account must be alphanumeric without special characters'})
+            if not re.match(r'^[A-Za-z0-9_]+$', gl_account_str):
+                raise ValidationError({'gl_account': 'GL Account must be alphanumeric with underscores allowed'})
     
     def save(self, *args, **kwargs):
         """Validate and auto-link to GL Account master record"""
@@ -1223,7 +1226,7 @@ class ChartOfAccount(BaseModel):
     
     # Account information - NO DECIMAL ACCOUNT NUMBERS (REQUIRED)
     account = models.CharField(
-        max_length=10, 
+        max_length=20, 
         help_text='Account Code (no decimal values allowed)'
     )
     
@@ -1255,18 +1258,20 @@ class ChartOfAccount(BaseModel):
     
     # Period data
     fiscal_year = models.IntegerField(null=True, blank=True, help_text='Fiscal Year')
-    q1_amount = models.DecimalField(max_digits=30, decimal_places=10, null=True, blank=True, help_text='Q1 Amount')
-    adj_reclas = models.DecimalField(max_digits=30, decimal_places=10, null=True, blank=True, help_text='Adjustments/Reclassifications')
-    fin_q1_amount = models.DecimalField(max_digits=30, decimal_places=10, null=True, blank=True, help_text='Final Q1 Amount')
+    q1_amount = models.DecimalField(max_digits=30, decimal_places=15, null=True, blank=True, help_text='Q1 Amount')
+    adj_reclas = models.DecimalField(max_digits=30, decimal_places=15, null=True, blank=True, help_text='Adjustments/Reclassifications')
+    fin_q1_amount = models.DecimalField(max_digits=30, decimal_places=15, null=True, blank=True, help_text='Final Q1 Amount')
     
     class Meta:
         db_table = 'chart_of_accounts'
         ordering = ['type', 'sub_type', 'sub_sub_type', 'account']
-        unique_together = [['data_file', 'account']]  # One COA record per account per file
+        # unique_together = [['account', 'cost_center']]  # Removed to allow all records to be saved
         indexes = [
             models.Index(fields=['data_file', 'account']),
+            models.Index(fields=['account', 'cost_center']),  # For unique constraint
             models.Index(fields=['type', 'sub_type', 'sub_sub_type']),
             models.Index(fields=['account']),
+            models.Index(fields=['company']),
             models.Index(fields=['gl_account_ref']),
             models.Index(fields=['type']),
             models.Index(fields=['sub_type']),
@@ -1301,8 +1306,26 @@ class ChartOfAccount(BaseModel):
                 account_str = account_str.replace(',', '')
                 self.account = account_str
             
-            if not re.match(r'^[A-Za-z0-9]+$', account_str):
-                raise ValidationError({'account': 'Account code must be alphanumeric without special characters'})
+            # Clean the account code to make it alphanumeric with underscores
+            # Convert spaces, hyphens, and other special characters to underscores
+            cleaned_account = re.sub(r'[^A-Za-z0-9]', '_', account_str)
+            # Remove multiple consecutive underscores
+            cleaned_account = re.sub(r'_+', '_', cleaned_account)
+            # Remove leading/trailing underscores
+            cleaned_account = cleaned_account.strip('_')
+            # Ensure it's not empty after cleaning
+            if not cleaned_account:
+                cleaned_account = 'UNKNOWN_ACCOUNT'
+            
+            # Only update if the cleaned version is different
+            if cleaned_account != account_str:
+                self.account = cleaned_account
+                account_str = cleaned_account
+            
+            # Now validate the cleaned account code - allow underscores for business naming
+            if not re.match(r'^[A-Za-z0-9_]+$', account_str):
+                logger.error(f"❌ Account validation failed for: '{account_str}' (original: '{self.account}')")
+                raise ValidationError({'account': f'Account code must be alphanumeric with underscores allowed. Got: {account_str}'})
         
         # Validate hierarchical structure
         if not self.type:
@@ -1762,6 +1785,14 @@ class AICompletenessModel(BaseModel):
         ('SCORE_ESTIMATOR', 'Completeness Score Estimator'),
         ('STEP_PREDICTOR', 'Individual Step Success Predictor'),
         ('CLIENT_PATTERN_LEARNER', 'Client-Specific Completeness Pattern Learning'),
+        # GL Prediction Model Types
+        ('TRANSACTION_VOLUME_PREDICTOR', 'Transaction Volume Predictor'),
+        ('UNUSUAL_ACTIVITY_DETECTOR', 'Unusual Activity Detector'),
+        ('AMOUNT_PATTERN_ANALYZER', 'Amount Pattern Analyzer'),
+        ('USER_BEHAVIOR_CLASSIFIER', 'User Behavior Classifier'),
+        ('ACCOUNT_USAGE_PREDICTOR', 'Account Usage Predictor'),
+        ('SEASONAL_TREND_FORECASTER', 'Seasonal Trend Forecaster'),
+        ('RISK_PATTERN_DETECTOR', 'Risk Pattern Detector'),
     ]
     model_type = models.CharField(max_length=30, choices=MODEL_TYPE_CHOICES, help_text='Type of AI model')
     

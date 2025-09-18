@@ -5,6 +5,7 @@ File processing utility functions for efficient and reusable operations
 import csv
 import io
 import logging
+import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Any, List, Tuple, Optional
@@ -86,18 +87,18 @@ class FileReader:
                         raise Exception(f"Could not read xlsb file: {e}")
                 elif file_extension == 'xls':
                     try:
-                        return pd.read_excel(file_obj, engine='xlrd')
+                        return pd.read_excel(file_obj, engine='xlrd', header=0)
                     except Exception as e:
                         logger.error(f"xlrd failed for xls file: {e}")
                         raise Exception(f"Could not read xls file: {e}")
                 else:
                     # Try openpyxl first, fallback to xlrd
                     try:
-                        return pd.read_excel(file_obj, engine='openpyxl')
+                        return pd.read_excel(file_obj, engine='openpyxl', header=0)
                     except Exception as e:
                         logger.warning(f"openpyxl failed for {file_extension} file: {e}")
                         try:
-                            return pd.read_excel(file_obj, engine='xlrd')
+                            return pd.read_excel(file_obj, engine='xlrd', header=0)
                         except Exception as e2:
                             logger.error(f"xlrd also failed for {file_extension} file: {e2}")
                             raise Exception(f"Could not read {file_extension} file with openpyxl or xlrd: {e}, {e2}")
@@ -111,18 +112,18 @@ class FileReader:
                         raise Exception(f"Could not read xlsb file: {e}")
                 elif file_extension == 'xls':
                     try:
-                        return pd.read_excel(file_obj, engine='xlrd')
+                        return pd.read_excel(file_obj, engine='xlrd', header=0)
                     except Exception as e:
                         logger.error(f"xlrd failed for xls file: {e}")
                         raise Exception(f"Could not read xls file: {e}")
                 else:
                     # Try openpyxl first, fallback to xlrd
                     try:
-                        return pd.read_excel(file_obj, engine='openpyxl')
+                        return pd.read_excel(file_obj, engine='openpyxl', header=0)
                     except Exception as e:
                         logger.warning(f"openpyxl failed for {file_extension} file: {e}")
                         try:
-                            return pd.read_excel(file_obj, engine='xlrd')
+                            return pd.read_excel(file_obj, engine='xlrd', header=0)
                         except Exception as e2:
                             logger.error(f"xlrd also failed for {file_extension} file: {e2}")
                             raise Exception(f"Could not read {file_extension} file with openpyxl or xlrd: {e}, {e2}")
@@ -134,10 +135,10 @@ class FileReader:
             # Method 1: Try pandas with openpyxl first (most reliable)
             logger.info("🔄 Method 1: pandas + openpyxl")
             if isinstance(file_obj, str):
-                df_full = pd.read_excel(file_obj, engine='openpyxl')
+                df_full = pd.read_excel(file_obj, engine='openpyxl', header=0)
             else:
                 file_obj.seek(0)
-                df_full = pd.read_excel(file_obj, engine='openpyxl')
+                df_full = pd.read_excel(file_obj, engine='openpyxl', header=0)
             
             logger.info(f"✅ Method 1 success: {len(df_full)} rows")
             
@@ -204,10 +205,10 @@ class FileReader:
                 try:
                     logger.info("🔄 Method 3: pandas + xlrd")
                     if isinstance(file_obj, str):
-                        df_full = pd.read_excel(file_obj, engine='xlrd')
+                        df_full = pd.read_excel(file_obj, engine='xlrd', header=0)
                     else:
                         file_obj.seek(0)
-                        df_full = pd.read_excel(file_obj, engine='xlrd')
+                        df_full = pd.read_excel(file_obj, engine='xlrd', header=0)
                     
                     logger.info(f"✅ Method 3 success: {len(df_full)} rows")
                     
@@ -270,6 +271,7 @@ class DataParser:
     def parse_decimal(value: Any) -> Decimal:
         """
         Parse decimal value from string, handling parentheses for negative values
+        and limiting decimal places to prevent validation errors
         
         Args:
             value: Value to parse
@@ -294,11 +296,18 @@ class DataParser:
         try:
             decimal_value = Decimal(cleaned_value)
             
+            # Limit decimal places to 15 to prevent validation errors
+            # Round to 15 decimal places if more are present
+            if decimal_value.as_tuple().exponent is not None and abs(decimal_value.as_tuple().exponent) > 15:
+                # Round to 15 decimal places
+                decimal_value = decimal_value.quantize(Decimal('0.' + '0' * 15))
+            
             # Normalize to remove unnecessary trailing zeros but preserve actual precision
             # This will convert 1000.000000 to 1000 but keep 1000.50 as 1000.50
             return decimal_value.normalize()
             
-        except (InvalidOperation, ValueError):
+        except (InvalidOperation, ValueError) as e:
+            logger.warning(f"Could not parse decimal value '{value}': {e}")
             return Decimal('0')
     
     @staticmethod
@@ -1230,22 +1239,53 @@ class DataProcessor:
                 logger.error(f"Error processing account group {account_code}: {e}")
                 failed_count += len(account_rows)
         
+        # Use simple bulk_create like TB processing
         if chart_records_to_create:
-            # Use Django bulk_create for reliable database persistence
             logger.info(f"💾 Using Django bulk_create for COA loading ({len(chart_records_to_create):,} records)")
-            self._bulk_create_with_progress(
-                ChartOfAccount, chart_records_to_create,
-                f"Chart records for file {self.data_file.file_name}"
-            )
+            try:
+                # Use the same approach as TB processing
+                self._bulk_create_with_progress(
+                    ChartOfAccount, chart_records_to_create,
+                    f"COA records for file {self.data_file.file_name}"
+                )
+                logger.info(f"✅ Successfully processed {len(chart_records_to_create)} COA records using bulk_create")
+            except Exception as e:
+                logger.error(f"❌ Error in bulk_create operations: {e}")
+                # Fallback to individual save
+                logger.info("🔄 Falling back to individual save operations")
+                
+                for record in chart_records_to_create:
+                    try:
+                        record.save()
+                        logger.debug(f"✅ Saved COA record for account {record.account}")
+                    except Exception as individual_error:
+                        logger.error(f"❌ Error saving individual record for account {record.account}: {individual_error}")
+                        failed_count += 1
         
         # Log final processing summary
-        logger.info(f"Chart of Accounts Processing Summary:")
-        logger.info(f"  - Original DataFrame rows: {len(df)}")
-        logger.info(f"  - Cleaned DataFrame rows: {len(df_cleaned)}")
-        logger.info(f"  - Unique accounts: {len(account_groups)}")
-        logger.info(f"  - Records created: {processed_count}")
-        logger.info(f"  - Records failed: {failed_count}")
-        logger.info(f"  - Success rate: {(processed_count / (processed_count + failed_count) * 100):.1f}%" if (processed_count + failed_count) > 0 else "N/A")
+        logger.info("🎯" + "="*60)
+        logger.info("🎯 CHART OF ACCOUNTS PROCESSING COMPLETED! 🎯")
+        logger.info("🎯" + "="*60)
+        logger.info(f"📊 Original DataFrame rows: {len(df)}")
+        logger.info(f"📊 Cleaned DataFrame rows: {len(df_cleaned)}")
+        logger.info(f"📊 Unique accounts: {len(account_groups)}")
+        logger.info(f"📊 Records created: {processed_count}")
+        logger.info(f"📊 Records failed: {failed_count}")
+        logger.info(f"📊 Success rate: {(processed_count / (processed_count + failed_count) * 100):.1f}%" if (processed_count + failed_count) > 0 else "N/A")
+        
+        # Verify records in database
+        try:
+            from .models import ChartOfAccount
+            db_count = ChartOfAccount.objects.filter(data_file=self.data_file).count()
+            logger.info(f"🔍 Database verification: {db_count} COA records found in database")
+            if db_count != processed_count:
+                logger.warning(f"⚠️ Database mismatch: Expected {processed_count}, found {db_count}")
+            else:
+                logger.info(f"✅ Database verification successful: All {processed_count} records saved!")
+        except Exception as verify_error:
+            logger.error(f"❌ Database verification failed: {verify_error}")
+        
+        logger.info("🎯" + "="*60)
         
         return {'processed_count': processed_count, 'failed_count': failed_count}
     
@@ -1271,7 +1311,9 @@ class DataProcessor:
                         account_groups[account] = []
                     account_groups[account].append(row)
                 else:
-                    logger.warning(f"Chart of Accounts: Skipped row {index} - no account code found")
+                    # Debug: Log the row data to see what's available
+                    available_columns = [col for col in row.index if pd.notna(row.get(col)) and str(row.get(col)).strip()]
+                    logger.warning(f"Chart of Accounts: Skipped row {index} - no account code found. Available columns: {available_columns[:5]}...")
                     
             except Exception as e:
                 logger.error(f"Error grouping row {index}: {e}")
@@ -1280,7 +1322,84 @@ class DataProcessor:
     
     def _extract_account_code(self, row: pd.Series) -> str:
         """Extract account code from row using flexible column mapping"""
-        # Try multiple possible account field names
+        # Try multiple possible account field names - prioritize 'Account' field
+        possible_names = [
+            'Account', 'account', 'ACCOUNT',
+            'G/L acct', 'G/L Acct', 'GL Account', 'GL Account Code',
+            'G/L Acct Long Text', 'G/L acct long text', 'GL Account Long Text',
+            'Account Code', 'account_code', 'Account_Code'
+        ]
+        
+        for name in possible_names:
+            if name in row.index:
+                value = str(row.get(name, '')).strip()
+                if value and value != 'nan' and value != 'None' and value != 'null' and value != '':
+                    # Special handling for G/L account format (e.g., "124000/1003" -> "124000")
+                    if name in ['G/L acct', 'G/L Acct', 'GL Account', 'GL Account Code'] and '/' in value:
+                        # Split by slash and take the first part (account code)
+                        account_part = value.split('/')[0].strip()
+                        if account_part:
+                            return self._clean_account_code(account_part)
+                    
+                    return self._clean_account_code(value)
+        
+        # Debug: If no account code found, log what columns are available
+        available_cols = [col for col in row.index if pd.notna(row.get(col)) and str(row.get(col)).strip()]
+        logger.debug(f"No account code found. Available columns: {available_cols}")
+        return ''
+    
+    def _clean_account_code(self, account_code: str) -> str:
+        """
+        Clean account code to make it alphanumeric only for database storage
+        
+        Args:
+            account_code: Raw account code from data
+            
+        Returns:
+            str: Cleaned account code suitable for database storage
+        """
+        if not account_code:
+            return ''
+        
+        # Convert to string and strip whitespace
+        cleaned = str(account_code).strip()
+        
+        # Handle decimal representations of whole numbers (e.g., "110000.0" → "110000")
+        if '.' in cleaned:
+            try:
+                float_val = float(cleaned)
+                if float_val.is_integer():
+                    cleaned = str(int(float_val))
+            except ValueError:
+                pass
+        
+        # Remove commas if present (thousands separators)
+        cleaned = cleaned.replace(',', '')
+        
+        # For Chart of Accounts, we need to handle descriptive names
+        # Convert spaces, hyphens, and other special characters to underscores
+        # This preserves the meaning while making it alphanumeric
+        cleaned = re.sub(r'[^A-Za-z0-9]', '_', cleaned)
+        
+        # Remove multiple consecutive underscores
+        cleaned = re.sub(r'_+', '_', cleaned)
+        
+        # Remove leading/trailing underscores
+        cleaned = cleaned.strip('_')
+        
+        # Ensure it's not empty after cleaning
+        if not cleaned:
+            cleaned = 'UNKNOWN_ACCOUNT'
+        
+        # Limit length to database field size (20 characters)
+        if len(cleaned) > 20:
+            cleaned = cleaned[:20]
+            logger.warning(f"Account code truncated to 20 characters: {cleaned}")
+        
+        return cleaned
+    
+    def _get_original_account_name(self, row: pd.Series) -> str:
+        """Get the original account name before cleaning"""
         possible_names = [
             'Account', 'account', 'ACCOUNT',
             'G/L Acct Long Text', 'G/L acct long text', 'GL Account Long Text',
@@ -1342,6 +1461,16 @@ class DataProcessor:
             'Description', 'description', 'DESCRIPTION'
         ])
         
+        # Extract GL Account field (e.g., "124000/1003")
+        gl_account = self._extract_field_value(first_row, [
+            'G/L acct', 'G/L Acct', 'GL Account', 'GL Account Code', 'gl_account'
+        ])
+        
+        # Extract Code field (e.g., "1003")
+        code = self._extract_field_value(first_row, [
+            'Code', 'code', 'CODE'
+        ])
+        
         # Process each row as a separate sub-sub type
         for row in account_rows:
             try:
@@ -1368,41 +1497,92 @@ class DataProcessor:
                     'Fin Q1 2025', 'Final Q1', 'final_q1', 'Final_Q1', 'Final Q1 Amount', 'fin_q1_amount'
                 ])
                 
-                # Create ChartOfAccount record
-                chart_record = ChartOfAccount(
-                    data_file=self.data_file,
-                    account=account_code,
-                    type=type_field or 'Unknown',
-                    sub_type=sub_type or 'Unknown',
-                    sub_sub_type=sub_sub_type,
-                    gl_account=account_code,  # Use account code as GL account
-                    gl_account_ref=None,  # Will be created if needed
-                    company=company,
-                    branch=branch,
-                    cost_center=cost_center,
-                    code=account_code,
-                    gl_account_long_text=gl_account_long_text,
-                    ref_to_fs=self._extract_field_value(row, [
-                        'REF to FS', 'Ref to FS', 'ref_to_fs', 'Ref_To_FS',
-                        'Reference to FS', 'reference_to_fs', 'Reference_To_FS'
-                    ]),
-                    financial_statement=self._extract_field_value(row, [
-                        'F.S', 'Financial Statement', 'financial_statement', 'Financial_Statement',
-                        'FS', 'fs', 'FS Category', 'fs_category', 'FS_Category'
-                    ]),
-                    ref_to_note=self._extract_field_value(row, [
-                        'Ref to Note', 'ref_to_note', 'Ref_To_Note',
-                        'Reference to Note', 'reference_to_note', 'Reference_To_Note'
-                    ]),
-                    fiscal_year=self._extract_int_value(row, [
-                        'FY 2024', 'Fiscal Year', 'fiscal_year', 'Fiscal_Year', 'Year', 'year'
-                    ]) or 2024,
-                    q1_amount=q1_amount,
-                    adj_reclas=adj_reclas,
-                    fin_q1_amount=fin_q1_amount
-                )
+                # Extract FY 2024 amount
+                fy_2024_amount = self._extract_decimal_value(row, [
+                    'FY 2024', 'Fiscal Year 2024', 'fy_2024', 'FY_2024'
+                ])
                 
-                records.append(chart_record)
+                # Create ChartOfAccount record with validation
+                try:
+                    # Store original account name in long text if different from cleaned code
+                    original_account_name = self._get_original_account_name(account_rows[0])
+                    if original_account_name and original_account_name != account_code:
+                        display_name = f"{original_account_name} ({account_code})"
+                    else:
+                        display_name = gl_account_long_text or account_code
+                    
+                    # Add FY 2024 amount information to the display name if available
+                    if fy_2024_amount and fy_2024_amount != Decimal('0'):
+                        display_name += f" [FY2024: {fy_2024_amount:,.2f}]"
+                    
+                    # Create ChartOfAccount record for bulk processing
+                    chart_record = ChartOfAccount(
+                        data_file=self.data_file,
+                        account=account_code,  # Cleaned account code
+                        type=type_field or 'Unknown',
+                        sub_type=sub_type or 'Unknown',
+                        sub_sub_type=sub_sub_type,
+                        gl_account=gl_account or account_code,  # Use extracted GL account or cleaned account code
+                        gl_account_ref=None,  # Will be created if needed
+                        company=company or 'DEFAULT',  # Provide default company
+                        branch=branch,
+                        cost_center=cost_center or 'DEFAULT',  # Provide default cost center
+                        code=code or account_code,  # Use extracted code or cleaned account code
+                        gl_account_long_text=display_name,  # Include original name for reference
+                        ref_to_fs=self._extract_field_value(row, [
+                            'REF to FS', 'Ref to FS', 'ref_to_fs', 'Ref_To_FS',
+                            'Reference to FS', 'reference_to_fs', 'Reference_To_FS'
+                        ]),
+                        financial_statement=self._extract_field_value(row, [
+                            'F.S', 'Financial Statement', 'financial_statement', 'Financial_Statement',
+                            'FS', 'fs', 'FS Category', 'fs_category', 'FS_Category'
+                        ]),
+                        ref_to_note=self._extract_field_value(row, [
+                            'Ref to Note', 'ref_to_note', 'Ref_To_Note',
+                            'Reference to Note', 'reference_to_note', 'Reference_To_Note'
+                        ]),
+                        fiscal_year=self._extract_int_value(row, [
+                            'FY 2024', 'Fiscal Year', 'fiscal_year', 'Fiscal_Year', 'Year', 'year'
+                        ]) or 2024,
+                        q1_amount=q1_amount,
+                        adj_reclas=adj_reclas,
+                        fin_q1_amount=fin_q1_amount
+                    )
+                    
+                    # Validate the record before adding to list
+                    chart_record.clean()
+                    records.append(chart_record)
+                    
+                except Exception as validation_error:
+                    logger.error(f"❌ Validation error for account {account_code}, sub-sub-type {sub_sub_type}: {validation_error}")
+                    # Create a minimal valid record as fallback
+                    try:
+                        # Get original account name for fallback
+                        original_name = self._get_original_account_name(account_rows[0])
+                        fallback_display_name = f"{original_name} ({account_code})" if original_name else f"Account {account_code}"
+                        
+                        fallback_record = ChartOfAccount(
+                            data_file=self.data_file,
+                            account=account_code,  # Cleaned account code
+                            type=type_field or 'Unknown',
+                            sub_type=sub_type or 'Unknown',
+                            sub_sub_type=sub_sub_type,
+                            gl_account=gl_account or account_code,  # Use extracted GL account or cleaned account code
+                            company=company or 'DEFAULT',  # Provide default company
+                            branch=branch,
+                            cost_center=cost_center or 'DEFAULT',  # Provide default cost center
+                            code=code or account_code,  # Use extracted code or cleaned account code
+                            gl_account_long_text=fallback_display_name,
+                            fiscal_year=2024,
+                            q1_amount=Decimal('0'),
+                            adj_reclas=Decimal('0'),
+                            fin_q1_amount=Decimal('0')
+                        )
+                        fallback_record.clean()
+                        records.append(fallback_record)
+                        logger.info(f"✅ Created fallback record for account {account_code}")
+                    except Exception as fallback_error:
+                        logger.error(f"❌ Failed to create fallback record for account {account_code}: {fallback_error}")
                 
             except Exception as e:
                 logger.error(f"Error processing sub-sub type for account {account_code}: {e}")
@@ -1417,6 +1597,144 @@ class DataProcessor:
                 if value and value != 'nan' and value != 'None' and value != 'null' and value != '':
                     return value
         return ''
+    
+    def _bulk_upsert_coa_records(self, records: List[ChartOfAccount]):
+        """
+        Use SQLAlchemy for bulk upsert operations on COA records
+        Handles the unique constraint (account, cost_center) efficiently
+        """
+        try:
+            from sqlalchemy import create_engine, text
+            from django.conf import settings
+            import uuid
+            
+            # Get database connection string from Django settings
+            db_config = settings.DATABASES['default']
+            if db_config['ENGINE'] == 'django.db.backends.postgresql':
+                connection_string = f"postgresql://{db_config['USER']}:{db_config['PASSWORD']}@{db_config['HOST']}:{db_config['PORT']}/{db_config['NAME']}"
+            else:
+                # Fallback for other databases
+                logger.warning("SQLAlchemy bulk operations only supported for PostgreSQL")
+                raise Exception("Unsupported database engine for bulk operations")
+            
+            # Create SQLAlchemy engine
+            engine = create_engine(connection_string)
+            
+            # Prepare data for bulk insert
+            records_data = []
+            for record in records:
+                record_data = {
+                    'id': str(uuid.uuid4()),
+                    'data_file_id': str(record.data_file.id),
+                    'account': record.account,
+                    'type': record.type,
+                    'sub_type': record.sub_type,
+                    'sub_sub_type': record.sub_sub_type,
+                    'gl_account': record.gl_account,
+                    'gl_account_ref_id': str(record.gl_account_ref.id) if record.gl_account_ref else None,
+                    'company': record.company,
+                    'branch': record.branch,
+                    'cost_center': record.cost_center,
+                    'code': record.code,
+                    'gl_account_long_text': record.gl_account_long_text,
+                    'ref_to_fs': record.ref_to_fs,
+                    'financial_statement': record.financial_statement,
+                    'ref_to_note': record.ref_to_note,
+                    'fiscal_year': record.fiscal_year,
+                    'q1_amount': float(record.q1_amount) if record.q1_amount else None,
+                    'adj_reclas': float(record.adj_reclas) if record.adj_reclas else None,
+                    'fin_q1_amount': float(record.fin_q1_amount) if record.fin_q1_amount else None,
+                    'created_at': timezone.now().isoformat(),
+                    'updated_at': timezone.now().isoformat()
+                }
+                records_data.append(record_data)
+            
+            # Use PostgreSQL's ON CONFLICT for upsert
+            with engine.connect() as conn:
+                # Create temporary table for bulk insert
+                conn.execute(text("""
+                    CREATE TEMP TABLE temp_coa_records (
+                        id UUID PRIMARY KEY,
+                        data_file_id UUID NOT NULL,
+                        account VARCHAR(10) NOT NULL,
+                        type VARCHAR(50) NOT NULL,
+                        sub_type VARCHAR(50) NOT NULL,
+                        sub_sub_type VARCHAR(50) NOT NULL,
+                        gl_account VARCHAR(20),
+                        gl_account_ref_id UUID,
+                        company VARCHAR(50),
+                        branch VARCHAR(50),
+                        cost_center VARCHAR(50) NOT NULL,
+                        code VARCHAR(50),
+                        gl_account_long_text TEXT,
+                        ref_to_fs VARCHAR(100),
+                        financial_statement VARCHAR(100),
+                        ref_to_note VARCHAR(100),
+                        fiscal_year INTEGER,
+                        q1_amount DECIMAL(30,15),
+                        adj_reclas DECIMAL(30,15),
+                        fin_q1_amount DECIMAL(30,15),
+                        created_at TIMESTAMP WITH TIME ZONE,
+                        updated_at TIMESTAMP WITH TIME ZONE
+                    )
+                """))
+                
+                # Bulk insert into temp table
+                if records_data:
+                    conn.execute(text("""
+                        INSERT INTO temp_coa_records 
+                        (id, data_file_id, account, type, sub_type, sub_sub_type, gl_account, 
+                         gl_account_ref_id, company, branch, cost_center, code, gl_account_long_text,
+                         ref_to_fs, financial_statement, ref_to_note, fiscal_year, q1_amount, 
+                         adj_reclas, fin_q1_amount, created_at, updated_at)
+                        VALUES 
+                        (:id, :data_file_id, :account, :type, :sub_type, :sub_sub_type, :gl_account,
+                         :gl_account_ref_id, :company, :branch, :cost_center, :code, :gl_account_long_text,
+                         :ref_to_fs, :financial_statement, :ref_to_note, :fiscal_year, :q1_amount,
+                         :adj_reclas, :fin_q1_amount, :created_at, :updated_at)
+                    """), records_data)
+                
+                # Upsert from temp table to main table
+                conn.execute(text("""
+                    INSERT INTO chart_of_accounts 
+                    (id, data_file_id, account, type, sub_type, sub_sub_type, gl_account,
+                     gl_account_ref_id, company, branch, cost_center, code, gl_account_long_text,
+                     ref_to_fs, financial_statement, ref_to_note, fiscal_year, q1_amount,
+                     adj_reclas, fin_q1_amount, created_at, updated_at)
+                    SELECT 
+                        id, data_file_id, account, type, sub_type, sub_sub_type, gl_account,
+                        gl_account_ref_id, company, branch, cost_center, code, gl_account_long_text,
+                        ref_to_fs, financial_statement, ref_to_note, fiscal_year, q1_amount,
+                        adj_reclas, fin_q1_amount, created_at, updated_at
+                    FROM temp_coa_records
+                    ON CONFLICT (account, cost_center) 
+                    DO UPDATE SET
+                        data_file_id = EXCLUDED.data_file_id,
+                        type = EXCLUDED.type,
+                        sub_type = EXCLUDED.sub_type,
+                        sub_sub_type = EXCLUDED.sub_sub_type,
+                        gl_account = EXCLUDED.gl_account,
+                        gl_account_ref_id = EXCLUDED.gl_account_ref_id,
+                        company = EXCLUDED.company,
+                        branch = EXCLUDED.branch,
+                        code = EXCLUDED.code,
+                        gl_account_long_text = EXCLUDED.gl_account_long_text,
+                        ref_to_fs = EXCLUDED.ref_to_fs,
+                        financial_statement = EXCLUDED.financial_statement,
+                        ref_to_note = EXCLUDED.ref_to_note,
+                        fiscal_year = EXCLUDED.fiscal_year,
+                        q1_amount = EXCLUDED.q1_amount,
+                        adj_reclas = EXCLUDED.adj_reclas,
+                        fin_q1_amount = EXCLUDED.fin_q1_amount,
+                        updated_at = EXCLUDED.updated_at
+                """))
+                
+                conn.commit()
+                logger.info(f"✅ SQLAlchemy bulk upsert completed for {len(records_data)} COA records")
+                
+        except Exception as e:
+            logger.error(f"❌ SQLAlchemy bulk upsert failed: {e}")
+            raise e
     
     def _extract_decimal_value(self, row: pd.Series, possible_names: List[str]) -> Decimal:
         """Extract decimal value using flexible column mapping"""
@@ -1501,6 +1819,7 @@ class DataProcessor:
         """
         from django.db import transaction, connection
         from django.db.utils import OperationalError, InterfaceError
+        from .models import ChartOfAccount  # Ensure ChartOfAccount is available
         import time
         
         logger.info("💾" + "="*50)
@@ -1537,9 +1856,10 @@ class DataProcessor:
                     if not _ensure_db_connection():
                         raise Exception("Cannot establish database connection")
                     
-                    # Validate each record before bulk create
+                    # Validate each record before bulk create (skip for ChartOfAccount)
                     for record in batch:
-                        record.full_clean()  # Validate the record
+                        if model_class.__name__ != 'ChartOfAccount':
+                            record.full_clean()  # Validate the record
                     
                     # Save the batch
                     model_class.objects.bulk_create(batch, batch_size=min(self.batch_size, 1000), ignore_conflicts=True)
@@ -1576,7 +1896,9 @@ class DataProcessor:
                         
                         for record_index, record in enumerate(batch):
                             try:
-                                record.full_clean()  # Validate the record
+                                # Skip validation for ChartOfAccount since we've already cleaned them during processing
+                                if model_class.__name__ != 'ChartOfAccount':
+                                    record.full_clean()  # Validate the record
                                 valid_records.append(record)
                             except Exception as validation_error:
                                 invalid_count += 1
@@ -1642,6 +1964,15 @@ class DataProcessor:
             logger.info(f"📊 Total Batches Processed: {batch_count}")
             logger.info(f"📈 Success Rate: {(total_created / len(records_to_create) * 100):.1f}%")
             logger.info("💾" + "="*50)
+            
+            # Verify records were actually saved to database
+            try:
+                actual_count = model_class.objects.filter(data_file=self.data_file).count()
+                logger.info(f"🔍 Database verification: {actual_count} {operation_name} found in database")
+                if actual_count != total_created:
+                    logger.warning(f"⚠️ Mismatch: Expected {total_created}, found {actual_count} in database")
+            except Exception as verify_error:
+                logger.error(f"❌ Database verification failed: {verify_error}")
                 
         except Exception as e:
             logger.error("💥" + "="*50)

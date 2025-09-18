@@ -47,6 +47,118 @@ class GLPredictionModelTypes:
 # FEATURE EXTRACTION FROM GL DATA
 # ============================================================================
 
+def extract_transaction_features_for_anomaly_detection(engagement: Engagement) -> List[List[float]]:
+    """
+    Extract transaction-level features for anomaly detection within a single engagement
+    
+    Args:
+        engagement: Engagement to analyze
+        
+    Returns:
+        List of feature vectors for each transaction
+    """
+    from .models import SAPGLPosting
+    import pandas as pd
+    import numpy as np
+    
+    # Get all GL transactions for this engagement
+    gl_postings = SAPGLPosting.objects.filter(
+        data_file__engagement=engagement
+    ).select_related('gl_account_ref', 'data_file')
+    
+    if not gl_postings.exists():
+        return []
+    
+    # Convert to DataFrame for efficient analysis
+    df = pd.DataFrame(list(gl_postings.values(
+        'document_number', 'document_type', 'amount_local_currency', 
+        'gl_account', 'profit_center', 'user_name', 'posting_date',
+        'document_date', 'entry_date', 'fiscal_year', 'posting_period',
+        'text', 'local_currency'
+    )))
+    
+    if len(df) == 0:
+        return []
+    
+    # Convert dates and amounts
+    df['posting_date'] = pd.to_datetime(df['posting_date'])
+    df['document_date'] = pd.to_datetime(df['document_date'])
+    df['entry_date'] = pd.to_datetime(df['entry_date'])
+    df['amount_numeric'] = pd.to_numeric(df['amount_local_currency'], errors='coerce').fillna(0)
+    
+    # Extract features for each transaction
+    transaction_features = []
+    
+    for idx, row in df.iterrows():
+        features = []
+        
+        # Amount features
+        amount = abs(row['amount_numeric'])
+        features.extend([
+            amount,  # absolute amount
+            np.log10(amount + 1),  # log amount (to handle large values)
+            1 if amount == 0 else 0,  # zero amount flag
+            1 if amount % 1000 == 0 else 0,  # round number flag
+            1 if amount > df['amount_numeric'].abs().quantile(0.95) else 0,  # large transaction flag
+        ])
+        
+        # Temporal features
+        if pd.notna(row['posting_date']):
+            features.extend([
+                row['posting_date'].day,  # day of month
+                row['posting_date'].month,  # month
+                row['posting_date'].quarter,  # quarter
+                row['posting_date'].dayofweek,  # day of week (0=Monday)
+                1 if row['posting_date'].dayofweek >= 5 else 0,  # weekend flag
+                row['posting_date'].dayofyear,  # day of year
+            ])
+        else:
+            features.extend([0, 0, 0, 0, 0, 0])  # default values for missing dates
+        
+        # Account features (categorical to numeric)
+        gl_account = str(row['gl_account']) if pd.notna(row['gl_account']) else '0'
+        features.extend([
+            len(gl_account),  # account code length
+            sum(c.isdigit() for c in gl_account),  # number of digits
+            sum(c.isalpha() for c in gl_account),  # number of letters
+        ])
+        
+        # User features
+        user_name = str(row['user_name']) if pd.notna(row['user_name']) else 'UNKNOWN'
+        features.extend([
+            len(user_name),  # user name length
+            1 if 'ADMIN' in user_name.upper() else 0,  # admin user flag
+        ])
+        
+        # Document type features
+        doc_type = str(row['document_type']) if pd.notna(row['document_type']) else 'UNKNOWN'
+        features.extend([
+            len(doc_type),  # document type length
+            1 if 'INVOICE' in doc_type.upper() else 0,  # invoice flag
+            1 if 'PAYMENT' in doc_type.upper() else 0,  # payment flag
+        ])
+        
+        # Text features
+        text = str(row['text']) if pd.notna(row['text']) else ''
+        features.extend([
+            len(text),  # text length
+            text.count(' '),  # word count (spaces)
+            1 if 'REFUND' in text.upper() else 0,  # refund flag
+            1 if 'ADJUSTMENT' in text.upper() else 0,  # adjustment flag
+        ])
+        
+        # Profit center features
+        profit_center = str(row['profit_center']) if pd.notna(row['profit_center']) else '0'
+        features.extend([
+            len(profit_center),  # profit center length
+            1 if profit_center == '0' else 0,  # default profit center flag
+        ])
+        
+        transaction_features.append(features)
+    
+    return transaction_features
+
+
 def extract_gl_features_for_engagement(engagement: Engagement) -> Dict[str, Any]:
     """
     Extract comprehensive features from ALL file types in an engagement (GL + TB + COA)
@@ -379,31 +491,22 @@ def train_gl_anomaly_detection_model(self, engagement_id=None, client_name=None)
             ai_model.save()
             logger.info(f"Updating existing model: {model_name}")
         
-        # Get training data
-        query_filter = {}
-        if engagement_id:
-            query_filter['id'] = engagement_id
-        elif client_name:
-            query_filter['client__client_name__icontains'] = client_name
+        # Get specific engagement for training
+        if not engagement_id:
+            raise Exception("engagement_id is required for anomaly detection training")
             
-        engagements = Engagement.objects.filter(**query_filter)
+        try:
+            engagement = Engagement.objects.get(id=engagement_id)
+        except Engagement.DoesNotExist:
+            raise Exception(f"Engagement {engagement_id} not found")
         
-        if not engagements.exists():
-            raise Exception("No engagements found for training")
+        # Extract transaction-level features for anomaly detection
+        training_features = extract_transaction_features_for_anomaly_detection(engagement)
         
-        # Extract features from all engagements
-        training_features = []
-        training_labels = []  # 0 = normal, 1 = anomalous
+        if len(training_features) < 10:
+            raise Exception(f"Insufficient transaction data: {len(training_features)} transactions (minimum 10 required)")
         
-        for engagement in engagements:
-            features = extract_gl_features_for_engagement(engagement)
-            if features:
-                training_features.append(list(features.values()))
-                # For now, label all as normal (0) - in future, use known anomalies
-                training_labels.append(0)
-        
-        if len(training_features) < 5:
-            raise Exception(f"Insufficient training data: {len(training_features)} engagements")
+        logger.info(f"📊 Training anomaly detection on {len(training_features)} transactions from engagement {engagement.engagement_id}")
         
         # Update training data size
         ai_model.training_data_size = len(training_features)
@@ -412,7 +515,7 @@ def train_gl_anomaly_detection_model(self, engagement_id=None, client_name=None)
         # Train anomaly detection model (Isolation Forest)
         from sklearn.ensemble import IsolationForest
         from sklearn.preprocessing import StandardScaler
-        from sklearn.metrics import classification_report
+        import numpy as np
         
         X = np.array(training_features)
         scaler = StandardScaler()
@@ -420,7 +523,7 @@ def train_gl_anomaly_detection_model(self, engagement_id=None, client_name=None)
         
         # Train Isolation Forest for anomaly detection
         model = IsolationForest(
-            contamination=0.1,  # Assume 10% anomalies
+            contamination=0.05,  # Assume 5% anomalies (more conservative for single engagement)
             random_state=42,
             n_estimators=100
         )
@@ -434,6 +537,12 @@ def train_gl_anomaly_detection_model(self, engagement_id=None, client_name=None)
         normal_count = len(anomaly_predictions[anomaly_predictions == 1])
         anomaly_count = len(anomaly_predictions[anomaly_predictions == -1])
         
+        logger.info(f"🔍 Anomaly Detection Results:")
+        logger.info(f"  📊 Total transactions: {len(training_features)}")
+        logger.info(f"  ✅ Normal transactions: {normal_count}")
+        logger.info(f"  ⚠️ Anomalous transactions: {anomaly_count}")
+        logger.info(f"  📈 Anomaly rate: {(anomaly_count/len(training_features)*100):.2f}%")
+        
         # Save model files
         model_dir = os.path.join(settings.BASE_DIR, 'trained_models')
         os.makedirs(model_dir, exist_ok=True)
@@ -446,7 +555,15 @@ def train_gl_anomaly_detection_model(self, engagement_id=None, client_name=None)
         
         # Update model record
         training_duration = (timezone.now() - start_time).total_seconds()
-        feature_names = list(extract_gl_features_for_engagement(engagements.first()).keys()) if engagements.exists() else []
+        feature_names = [
+            'amount', 'log_amount', 'zero_amount', 'round_number', 'large_transaction',
+            'day', 'month', 'quarter', 'dayofweek', 'weekend', 'dayofyear',
+            'account_length', 'account_digits', 'account_letters',
+            'user_length', 'admin_user',
+            'doc_type_length', 'invoice_flag', 'payment_flag',
+            'text_length', 'word_count', 'refund_flag', 'adjustment_flag',
+            'profit_center_length', 'default_profit_center'
+        ]
         
         ai_model.feature_set = feature_names
         ai_model.model_file_path = model_path
@@ -456,24 +573,29 @@ def train_gl_anomaly_detection_model(self, engagement_id=None, client_name=None)
         ai_model.status = 'TRAINED'
         ai_model.model_parameters = {
             'model_type': 'IsolationForest',
-            'contamination': 0.1,
+            'contamination': 0.05,
             'n_estimators': 100,
-            'normal_engagements': normal_count,
-            'anomalous_engagements': anomaly_count
+            'normal_transactions': normal_count,
+            'anomalous_transactions': anomaly_count,
+            'engagement_id': str(engagement.id),
+            'engagement_name': engagement.engagement_id
         }
         ai_model.save()
         
         logger.info(f"GL anomaly detection model training completed:")
         logger.info(f"  Model ID: {ai_model.id}")
         logger.info(f"  Training Duration: {training_duration:.2f} seconds")
-        logger.info(f"  Training Data: {len(training_features)} engagements")
+        logger.info(f"  Training Data: {len(training_features)} transactions")
         logger.info(f"  Normal: {normal_count}, Anomalous: {anomaly_count}")
+        logger.info(f"  Engagement: {engagement.engagement_id}")
         
         return {
             'success': True,
             'model_id': str(ai_model.id),
             'model_type': GLPredictionModelTypes.UNUSUAL_ACTIVITY_DETECTOR,
             'client_name': client_name or '',
+            'engagement_id': str(engagement.id),
+            'engagement_name': engagement.engagement_id,
             'training_duration': training_duration,
             'training_data_size': len(training_features),
             'normal_count': normal_count,
@@ -657,18 +779,26 @@ def train_gl_volume_prediction_model(self, engagement_id=None, client_name=None)
         ai_model.feature_set = feature_names
         ai_model.model_file_path = model_path
         ai_model.scaler_file_path = scaler_path
+        # Handle NaN values for JSON serialization
+        def safe_float(value):
+            """Convert value to float, handling NaN and None"""
+            if value is None or (isinstance(value, float) and (value != value)):  # NaN check
+                return 0.0
+            return float(value)
+        
         ai_model.training_completed_at = timezone.now()
         ai_model.training_duration = training_duration
-        ai_model.training_accuracy = train_r2 * 100
-        ai_model.validation_accuracy = test_r2 * 100
+        ai_model.training_accuracy = safe_float(train_r2) * 100
+        ai_model.validation_accuracy = safe_float(test_r2) * 100
         ai_model.status = 'TRAINED'
+        
         ai_model.model_parameters = {
             'model_type': 'RandomForestRegressor',
             'n_estimators': 100,
-            'train_r2': train_r2,
-            'test_r2': test_r2,
-            'train_mse': train_mse,
-            'test_mse': test_mse
+            'train_r2': safe_float(train_r2),
+            'test_r2': safe_float(test_r2),
+            'train_mse': safe_float(train_mse),
+            'test_mse': safe_float(test_mse)
         }
         ai_model.save()
         

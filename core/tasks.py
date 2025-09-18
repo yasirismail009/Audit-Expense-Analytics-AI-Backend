@@ -52,9 +52,13 @@ try:
         predict_gl_anomalies
     )
     AI_TRAINING_AVAILABLE = True
-except ImportError:
+    logger.info("✅ AI training tasks imported successfully")
+except ImportError as e:
     AI_TRAINING_AVAILABLE = False
-    logger.warning("AI training tasks not available")
+    logger.warning(f"⚠️ AI training tasks not available: {e}")
+except Exception as e:
+    AI_TRAINING_AVAILABLE = False
+    logger.error(f"❌ Error importing AI training tasks: {e}")
 
 # ============================================================================
 # NOTIFICATION HELPER FUNCTIONS
@@ -7590,15 +7594,22 @@ def run_gl_completeness_analysis(self, data_file_id):
             try:
                 if AI_TRAINING_AVAILABLE:
                     logger.info("🚀 Triggering comprehensive AI training after completeness test...")
+                    logger.info(f"📊 Training for engagement: {data_file.engagement.engagement_id}")
+                    logger.info(f"👤 Client: {data_file.engagement.client.client_name}")
+                    
                     ai_training_task = train_comprehensive_ai_models.delay(
                         engagement_id=str(data_file.engagement.id),
                         client_name=data_file.engagement.client.client_name
                     )
                     logger.info(f"🤖 AI training task queued: {ai_training_task.id}")
+                    logger.info(f"🔗 AI Task state: {ai_training_task.state}")
                 else:
-                    logger.warning("AI training not available - skipping automatic training")
+                    logger.warning("⚠️ AI training not available - skipping automatic training")
+                    logger.warning("⚠️ Check AI_TRAINING_AVAILABLE flag and imports")
             except Exception as ai_error:
-                logger.error(f"Failed to queue AI training: {ai_error}")
+                logger.error(f"❌ Failed to queue AI training: {ai_error}")
+                import traceback
+                logger.error(f"❌ AI Training Traceback: {traceback.format_exc()}")
                 # Don't fail the completeness test if AI training fails to queue
             
         except Exception as db_error:
