@@ -43,12 +43,17 @@ def extract_gl_features(engagement_id):
     # Convert to DataFrame
     data = []
     for gl in gl_transactions:
+        # Calculate debit/credit from amount_local_currency (positive=debit, negative=credit)
+        amount = float(gl.amount_local_currency or 0)
+        debit_amount = amount if amount > 0 else 0
+        credit_amount = abs(amount) if amount < 0 else 0
+        
         data.append({
             'posting_date': gl.posting_date,
-            'account_code': gl.account_code,
-            'debit_amount': float(gl.debit_amount or 0),
-            'credit_amount': float(gl.credit_amount or 0),
-            'total_amount': float(gl.debit_amount or 0) + float(gl.credit_amount or 0),
+            'gl_account': gl.gl_account or '',
+            'debit_amount': debit_amount,
+            'credit_amount': credit_amount,
+            'total_amount': abs(amount),
             'user_name': gl.user_name or 'Unknown',
             'document_number': gl.document_number or '',
             'fiscal_year': gl.data_file.engagement.fiscal_year,
@@ -70,7 +75,7 @@ def extract_gl_features(engagement_id):
         'total_amount': ['sum', 'mean', 'count'],
         'debit_amount': 'sum',
         'credit_amount': 'sum',
-        'account_code': 'nunique',
+        'gl_account': 'nunique',
         'user_name': 'nunique',
         'document_number': 'nunique'
     }).reset_index()
