@@ -42,7 +42,7 @@ except ImportError:
 from ..specialized_analysis_models import AnalysisModelManager
 from ..ml_models import MLModelTrainer
 from ..overall_analysis import OverallAnalyzer
-from ..sync_analysis import _determine_risk_level
+# Removed unused import: from ..sync_analysis import _determine_risk_level
 from .utils import (
     send_notification_if_available,
     get_user_from_job,
