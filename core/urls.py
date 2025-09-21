@@ -31,4 +31,10 @@ urlpatterns = [
     
     # Account Verifications APIs
     path('account-verifications/engagement/<str:engagement_id>/', views.get_account_verifications_by_engagement, name='account-verifications-by-engagement'),
+    
+    # Document Verifications APIs
+    path('document-verifications/engagement/<str:engagement_id>/', views.get_document_verifications_by_engagement, name='document-verifications-by-engagement'),
+    
+    # Profit Center Data APIs
+    path('profit-center-data/engagement/<str:engagement_id>/', views.get_profit_center_data_by_engagement, name='profit-center-data-by-engagement'),
 ] 

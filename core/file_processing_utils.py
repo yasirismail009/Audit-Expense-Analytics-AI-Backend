@@ -489,6 +489,9 @@ class DataProcessor:
                 postings_to_create,
                 f"GL records for file {self.data_file.file_name}"
             )
+            
+            # Update GLAccount records after GL bulk operations
+            self._update_gl_accounts_after_gl_processing()
         else:
             logger.warning("⚠️  No GL postings to save to database!")
         
@@ -1973,6 +1976,9 @@ class DataProcessor:
                     logger.warning(f"⚠️ Mismatch: Expected {total_created}, found {actual_count} in database")
             except Exception as verify_error:
                 logger.error(f"❌ Database verification failed: {verify_error}")
+            
+            # Update GLAccount records after bulk operations
+            self._update_gl_accounts_after_bulk_operation(model_class, operation_name)
                 
         except Exception as e:
             logger.error("💥" + "="*50)
@@ -1983,6 +1989,121 @@ class DataProcessor:
             logger.error(f"📊 Batches processed: {batch_count}")
             logger.error("💥" + "="*50)
             raise Exception(f"Processing failed: {str(e)}")
+    
+    def _update_gl_accounts_after_bulk_operation(self, model_class, operation_name: str):
+        """
+        Update GLAccount records after bulk operations since bulk_create bypasses save() methods
+        
+        This ensures that:
+        - TB data updates GLAccount opening/closing balances
+        - COA data updates GLAccount type hierarchy and cost_code
+        - Profit Center auto-linking happens
+        """
+        try:
+            from .models import GLAccount, TrialBalance, ChartOfAccount, ProfitCenter
+            
+            logger.info("🔄 Updating GLAccount records after bulk operation...")
+            
+            if model_class.__name__ == 'TrialBalance':
+                # Update GLAccount with TB data
+                logger.info("📊 Updating GLAccount records with TB data...")
+                
+                # Get all TB records for this data file
+                tb_records = TrialBalance.objects.filter(data_file=self.data_file)
+                
+                for tb_record in tb_records:
+                    if tb_record.gl_account_ref:
+                        # Update GLAccount with TB information
+                        gl_account = tb_record.gl_account_ref
+                        gl_account.opening_balance = tb_record.opening_balance
+                        gl_account.closing_balance = tb_record.closing_balance
+                        gl_account.tb_debit = tb_record.debit
+                        gl_account.tb_credit = tb_record.credit
+                        gl_account.save()
+                        
+                        logger.debug(f"✅ Updated GLAccount {gl_account.account_code} with TB data")
+                
+                logger.info(f"✅ Updated {tb_records.count()} GLAccount records with TB data")
+                
+            elif model_class.__name__ == 'ChartOfAccount':
+                # Update GLAccount with COA data
+                logger.info("📊 Updating GLAccount records with COA data...")
+                
+                # Get all COA records for this data file
+                coa_records = ChartOfAccount.objects.filter(data_file=self.data_file)
+                
+                for coa_record in coa_records:
+                    if coa_record.gl_account_ref:
+                        # Update GLAccount with COA hierarchy information
+                        gl_account = coa_record.gl_account_ref
+                        gl_account.account_type = coa_record.type
+                        gl_account.sub_type = coa_record.sub_type
+                        gl_account.sub_sub_type = coa_record.sub_sub_type
+                        gl_account.financial_statement_category = coa_record.financial_statement
+                        
+                        # Also set cost_code from COA if not already set
+                        if coa_record.cost_center and not gl_account.cost_code:
+                            gl_account.cost_code = coa_record.cost_center
+                        
+                        gl_account.save()
+                        
+                        # Auto-link to ProfitCenter if cost_code is provided
+                        if gl_account.cost_code and not gl_account.profit_center_ref:
+                            profit_center = ProfitCenter.objects.filter(profit_center_code=gl_account.cost_code).first()
+                            if profit_center:
+                                gl_account.profit_center_ref = profit_center
+                                gl_account.save()
+                                logger.debug(f"✅ Linked GLAccount {gl_account.account_code} to ProfitCenter {profit_center.profit_center_code}")
+                        
+                        logger.debug(f"✅ Updated GLAccount {gl_account.account_code} with COA data")
+                
+                logger.info(f"✅ Updated {coa_records.count()} GLAccount records with COA data")
+                
+        except Exception as e:
+            logger.error(f"❌ Error updating GLAccount records after bulk operation: {e}")
+            # Don't raise exception as this is a post-processing step
+    
+    def _update_gl_accounts_after_gl_processing(self):
+        """
+        Update GLAccount records after GL processing to ensure Profit Center auto-linking
+        
+        This ensures that:
+        - GLAccount records created during GL processing are properly linked to Profit Centers
+        - Cost codes from GL data are used for Profit Center linking
+        """
+        try:
+            from .models import GLAccount, ProfitCenter
+            
+            logger.info("🔄 Updating GLAccount records after GL processing...")
+            
+            # Get all GLAccount records for this engagement that have cost_code but no profit_center_ref
+            gl_accounts_to_update = GLAccount.objects.filter(
+                engagement=self.data_file.engagement,
+                cost_code__isnull=False
+            ).exclude(
+                cost_code=''
+            ).filter(
+                profit_center_ref__isnull=True
+            )
+            
+            updated_count = 0
+            for gl_account in gl_accounts_to_update:
+                # Auto-link to ProfitCenter if cost_code is provided
+                if gl_account.cost_code:
+                    profit_center = ProfitCenter.objects.filter(profit_center_code=gl_account.cost_code).first()
+                    if profit_center:
+                        gl_account.profit_center_ref = profit_center
+                        gl_account.save()
+                        updated_count += 1
+                        logger.debug(f"✅ Linked GLAccount {gl_account.account_code} to ProfitCenter {profit_center.profit_center_code}")
+                    else:
+                        logger.debug(f"⚠️ No ProfitCenter found for cost_code: {gl_account.cost_code}")
+            
+            logger.info(f"✅ Updated {updated_count} GLAccount records with Profit Center links")
+                
+        except Exception as e:
+            logger.error(f"❌ Error updating GLAccount records after GL processing: {e}")
+            # Don't raise exception as this is a post-processing step
     
     def _create_gl_posting_from_row(self, row: pd.Series) -> Optional[SAPGLPosting]:
         """Create SAPGLPosting from CSV row with GL Account reference"""
@@ -2027,7 +2148,7 @@ class DataProcessor:
                 account_code=gl_account_code,
                 account_name=f'GL Account {gl_account_code}',  # Default name, can be updated later
                 company_code=row.get('Company Code', ''),
-                profit_center=row.get('Profit Center', '')
+                cost_code=row.get('Profit Center', '')  # Map Profit Center to cost_code
             )
             
             # Handle document number - convert float/int to proper string format

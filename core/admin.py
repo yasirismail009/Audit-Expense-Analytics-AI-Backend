@@ -1,7 +1,7 @@
 from django.contrib import admin
 from .models import (
     Client, Engagement, DataFile, GLAccount, SAPGLPosting, TrialBalance, ChartOfAccount,
-    FileProcessingJob, CompletenessTestResult, MLModelTraining
+    FileProcessingJob, CompletenessTestResult, MLModelTraining, ProfitCenter, ProfitCenterAccount
 )
 
 @admin.register(SAPGLPosting)
@@ -42,16 +42,109 @@ class DataFileAdmin(admin.ModelAdmin):
         return obj.engagement.fiscal_year if obj.engagement else obj.legacy_fiscal_year
     get_fiscal_year.short_description = 'Fiscal Year'
 
+class ProfitCenterAccountInline(admin.TabularInline):
+    """Inline admin for profit center-account relationships"""
+    model = ProfitCenterAccount
+    extra = 1
+    fields = ['gl_account', 'is_primary', 'allocation_percentage', 'company_code', 'business_area']
+
+
+@admin.register(ProfitCenter)
+class ProfitCenterAdmin(admin.ModelAdmin):
+    list_display = ['profit_center_code', 'profit_center_name', 'profit_center_type', 'cost_center', 'revenue_center', 'profit_center_status', 'get_account_count', 'created_at']
+    list_filter = ['profit_center_status', 'profit_center_type', 'cost_center', 'revenue_center', 'company_code', 'created_at']
+    search_fields = ['profit_center_code', 'profit_center_name', 'responsible_person', 'department']
+    readonly_fields = ['id', 'created_at', 'updated_at', 'cost_center_code', 'cost_center_name']
+    inlines = [ProfitCenterAccountInline]
+    fieldsets = (
+        ('Basic Information (Profit Center)', {
+            'fields': ('profit_center_code', 'profit_center_name', 'profit_center_short_text', 'profit_center_description')
+        }),
+        ('Cost Center Aliases (Same Data)', {
+            'fields': ('cost_center_code', 'cost_center_name'),
+            'description': 'Cost Center and Profit Center are the same data with different names'
+        }),
+        ('Classification', {
+            'fields': ('profit_center_type', 'profit_center_group', 'cost_center', 'revenue_center')
+        }),
+        ('Properties', {
+            'fields': ('profit_center_currency', 'profit_center_status', 'company_code', 'business_area', 'segment')
+        }),
+        ('Hierarchy', {
+            'fields': ('parent_profit_center', 'profit_center_level')
+        }),
+        ('Management', {
+            'fields': ('responsible_person', 'department', 'notes')
+        }),
+        ('Audit Trail', {
+            'fields': ('created_from_file', 'last_updated_from_file', 'created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    def get_account_count(self, obj):
+        """Get the number of accounts associated with this profit center"""
+        return obj.get_account_count()
+    get_account_count.short_description = 'Account Count'
+
+
+@admin.register(ProfitCenterAccount)
+class ProfitCenterAccountAdmin(admin.ModelAdmin):
+    list_display = ['profit_center', 'gl_account', 'is_primary', 'allocation_percentage', 'company_code', 'created_at']
+    list_filter = ['is_primary', 'company_code', 'business_area', 'created_at']
+    search_fields = ['profit_center__profit_center_code', 'profit_center__profit_center_name', 'gl_account__account_code', 'gl_account__account_name']
+    readonly_fields = ['id', 'created_at', 'updated_at']
+    fieldsets = (
+        ('Relationship', {
+            'fields': ('profit_center', 'gl_account', 'is_primary', 'allocation_percentage')
+        }),
+        ('Context', {
+            'fields': ('company_code', 'business_area', 'notes')
+        }),
+        ('Audit Trail', {
+            'fields': ('created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+
+
 @admin.register(GLAccount)
 class GLAccountAdmin(admin.ModelAdmin):
-    list_display = ['account_code', 'account_name', 'get_engagement', 'account_type', 'is_active', 'created_at']
-    list_filter = ['is_active', 'account_type', 'sub_type', 'created_at']
-    search_fields = ['account_code', 'account_name', 'engagement__engagement_id', 'engagement__client__client_name']
+    list_display = ['account_code', 'account_name', 'get_engagement', 'cost_code', 'get_profit_center', 'account_type', 'is_active', 'created_at']
+    list_filter = ['is_active', 'account_type', 'sub_type', 'sub_sub_type', 'created_at']
+    search_fields = ['account_code', 'account_name', 'cost_code', 'engagement__engagement_id', 'engagement__client__client_name']
     readonly_fields = ['id', 'created_at', 'updated_at', 'legacy_engagement_id', 'legacy_client_name']
+    fieldsets = (
+        ('Basic Information', {
+            'fields': ('engagement', 'account_code', 'account_name', 'account_description')
+        }),
+        ('Account Classification', {
+            'fields': ('account_type', 'sub_type', 'sub_sub_type', 'financial_statement_category', 'balance_sheet_category', 'income_statement_category')
+        }),
+        ('Cost Center & Profit Center', {
+            'fields': ('cost_code', 'profit_center_ref'),
+            'description': 'Cost code maps to Profit Center from GL listing'
+        }),
+        ('Trial Balance Data', {
+            'fields': ('opening_balance', 'closing_balance', 'tb_debit', 'tb_credit')
+        }),
+        ('Properties', {
+            'fields': ('is_active', 'currency', 'company_code')
+        }),
+        ('Legacy Fields', {
+            'fields': ('legacy_engagement_id', 'legacy_client_name'),
+            'classes': ('collapse',)
+        }),
+    )
     
     def get_engagement(self, obj):
         return obj.engagement.engagement_id if obj.engagement else obj.legacy_engagement_id
     get_engagement.short_description = 'Engagement'
+    
+    def get_profit_center(self, obj):
+        profit_center = obj.get_profit_center()
+        return profit_center.profit_center_code if profit_center else 'Not linked'
+    get_profit_center.short_description = 'Profit Center'
 
 @admin.register(TrialBalance)
 class TrialBalanceAdmin(admin.ModelAdmin):

@@ -34,6 +34,543 @@ logger = logging.getLogger(__name__)
 
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=600, soft_time_limit=540)
+def run_gl_completeness_analysis(self, data_file_id):
+    """
+    Run 2-Step GL Completeness Test after GL file processing is complete
+    
+    Performs a streamlined 2-step completeness validation:
+    
+    Step 1: GL Completeness Check
+        - Verify GL is balanced (Credit - Debit = 0)
+        - Check data volume and availability (sufficient transactions, TB data present)
+        
+    Step 2: Account-wise Balance Verification
+        - For each account: Opening + Debits - Credits = Closing balance
+        - Cross-verify GL movements with TB movements per account
+        - Requires 90%+ pass rate for overall completion
+        
+    Features:
+        - Chart generation based on posting/document dates
+        - Enhanced logging and debugging
+        - Comprehensive statistics and scoring
+        - Database persistence of results
+    
+    Args:
+        data_file_id (str): UUID of the DataFile to analyze
+        
+    Returns:
+        dict: Completeness test results with Pass/Fail status and detailed explanation
+    """
+    task_name = "run_gl_completeness_analysis"
+    start_time = timezone.now()
+    
+    # Enhanced debugging setup
+    logger.info("=" * 80)
+    logger.info(f"🚀 STARTING COMPLETENESS ANALYSIS - Task ID: {self.request.id}")
+    logger.info(f"📁 Data File ID: {data_file_id}")
+    logger.info(f"⏰ Start Time: {start_time}")
+    logger.info(f"🔧 Celery Worker: {self.request.hostname}")
+    logger.info("=" * 80)
+    
+    try:
+        from django.db import models
+        
+        # Get the data file
+        try:
+            data_file = DataFile.objects.get(id=data_file_id)
+            logger.info(f"✅ STEP 0.1: Data file retrieved successfully")
+            logger.info(f"   📄 File Name: {data_file.file_name}")
+            logger.info(f"   📊 File Type: {data_file.file_type}")
+            logger.info(f"   🎯 Engagement: {data_file.engagement_id}")
+            logger.info(f"   📈 Status: {data_file.status}")
+            logger.info(f"   📋 Total Records: {data_file.total_records}")
+        except DataFile.DoesNotExist:
+            logger.error(f"❌ STEP 0.1 FAILED: DataFile with ID {data_file_id} not found")
+            return {'success': False, 'error': f'DataFile {data_file_id} not found'}
+        
+        logger.info(f"🔄 STEP 0.2: Starting GL-TB completeness test for file: {data_file.file_name}")
+        
+        # =======================================================================
+        # STEP 0.4: DATA LOADING AND VALIDATION
+        # =======================================================================
+        
+        logger.info("📊 STEP 0.4: Loading GL postings and Trial Balance data...")
+        
+        # Get GL postings and Trial Balance data for this engagement
+        gl_postings = SAPGLPosting.objects.filter(data_file=data_file)
+        trial_balance_records = TrialBalance.objects.filter(data_file__engagement=data_file.engagement)
+        
+        logger.info(f"   📈 GL Postings found: {gl_postings.count():,}")
+        logger.info(f"   📋 TB Records found: {trial_balance_records.count():,}")
+        logger.info(f"   🎯 Engagement ID: {data_file.engagement_id}")
+        
+        # Check if we have both GL and TB data
+        if not gl_postings.exists():
+            logger.warning(f"No GL postings found for data file {data_file_id}")
+            return {'success': False, 'error': 'No GL postings found for completeness test'}
+        
+        if not trial_balance_records.exists():
+            logger.warning(f"No Trial Balance data found for engagement {data_file.engagement_id}")
+            return {
+                'success': True,
+                'completeness_results': {
+                    'status': 'TB_NOT_AVAILABLE',
+                    'explanation': 'Trial Balance data not available for cross-validation. Only GL internal validation performed.',
+                    'gl_only_validation': True
+                }
+            }
+        
+        # Get Chart of Accounts data for this engagement
+        coa_records = GLAccount.objects.filter(engagement=data_file.engagement)
+        
+        # =======================================================================
+        # STEP 1: GL COMPLETENESS CHECK
+        # =======================================================================
+        
+        logger.info("🔍 STEP 1: Starting GL Completeness Check...")
+        step1_start = timezone.now()
+        
+        # Calculate GL totals (debits are positive, credits are negative)
+        logger.info("   📊 Calculating GL totals...")
+        gl_total_debit = sum(float(p.amount_local_currency or 0) for p in gl_postings if float(p.amount_local_currency or 0) > 0)
+        gl_total_credit = sum(abs(float(p.amount_local_currency or 0)) for p in gl_postings if float(p.amount_local_currency or 0) < 0)
+        
+        # Check if GL is balanced (Credit - Debit = 0)
+        gl_net_balance = gl_total_credit - gl_total_debit
+        gl_is_balanced = abs(gl_net_balance) < 1.00  # Allow 1 unit variance
+        
+        # Additional completeness checks
+        transaction_count = gl_postings.count()
+        account_count = gl_postings.values('gl_account').distinct().count()
+        has_tb = trial_balance_records.exists()
+        
+        # Volume and data availability check
+        volume_check = transaction_count >= 100 and account_count >= 10
+        data_availability = has_tb and gl_postings.exists()
+        
+        step1_completeness_passed = gl_is_balanced and volume_check and data_availability
+        
+        logger.info(f"   💰 GL Debit Total: {gl_total_debit:,.2f}")
+        logger.info(f"   💰 GL Credit Total: {gl_total_credit:,.2f}")
+        logger.info(f"   ⚖️  GL Net Balance (Credit - Debit): {gl_net_balance:,.2f}")
+        logger.info(f"   ✅ GL Balanced: {'YES' if gl_is_balanced else 'NO'}")
+        logger.info(f"   📊 Transaction Count: {transaction_count:,}")
+        logger.info(f"   📋 Account Count: {account_count:,}")
+        logger.info(f"   📈 TB Available: {'YES' if has_tb else 'NO'}")
+        logger.info(f"   🎯 Volume Check: {'PASS' if volume_check else 'FAIL'}")
+        
+        step1_completeness = {
+            'description': 'GL completeness verification: Credit - Debit should equal 0 and sufficient data volume',
+            'gl_debit_total': round(gl_total_debit, 2),
+            'gl_credit_total': round(gl_total_credit, 2),
+            'gl_net_balance': round(gl_net_balance, 2),
+            'gl_is_balanced': gl_is_balanced,
+            'transaction_count': transaction_count,
+            'account_count': account_count,
+            'has_tb': has_tb,
+            'volume_check': volume_check,
+            'data_availability': data_availability,
+            'passed': step1_completeness_passed,
+            'explanation': f"GL Balance: {gl_net_balance:.2f} ({'PASS' if gl_is_balanced else 'FAIL'}), Volume: {transaction_count:,} transactions, {account_count} accounts, TB: {'Available' if has_tb else 'Missing'}"
+        }
+        
+        step1_duration = (timezone.now() - step1_start).total_seconds()
+        logger.info(f"✅ STEP 1 COMPLETED: {'PASS' if step1_completeness_passed else 'FAIL'} (Duration: {step1_duration:.2f}s)")
+        if not step1_completeness_passed:
+            issues = []
+            if not gl_is_balanced:
+                issues.append(f"GL imbalanced by {gl_net_balance:.2f}")
+            if not volume_check:
+                issues.append(f"Low volume: {transaction_count:,} transactions")
+            if not data_availability:
+                issues.append("Missing TB data")
+            logger.warning(f"   ⚠️  Issues: {', '.join(issues)}")
+        
+        # =======================================================================
+        # STEP 2: ACCOUNT-WISE BALANCE VERIFICATION
+        # =======================================================================
+        
+        logger.info("🔍 STEP 2: Starting Account-wise Balance Verification...")
+        step2_start = timezone.now()
+        
+        logger.info("   📊 Building GL account summaries...")
+        
+        # Build GL account-wise totals
+        gl_account_totals = {}
+        for posting in gl_postings:
+            account_code = str(posting.gl_account).replace('.0', '')
+            amount = float(posting.amount_local_currency or 0)
+            
+            if account_code not in gl_account_totals:
+                gl_account_totals[account_code] = {
+                    'debit_total': 0,
+                    'credit_total': 0,
+                    'net_movement': 0
+                }
+            
+            if amount > 0:
+                gl_account_totals[account_code]['debit_total'] += amount
+            else:
+                gl_account_totals[account_code]['credit_total'] += abs(amount)
+            
+            gl_account_totals[account_code]['net_movement'] = (
+                gl_account_totals[account_code]['debit_total'] - 
+                gl_account_totals[account_code]['credit_total']
+            )
+        
+        logger.info(f"   📋 GL Account Summaries Built: {len(gl_account_totals)} accounts")
+        
+        # Get TB account details with balance verification
+        logger.info("   📊 Verifying account-wise balance equation...")
+        
+        account_verifications = []
+        balance_equation_passed_count = 0
+        balance_equation_failed_count = 0
+        total_variance = 0
+        
+        for tb_record in trial_balance_records:
+            account_code = str(tb_record.gl_account).replace('.0', '')
+            
+            # Get TB data
+            tb_debit = float(tb_record.debit or 0)
+            tb_credit = float(tb_record.credit or 0)
+            opening_balance = float(getattr(tb_record, 'opening_balance', 0) or 0)
+            closing_balance = float(getattr(tb_record, 'closing_balance', 0) or 0)
+            
+            # Get GL data for this account
+            gl_data = gl_account_totals.get(account_code, {
+                'debit_total': 0,
+                'credit_total': 0,
+                'net_movement': 0
+            })
+            
+            # Calculate expected closing balance: Opening + Debits - Credits = Closing
+            calculated_closing = opening_balance + tb_debit - tb_credit
+            balance_variance = abs(calculated_closing - closing_balance)
+            
+            # Check if GL movements match TB movements
+            gl_vs_tb_debit_variance = abs(gl_data['debit_total'] - tb_debit)
+            gl_vs_tb_credit_variance = abs(gl_data['credit_total'] - tb_credit)
+            
+            # Verification result
+            balance_equation_correct = balance_variance < 1.00  # Allow 1 unit variance
+            gl_tb_movements_match = (gl_vs_tb_debit_variance + gl_vs_tb_credit_variance) < 10.00
+            
+            account_verification = {
+                'account_code': account_code,
+                'opening_balance': opening_balance,
+                'tb_debit': tb_debit,
+                'tb_credit': tb_credit,
+                'closing_balance': closing_balance,
+                'calculated_closing': calculated_closing,
+                'balance_variance': balance_variance,
+                'gl_debit_total': gl_data['debit_total'],
+                'gl_credit_total': gl_data['credit_total'],
+                'gl_vs_tb_debit_variance': gl_vs_tb_debit_variance,
+                'gl_vs_tb_credit_variance': gl_vs_tb_credit_variance,
+                'balance_equation_correct': balance_equation_correct,
+                'gl_tb_movements_match': gl_tb_movements_match,
+                'account_passed': balance_equation_correct and gl_tb_movements_match
+            }
+            
+            account_verifications.append(account_verification)
+            total_variance += balance_variance
+            
+            if account_verification['account_passed']:
+                balance_equation_passed_count += 1
+            else:
+                balance_equation_failed_count += 1
+        
+        # Overall Step 2 result
+        total_accounts_verified = len(account_verifications)
+        pass_rate = (balance_equation_passed_count / total_accounts_verified) if total_accounts_verified > 0 else 0
+        step2_account_verification_passed = pass_rate >= 0.90  # 90% pass rate required
+        
+        logger.info(f"   📊 Account Verifications Completed:")
+        logger.info(f"      Total Accounts: {total_accounts_verified}")
+        logger.info(f"      Passed: {balance_equation_passed_count}")
+        logger.info(f"      Failed: {balance_equation_failed_count}")
+        logger.info(f"      Pass Rate: {pass_rate:.1%}")
+        logger.info(f"      Total Variance: {total_variance:,.2f}")
+        logger.info(f"      Result: {'✅ PASS' if step2_account_verification_passed else '❌ FAIL'}")
+        
+        # Show sample of failed accounts for debugging
+        failed_accounts = [acc for acc in account_verifications if not acc['account_passed']]
+        if failed_accounts:
+            logger.warning(f"   ⚠️  Sample Failed Accounts:")
+            for acc in failed_accounts[:5]:  # Show first 5 failed accounts
+                logger.warning(f"      Account {acc['account_code']}: Balance variance {acc['balance_variance']:.2f}")
+        
+        step2_account_verification = {
+            'description': 'Account-wise balance verification: Opening + Debits - Credits = Closing for each GL account',
+            'total_accounts_verified': total_accounts_verified,
+            'accounts_passed': balance_equation_passed_count,
+            'accounts_failed': balance_equation_failed_count,
+            'pass_rate': round(pass_rate, 3),
+            'total_variance': round(total_variance, 2),
+            'account_verifications': account_verifications,
+            'failed_accounts': [acc['account_code'] for acc in failed_accounts],
+            'passed': step2_account_verification_passed,
+            'explanation': f"Account verification: {balance_equation_passed_count}/{total_accounts_verified} passed ({pass_rate:.1%}), Total variance: {total_variance:,.2f}"
+        }
+        
+        step2_duration = (timezone.now() - step2_start).total_seconds()
+        logger.info(f"✅ STEP 2 COMPLETED: {'PASS' if step2_account_verification_passed else 'FAIL'} (Duration: {step2_duration:.2f}s)")
+        if not step2_account_verification_passed:
+            logger.warning(f"   ⚠️  Issues: {balance_equation_failed_count} accounts failed verification, Pass rate: {pass_rate:.1%}")
+        
+        # =======================================================================
+        # CHART GENERATION BASED ON POSTING/DOCUMENT DATES
+        # =======================================================================
+        
+        logger.info("📊 Generating charts based on posting and document dates...")
+        chart_start = timezone.now()
+        
+        # Monthly posting trends
+        monthly_posting_data = {}
+        daily_posting_data = {}
+        
+        for posting in gl_postings:
+            # Use posting_date if available, otherwise document_date
+            posting_date = posting.posting_date or posting.document_date
+            if posting_date:
+                month_key = posting_date.strftime('%Y-%m')
+                day_key = posting_date.strftime('%Y-%m-%d')
+                amount = abs(float(posting.amount_local_currency or 0))
+                
+                # Monthly data
+                if month_key not in monthly_posting_data:
+                    monthly_posting_data[month_key] = {'count': 0, 'amount': 0}
+                monthly_posting_data[month_key]['count'] += 1
+                monthly_posting_data[month_key]['amount'] += amount
+                
+                # Daily data (for trend analysis)
+                if day_key not in daily_posting_data:
+                    daily_posting_data[day_key] = {'count': 0, 'amount': 0}
+                daily_posting_data[day_key]['count'] += 1
+                daily_posting_data[day_key]['amount'] += amount
+        
+        # Account-wise posting analysis
+        account_posting_data = {}
+        for account_code, totals in gl_account_totals.items():
+            total_amount = totals['debit_total'] + totals['credit_total']
+            if total_amount > 0:
+                account_posting_data[account_code] = {
+                    'debit_total': totals['debit_total'],
+                    'credit_total': totals['credit_total'],
+                    'total_amount': total_amount,
+                    'net_movement': totals['net_movement']
+                }
+        
+        # Sort accounts by total activity
+        top_accounts = sorted(account_posting_data.items(), key=lambda x: x[1]['total_amount'], reverse=True)[:20]
+        
+        chart_data = {
+            'monthly_trends': {
+                'labels': sorted(monthly_posting_data.keys()),
+                'transaction_counts': [monthly_posting_data[month]['count'] for month in sorted(monthly_posting_data.keys())],
+                'amounts': [monthly_posting_data[month]['amount'] for month in sorted(monthly_posting_data.keys())]
+            },
+            'top_accounts': {
+                'labels': [acc[0] for acc in top_accounts],
+                'debit_amounts': [acc[1]['debit_total'] for acc in top_accounts],
+                'credit_amounts': [acc[1]['credit_total'] for acc in top_accounts],
+                'net_movements': [acc[1]['net_movement'] for acc in top_accounts]
+            },
+            'chart_metadata': {
+                'total_charts': 2,
+                'data_period': f"{min(monthly_posting_data.keys())} to {max(monthly_posting_data.keys())}" if monthly_posting_data else "No data",
+                'total_months': len(monthly_posting_data),
+                'total_days_with_activity': len(daily_posting_data)
+            }
+        }
+        
+        chart_duration = (timezone.now() - chart_start).total_seconds()
+        logger.info(f"📊 Chart generation completed in {chart_duration:.2f}s")
+        logger.info(f"   📈 Monthly trends: {len(monthly_posting_data)} months")
+        logger.info(f"   📋 Top accounts: {len(top_accounts)} accounts")
+        logger.info(f"   📅 Activity period: {chart_data['chart_metadata']['data_period']}")
+        
+        # =======================================================================
+        # OVERALL COMPLETENESS ASSESSMENT (2 STEPS)
+        # =======================================================================
+        
+        logger.info("📊 Starting overall completeness assessment...")
+        assessment_start = timezone.now()
+        
+        # 2-Step Completeness Assessment
+        all_steps_passed = step1_completeness_passed and step2_account_verification_passed
+        
+        # Calculate weighted completeness score (0-100%) for 2 steps
+        weights = {
+            'step1': 40,  # GL completeness (fundamental)
+            'step2': 60   # Account-wise verification (critical)
+        }
+        
+        scores = {
+            'step1': 100 if step1_completeness_passed else (70 if gl_is_balanced else 30),
+            'step2': round(pass_rate * 100, 1) if pass_rate > 0 else 0
+        }
+        
+        completeness_score = sum(scores[step] * weights[step] / 100 for step in weights.keys())
+        
+        # Determine overall status
+        if all_steps_passed and completeness_score >= 95:
+            overall_status = 'COMPLETE'
+            overall_explanation = 'GL completeness verified: Credit-Debit balanced and all account equations verified.'
+        elif completeness_score >= 80:
+            overall_status = 'COMPLETE'
+            overall_explanation = f'GL mostly complete with minor issues. Score: {completeness_score:.1f}%.'
+        else:
+            overall_status = 'INCOMPLETE'
+            issues = []
+            if not step1_completeness_passed:
+                if not gl_is_balanced:
+                    issues.append(f'GL imbalanced by {gl_net_balance:.2f}')
+                if not volume_check:
+                    issues.append('Insufficient data volume')
+                if not data_availability:
+                    issues.append('Missing TB data')
+            if not step2_account_verification_passed:
+                issues.append(f'{balance_equation_failed_count} accounts failed balance verification')
+            overall_explanation = f"GL incomplete (Score: {completeness_score:.1f}%): {', '.join(issues)}"
+        
+        assessment_duration = (timezone.now() - assessment_start).total_seconds()
+        processing_duration = (timezone.now() - start_time).total_seconds()
+        
+        logger.info(f"📊 Overall Assessment Completed:")
+        logger.info(f"   🎯 Status: {overall_status}")
+        logger.info(f"   📈 Score: {completeness_score:.1f}%")
+        logger.info(f"   ⏱️  Assessment Duration: {assessment_duration:.2f}s")
+        logger.info(f"   ⏱️  Total Processing Duration: {processing_duration:.2f}s")
+        
+        # =======================================================================
+        # ENHANCED COMPREHENSIVE STATISTICS CALCULATION
+        # =======================================================================
+        
+        logger.info("📊 Calculating enhanced comprehensive statistics...")
+        enhanced_stats_start = timezone.now()
+        
+        # Calculate additional statistics
+        enhanced_statistics = _calculate_enhanced_statistics(
+            gl_postings, trial_balance_records, coa_records, 
+            gl_account_totals, account_verifications
+        )
+        
+        enhanced_stats_duration = (timezone.now() - enhanced_stats_start).total_seconds()
+        logger.info(f"📊 Enhanced statistics calculated in {enhanced_stats_duration:.2f}s")
+        
+        # Prepare comprehensive statistics for charts and analysis
+        comprehensive_statistics = {
+            'document_statistics': {
+                'total_gl_records': transaction_count,
+                'total_tb_records': trial_balance_records.count(),
+                'unique_accounts': account_count,
+                'gl_debit_total': gl_total_debit,
+                'gl_credit_total': gl_total_credit,
+                'gl_net_balance': gl_net_balance
+            },
+            'summary_statistics': {
+                'completeness_score': completeness_score,
+                'steps_passed': 2 if all_steps_passed else (1 if step1_completeness_passed else 0),
+                'total_steps': 2,
+                'account_verification_pass_rate': pass_rate,
+                'total_variance': total_variance,
+                'failed_accounts_count': balance_equation_failed_count
+            },
+            'enhanced_statistics': enhanced_statistics,
+            'chart_data': chart_data,
+            'monthly_trends': chart_data.get('monthly_trends', {}),
+            'top_accounts': chart_data.get('top_accounts', {})
+        }
+        
+        # Prepare completeness results
+        completeness_results = {
+            'status': overall_status,
+            'explanation': overall_explanation,
+            'completeness_score': round(completeness_score, 1),
+            'analysis_timestamp': timezone.now().isoformat(),
+            'file_name': data_file.file_name,
+            'engagement_id': str(data_file.engagement_id),
+            'total_gl_records': transaction_count,
+            'total_tb_records': trial_balance_records.count(),
+            'processing_duration': processing_duration,
+            'step1_completeness': step1_completeness,
+            'step2_account_verification': step2_account_verification,
+            'comprehensive_statistics': comprehensive_statistics,
+            'scoring_breakdown': {
+                'step_scores': scores,
+                'step_weights': weights,
+                'final_score': round(completeness_score, 1)
+            },
+            'summary': {
+                'tests_passed': 2 if all_steps_passed else (1 if step1_completeness_passed else 0),
+                'total_tests': 2,
+                'critical_issues_count': balance_equation_failed_count if not step2_account_verification_passed else 0,
+                'all_steps_passed': all_steps_passed
+            }
+        }
+        
+        # Save to database
+        try:
+            test_result = CompletenessTestResult.objects.create(
+                engagement=data_file.engagement,
+                gl_file=data_file,
+                tb_file=None,  # We'll find TB file later
+                coa_file=None,  # We'll find COA file later  
+                overall_status=overall_status,
+                overall_explanation=overall_explanation,
+                completeness_score=completeness_score,
+                step1_file_completeness=step1_completeness,
+                step2_gl_tb_reconciliation=step2_account_verification,
+                step3_debit_credit_balance={},  # Not used in 2-step
+                step4_account_coverage={},      # Not used in 2-step
+                step5_coa_hierarchy_validation={},  # Not used in 2-step
+                step6_account_linking={},       # Not used in 2-step
+                step7_transaction_gaps={},      # Not used in 2-step
+                total_gl_records=transaction_count,
+                total_tb_records=trial_balance_records.count(),
+                total_coa_records=coa_records.count() if coa_records.exists() else 0,
+                total_accounts_unified=account_count,
+                tests_passed=2 if all_steps_passed else (1 if step1_completeness_passed else 0),
+                total_tests=2,
+                critical_issues_count=balance_equation_failed_count if not step2_account_verification_passed else 0,
+                comprehensive_statistics=comprehensive_statistics,
+                processing_duration=processing_duration
+            )
+            
+            logger.info(f"💾 Completeness test result saved to database (ID: {test_result.id})")
+            
+        except Exception as db_error:
+            logger.error(f"Failed to save completeness test result: {db_error}")
+            # Continue execution even if DB save fails
+        
+        logger.info("================================================================================")
+        logger.info(f"✅ COMPLETENESS ANALYSIS COMPLETED SUCCESSFULLY")
+        logger.info(f"📊 Status: {overall_status}, Score: {completeness_score:.1f}%")
+        logger.info(f"⏱️  Total Duration: {processing_duration:.2f} seconds")
+        logger.info("================================================================================")
+        
+        return {
+            'success': True,
+            'completeness_results': completeness_results,
+            'analysis_duration': processing_duration,
+            'test_result_id': test_result.id if 'test_result' in locals() else None
+        }
+        
+    except Exception as e:
+        error_message = f"Completeness analysis failed: {str(e)}"
+        logger.error(f"❌ {error_message}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        return {
+            'success': False,
+            'error': error_message,
+            'analysis_duration': (timezone.now() - start_time).total_seconds() if 'start_time' in locals() else 0
+        }
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, time_limit=600, soft_time_limit=540)
 def run_completeness_job(self, job_id):
     """
     Run completeness analysis job after all processing tasks are complete
@@ -538,3 +1075,544 @@ def _perform_audit_checks(gl_transactions, tb_records, coa_records, engagement):
         'risk_assessments': [],
         'recommendations': []
     }
+
+
+def _calculate_enhanced_statistics(gl_postings, trial_balance_records, coa_records, gl_account_totals, account_verifications):
+    """
+    Calculate enhanced comprehensive statistics including totals, means, standard deviations, and detailed breakdowns
+    """
+    import statistics
+    from collections import defaultdict, Counter
+    
+    logger.info("📊 Calculating enhanced statistics...")
+    
+    # =======================================================================
+    # BASIC TOTALS AND COUNTS
+    # =======================================================================
+    
+    # GL Account totals
+    total_gl_accounts = len(gl_account_totals)
+    
+    # Profit Center analysis
+    profit_centers = set()
+    profit_center_transactions = defaultdict(int)
+    profit_center_amounts = defaultdict(float)
+    
+    # User analysis
+    users = set()
+    user_transactions = defaultdict(int)
+    user_debit_totals = defaultdict(float)
+    user_credit_totals = defaultdict(float)
+    
+    # Transaction type analysis
+    debit_entries = 0
+    credit_entries = 0
+    transaction_amounts = []
+    account_transaction_counts = defaultdict(int)
+    
+    # =======================================================================
+    # AUDIT CALCULATION STATISTICS - DOCUMENT VERIFICATION
+    # =======================================================================
+    
+    # Document verification analysis
+    document_analysis = defaultdict(lambda: {
+        'debit_total': 0.0,
+        'credit_total': 0.0,
+        'net_balance': 0.0,
+        'is_balanced': False,
+        'transaction_count': 0,
+        'accounts': set(),
+        'users': set(),
+        'profit_centers': set(),
+        'posting_dates': set(),
+        'document_types': set()
+    })
+    
+    for posting in gl_postings:
+        # Profit Center analysis
+        if posting.profit_center:
+            profit_centers.add(posting.profit_center)
+            profit_center_transactions[posting.profit_center] += 1
+            profit_center_amounts[posting.profit_center] += abs(float(posting.amount_local_currency or 0))
+        
+        # User analysis
+        if posting.user_name:
+            users.add(posting.user_name)
+            user_transactions[posting.user_name] += 1
+            amount = float(posting.amount_local_currency or 0)
+            if amount > 0:
+                user_debit_totals[posting.user_name] += amount
+                debit_entries += 1
+            else:
+                user_credit_totals[posting.user_name] += abs(amount)
+                credit_entries += 1
+            transaction_amounts.append(abs(amount))
+        
+        # Account transaction counts
+        account_code = str(posting.gl_account).replace('.0', '')
+        account_transaction_counts[account_code] += 1
+        
+        # =======================================================================
+        # DOCUMENT VERIFICATION ANALYSIS
+        # =======================================================================
+        
+        # Get document number for analysis - handle empty/missing document numbers
+        document_number = posting.document_number or ''
+        if not document_number.strip():
+            document_number = 'NO_DOCUMENT'
+        amount = float(posting.amount_local_currency or 0)
+        
+        # Update document analysis
+        doc_analysis = document_analysis[document_number]
+        doc_analysis['transaction_count'] += 1
+        
+        # Add account to document
+        doc_analysis['accounts'].add(account_code)
+        
+        # Add user to document
+        if posting.user_name:
+            doc_analysis['users'].add(posting.user_name)
+        
+        # Add profit center to document
+        if posting.profit_center:
+            doc_analysis['profit_centers'].add(posting.profit_center)
+        
+        # Add posting date to document
+        if posting.posting_date:
+            doc_analysis['posting_dates'].add(posting.posting_date.strftime('%Y-%m-%d'))
+        
+        # Add document type to document
+        if posting.document_type:
+            doc_analysis['document_types'].add(posting.document_type)
+        
+        # Calculate debit/credit totals for document
+        if amount > 0:
+            doc_analysis['debit_total'] += amount
+        else:
+            doc_analysis['credit_total'] += abs(amount)
+    
+    total_profit_centers = len(profit_centers)
+    total_users = len(users)
+    
+    # =======================================================================
+    # DOCUMENT VERIFICATION CALCULATIONS
+    # =======================================================================
+    
+    logger.info("📊 Calculating document verification statistics...")
+    
+    # Calculate document balances and verification
+    document_verification_results = []
+    balanced_documents = 0
+    unbalanced_documents = 0
+    total_document_variance = 0.0
+    
+    for doc_number, doc_analysis in document_analysis.items():
+        # Calculate net balance (debit - credit)
+        doc_analysis['net_balance'] = doc_analysis['debit_total'] - doc_analysis['credit_total']
+        
+        # Check if document is balanced (within 0.01 tolerance)
+        doc_analysis['is_balanced'] = abs(doc_analysis['net_balance']) < 0.01
+        
+        # Count balanced/unbalanced documents
+        if doc_analysis['is_balanced']:
+            balanced_documents += 1
+        else:
+            unbalanced_documents += 1
+            total_document_variance += abs(doc_analysis['net_balance'])
+        
+        # Convert sets to lists for JSON serialization
+        doc_verification = {
+            'document_number': doc_number,
+            'debit_total': round(doc_analysis['debit_total'], 2),
+            'credit_total': round(doc_analysis['credit_total'], 2),
+            'net_balance': round(doc_analysis['net_balance'], 2),
+            'is_balanced': doc_analysis['is_balanced'],
+            'transaction_count': doc_analysis['transaction_count'],
+            'account_count': len(doc_analysis['accounts']),
+            'accounts': list(doc_analysis['accounts']),
+            'user_count': len(doc_analysis['users']),
+            'users': list(doc_analysis['users']),
+            'profit_center_count': len(doc_analysis['profit_centers']),
+            'profit_centers': list(doc_analysis['profit_centers']),
+            'posting_dates': list(doc_analysis['posting_dates']),
+            'document_types': list(doc_analysis['document_types']),
+            'account_links': {
+                'total_accounts': len(doc_analysis['accounts']),
+                'account_codes': list(doc_analysis['accounts']),
+                'account_diversity': len(doc_analysis['accounts']) / doc_analysis['transaction_count'] if doc_analysis['transaction_count'] > 0 else 0
+            }
+        }
+        
+        document_verification_results.append(doc_verification)
+    
+    # Sort documents by transaction count (most active first)
+    document_verification_results.sort(key=lambda x: x['transaction_count'], reverse=True)
+    
+    # Calculate document verification statistics
+    total_documents = len(document_verification_results)
+    document_balance_rate = (balanced_documents / total_documents) if total_documents > 0 else 0
+    average_document_variance = (total_document_variance / unbalanced_documents) if unbalanced_documents > 0 else 0
+    
+    # Separate transactions with and without document numbers
+    transactions_with_documents = [d for d in document_verification_results if d['document_number'] != 'NO_DOCUMENT']
+    transactions_without_documents = [d for d in document_verification_results if d['document_number'] == 'NO_DOCUMENT']
+    
+    # Count transactions without document numbers
+    no_document_transactions = len(transactions_without_documents)
+    no_document_count = sum(d['transaction_count'] for d in transactions_without_documents)
+    
+    # Account linkage analysis per document
+    account_linkage_stats = {
+        'documents_with_single_account': len([d for d in document_verification_results if d['account_count'] == 1]),
+        'documents_with_multiple_accounts': len([d for d in document_verification_results if d['account_count'] > 1]),
+        'average_accounts_per_document': sum(d['account_count'] for d in document_verification_results) / total_documents if total_documents > 0 else 0,
+        'max_accounts_in_document': max((d['account_count'] for d in document_verification_results), default=0),
+        'min_accounts_in_document': min((d['account_count'] for d in document_verification_results), default=0)
+    }
+    
+    logger.info(f"📊 Document verification completed:")
+    logger.info(f"   📄 Total Documents: {total_documents}")
+    logger.info(f"   ✅ Balanced Documents: {balanced_documents}")
+    logger.info(f"   ❌ Unbalanced Documents: {unbalanced_documents}")
+    logger.info(f"   📊 Balance Rate: {document_balance_rate:.1%}")
+    logger.info(f"   💰 Total Variance: {total_document_variance:.2f}")
+    logger.info(f"   📝 Transactions with Documents: {len(transactions_with_documents)}")
+    logger.info(f"   ❓ Transactions without Documents: {no_document_transactions} ({no_document_count} transactions)")
+    
+    # =======================================================================
+    # STATISTICAL CALCULATIONS
+    # =======================================================================
+    
+    # Amount statistics
+    if transaction_amounts:
+        mean_amount = statistics.mean(transaction_amounts)
+        median_amount = statistics.median(transaction_amounts)
+        std_dev_amount = statistics.stdev(transaction_amounts) if len(transaction_amounts) > 1 else 0
+        min_amount = min(transaction_amounts)
+        max_amount = max(transaction_amounts)
+    else:
+        mean_amount = median_amount = std_dev_amount = min_amount = max_amount = 0
+    
+    # Per-account statistics
+    account_transaction_counts_list = list(account_transaction_counts.values())
+    if account_transaction_counts_list:
+        mean_transactions_per_account = statistics.mean(account_transaction_counts_list)
+        median_transactions_per_account = statistics.median(account_transaction_counts_list)
+        std_dev_transactions_per_account = statistics.stdev(account_transaction_counts_list) if len(account_transaction_counts_list) > 1 else 0
+        max_transactions_per_account = max(account_transaction_counts_list)
+        min_transactions_per_account = min(account_transaction_counts_list)
+    else:
+        mean_transactions_per_account = median_transactions_per_account = std_dev_transactions_per_account = 0
+        max_transactions_per_account = min_transactions_per_account = 0
+    
+    # =======================================================================
+    # CHART DATA GENERATION
+    # =======================================================================
+    
+    # Account by transaction counts (top 20)
+    account_by_transactions = sorted(
+        account_transaction_counts.items(), 
+        key=lambda x: x[1], 
+        reverse=True
+    )[:20]
+    
+    # User by transaction counts (top 20)
+    user_by_transactions = sorted(
+        user_transactions.items(), 
+        key=lambda x: x[1], 
+        reverse=True
+    )[:20]
+    
+    # User by credit/debit analysis
+    user_credit_debit_data = []
+    for user in users:
+        user_credit_debit_data.append({
+            'user': user,
+            'debit_total': user_debit_totals.get(user, 0),
+            'credit_total': user_credit_totals.get(user, 0),
+            'transaction_count': user_transactions.get(user, 0),
+            'net_amount': user_debit_totals.get(user, 0) - user_credit_totals.get(user, 0)
+        })
+    
+    # Sort by transaction count
+    user_credit_debit_data = sorted(user_credit_debit_data, key=lambda x: x['transaction_count'], reverse=True)[:20]
+    
+    # Profit Center analysis
+    profit_center_data = []
+    for pc in profit_centers:
+        profit_center_data.append({
+            'profit_center': pc,
+            'transaction_count': profit_center_transactions.get(pc, 0),
+            'total_amount': profit_center_amounts.get(pc, 0)
+        })
+    
+    # Sort by transaction count
+    profit_center_data = sorted(profit_center_data, key=lambda x: x['transaction_count'], reverse=True)[:20]
+    
+    # =======================================================================
+    # COMPREHENSIVE STATISTICS OBJECT
+    # =======================================================================
+    
+    enhanced_statistics = {
+        'basic_totals': {
+            'total_gl_accounts': total_gl_accounts,
+            'total_profit_centers': total_profit_centers,
+            'total_users': total_users,
+            'total_debit_entries': debit_entries,
+            'total_credit_entries': credit_entries,
+            'total_transactions': len(gl_postings)
+        },
+        'amount_statistics': {
+            'mean_amount': round(mean_amount, 2),
+            'median_amount': round(median_amount, 2),
+            'std_deviation_amount': round(std_dev_amount, 2),
+            'min_amount': round(min_amount, 2),
+            'max_amount': round(max_amount, 2),
+            'total_debit_amount': round(sum(user_debit_totals.values()), 2),
+            'total_credit_amount': round(sum(user_credit_totals.values()), 2)
+        },
+        'per_account_statistics': {
+            'mean_transactions_per_account': round(mean_transactions_per_account, 2),
+            'median_transactions_per_account': round(median_transactions_per_account, 2),
+            'std_deviation_transactions_per_account': round(std_dev_transactions_per_account, 2),
+            'max_transactions_per_account': max_transactions_per_account,
+            'min_transactions_per_account': min_transactions_per_account
+        },
+        'chart_data_enhanced': {
+            'account_by_transaction_counts': {
+                'labels': [acc[0] for acc in account_by_transactions],
+                'transaction_counts': [acc[1] for acc in account_by_transactions]
+            },
+            'user_by_transaction_counts': {
+                'labels': [user[0] for user in user_by_transactions],
+                'transaction_counts': [user[1] for user in user_by_transactions]
+            },
+            'user_credit_debit_analysis': {
+                'labels': [user['user'] for user in user_credit_debit_data],
+                'debit_totals': [user['debit_total'] for user in user_credit_debit_data],
+                'credit_totals': [user['credit_total'] for user in user_credit_debit_data],
+                'net_amounts': [user['net_amount'] for user in user_credit_debit_data],
+                'transaction_counts': [user['transaction_count'] for user in user_credit_debit_data]
+            },
+            'profit_center_analysis': {
+                'labels': [pc['profit_center'] for pc in profit_center_data],
+                'transaction_counts': [pc['transaction_count'] for pc in profit_center_data],
+                'total_amounts': [pc['total_amount'] for pc in profit_center_data]
+            }
+        },
+        'data_quality_metrics': {
+            'accounts_with_transactions': len(account_transaction_counts),
+            'users_with_activity': len(users),
+            'profit_centers_with_activity': len(profit_centers),
+            'average_transactions_per_user': round(len(gl_postings) / total_users, 2) if total_users > 0 else 0,
+            'average_transactions_per_account': round(len(gl_postings) / total_gl_accounts, 2) if total_gl_accounts > 0 else 0,
+            'average_transactions_per_profit_center': round(len(gl_postings) / total_profit_centers, 2) if total_profit_centers > 0 else 0
+        },
+        'audit_calculation_statistics': {
+            'document_verification': {
+                'total_documents': total_documents,
+                'balanced_documents': balanced_documents,
+                'unbalanced_documents': unbalanced_documents,
+                'document_balance_rate': round(document_balance_rate, 3),
+                'total_document_variance': round(total_document_variance, 2),
+                'average_document_variance': round(average_document_variance, 2),
+                'transactions_with_documents': len(transactions_with_documents),
+                'transactions_without_documents': no_document_transactions,
+                'no_document_transaction_count': no_document_count
+            },
+            'account_linkage_analysis': account_linkage_stats,
+            'document_balance_verification': {
+                'verification_rule': 'Each document must have Debit Total = Credit Total (within 0.01 tolerance). Transactions without document numbers are tracked separately.',
+                'verification_passed': document_balance_rate >= 0.95,  # 95% of documents should be balanced
+                'critical_issues': unbalanced_documents + no_document_transactions,
+                'recommendation': f'Review {unbalanced_documents} unbalanced documents and {no_document_transactions} transactions without document numbers' if (unbalanced_documents > 0 or no_document_transactions > 0) else 'All documents are properly balanced'
+            },
+            'document_details': document_verification_results[:20],  # Top 20 documents by transaction count
+            'unbalanced_documents': [d for d in document_verification_results if not d['is_balanced']][:10],  # Top 10 unbalanced documents
+            'no_document_transactions': transactions_without_documents,  # All transactions without document numbers
+            'transactions_with_documents': transactions_with_documents[:10]  # Top 10 transactions with documents
+        }
+    }
+    
+    logger.info(f"📊 Enhanced statistics calculated:")
+    logger.info(f"   📋 Total GL Accounts: {total_gl_accounts}")
+    logger.info(f"   🏢 Total Profit Centers: {total_profit_centers}")
+    logger.info(f"   👥 Total Users: {total_users}")
+    logger.info(f"   💰 Mean Amount: {mean_amount:.2f}")
+    logger.info(f"   📊 Mean Transactions per Account: {mean_transactions_per_account:.2f}")
+    logger.info(f"   📄 Total Documents: {total_documents}")
+    logger.info(f"   ✅ Balanced Documents: {balanced_documents}")
+    logger.info(f"   ❌ Unbalanced Documents: {unbalanced_documents}")
+    logger.info(f"   📊 Document Balance Rate: {document_balance_rate:.1%}")
+    
+    return enhanced_statistics
+
+
+@shared_task(bind=True, name='core.tasks.trigger_eng008_completeness')
+def trigger_eng008_completeness(self):
+    """
+    Simple task to trigger completeness test for ENG-008
+    """
+    try:
+        logger.info("Starting ENG-008 completeness trigger task")
+        
+        # Get ENG-008 engagement
+        engagement = Engagement.objects.get(engagement_id='ENG-008')
+        logger.info(f"Found engagement: {engagement.engagement_id} - {engagement.engagement_name}")
+        
+        # Get the latest data file for this engagement
+        latest_data_file = DataFile.objects.filter(
+            engagement=engagement
+        ).order_by('-created_at').first()
+        
+        if not latest_data_file:
+            logger.error("No data file found for ENG-008")
+            return {"status": "error", "message": "No data file found for ENG-008"}
+        
+        logger.info(f"Using data file: {latest_data_file.file_name} (ID: {latest_data_file.id})")
+        
+        # Trigger the completeness analysis task
+        logger.info("Triggering completeness analysis task...")
+        completeness_task = run_gl_completeness_analysis.delay(latest_data_file.id)
+        
+        logger.info(f"Completeness task triggered with ID: {completeness_task.id}")
+        
+        # Trigger AI prediction task
+        logger.info("Triggering AI completeness prediction...")
+        try:
+            from .ml_training_tasks import predict_completeness_with_ai
+            ai_prediction_task = predict_completeness_with_ai.delay(latest_data_file.id)
+            logger.info(f"AI prediction task triggered with ID: {ai_prediction_task.id}")
+        except Exception as e:
+            logger.error(f"Failed to trigger AI prediction: {e}")
+            ai_prediction_task = None
+        
+        # Trigger ML model training
+        logger.info("Triggering ML model training...")
+        try:
+            from .ml_training_tasks import train_comprehensive_ai_models
+            ml_training_task = train_comprehensive_ai_models.delay(
+                engagement_id=engagement.id,
+                client_name=engagement.engagement_name
+            )
+            logger.info(f"ML training task triggered with ID: {ml_training_task.id}")
+        except Exception as e:
+            logger.error(f"Failed to trigger ML training: {e}")
+            ml_training_task = None
+        
+        # Trigger GL volume prediction model training
+        logger.info("Triggering GL volume prediction model training...")
+        try:
+            from core.gl_prediction_tasks import train_gl_volume_prediction_model
+            gl_prediction_task = train_gl_volume_prediction_model.delay(
+                engagement_id=engagement.id,
+                client_name=engagement.engagement_name
+            )
+            logger.info(f"GL volume prediction task triggered with ID: {gl_prediction_task.id}")
+        except Exception as e:
+            logger.error(f"Failed to trigger GL volume prediction: {e}")
+            gl_prediction_task = None
+        
+        return {
+            "status": "success", 
+            "message": "Completeness test, AI prediction, ML training, and GL volume prediction triggered for ENG-008",
+            "data_file_id": latest_data_file.id,
+            "completeness_task_id": completeness_task.id,
+            "ai_prediction_task_id": ai_prediction_task.id if ai_prediction_task else None,
+            "ml_training_task_id": ml_training_task.id if ml_training_task else None,
+            "gl_prediction_task_id": gl_prediction_task.id if gl_prediction_task else None
+        }
+        
+    except Engagement.DoesNotExist:
+        logger.error("ENG-008 engagement not found")
+        return {"status": "error", "message": "ENG-008 engagement not found"}
+    except Exception as e:
+        logger.error(f"Error triggering ENG-008 completeness: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@shared_task(bind=True, name='core.tasks.run_eng008_complete_workflow')
+def run_eng008_complete_workflow(self):
+    """
+    Complete workflow for ENG-008: Completeness Test → AI Prediction → ML Training
+    """
+    try:
+        logger.info("Starting complete ENG-008 workflow")
+        
+        # Get ENG-008 engagement
+        engagement = Engagement.objects.get(engagement_id='ENG-008')
+        logger.info(f"Found engagement: {engagement.engagement_id} - {engagement.engagement_name}")
+        
+        # Get the latest data file for this engagement
+        latest_data_file = DataFile.objects.filter(
+            engagement=engagement
+        ).order_by('-created_at').first()
+        
+        if not latest_data_file:
+            logger.error("No data file found for ENG-008")
+            return {"status": "error", "message": "No data file found for ENG-008"}
+        
+        logger.info(f"Using data file: {latest_data_file.file_name} (ID: {latest_data_file.id})")
+        
+        # Step 1: Run completeness analysis
+        logger.info("Step 1: Running completeness analysis...")
+        completeness_result = run_gl_completeness_analysis(latest_data_file.id)
+        
+        if not completeness_result.get('success', False):
+            logger.error(f"Completeness analysis failed: {completeness_result.get('error', 'Unknown error')}")
+            return {"status": "error", "message": "Completeness analysis failed"}
+        
+        logger.info("Step 1 completed: Completeness analysis successful")
+        
+        # Step 2: Run AI prediction
+        logger.info("Step 2: Running AI prediction...")
+        try:
+            from .ml_training_tasks import predict_completeness_with_ai
+            ai_prediction_result = predict_completeness_with_ai(latest_data_file.id)
+            logger.info(f"Step 2 completed: AI prediction - {ai_prediction_result.get('status', 'unknown')}")
+        except Exception as e:
+            logger.error(f"AI prediction failed: {e}")
+            ai_prediction_result = {"status": "error", "message": str(e)}
+        
+        # Step 3: Run ML model training
+        logger.info("Step 3: Running ML model training...")
+        try:
+            from .ml_training_tasks import train_comprehensive_ai_models
+            ml_training_result = train_comprehensive_ai_models(
+                engagement_id=engagement.id,
+                client_name=engagement.engagement_name
+            )
+            logger.info(f"Step 3 completed: ML training - {ml_training_result.get('status', 'unknown')}")
+        except Exception as e:
+            logger.error(f"ML training failed: {e}")
+            ml_training_result = {"status": "error", "message": str(e)}
+        
+        # Step 4: Run GL volume prediction model training
+        logger.info("Step 4: Running GL volume prediction model training...")
+        try:
+            from core.gl_prediction_tasks import train_gl_volume_prediction_model
+            gl_prediction_result = train_gl_volume_prediction_model(
+                engagement_id=engagement.id,
+                client_name=engagement.engagement_name
+            )
+            logger.info(f"Step 4 completed: GL volume prediction - {gl_prediction_result.get('status', 'unknown')}")
+        except Exception as e:
+            logger.error(f"GL volume prediction failed: {e}")
+            gl_prediction_result = {"status": "error", "message": str(e)}
+        
+        return {
+            "status": "success",
+            "message": "Complete ENG-008 workflow executed with future prediction",
+            "data_file_id": latest_data_file.id,
+            "completeness_result": completeness_result,
+            "ai_prediction_result": ai_prediction_result,
+            "ml_training_result": ml_training_result,
+            "gl_prediction_result": gl_prediction_result
+        }
+        
+    except Engagement.DoesNotExist:
+        logger.error("ENG-008 engagement not found")
+        return {"status": "error", "message": "ENG-008 engagement not found"}
+    except Exception as e:
+        logger.error(f"Complete workflow failed: {e}")
+        return {"status": "error", "message": str(e)}

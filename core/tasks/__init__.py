@@ -14,11 +14,16 @@ from .analysis_tasks import (
     run_holiday_analysis,
     run_overall_analysis,
     run_manual_entry_analysis,
+    run_ai_risk_recommendations,
+    run_risk_analysis,
 )
 
 from .completeness_tasks import (
     run_completeness_job,
     run_completeness_test,
+    run_gl_completeness_analysis,
+    trigger_eng008_completeness,
+    run_eng008_complete_workflow,
 )
 
 from .ml_training_tasks import (
@@ -34,6 +39,9 @@ from .ml_training_tasks import (
     train_ml_models,
     retrain_ml_models,
     predict_anomalies_ml,
+    train_comprehensive_ai_models,
+    train_completeness_recommendation_model,
+    predict_completeness_with_ai,
 )
 
 from .monitoring_tasks import (
@@ -81,6 +89,8 @@ __all__ = [
     # Completeness tasks
     'run_completeness_job',
     'run_completeness_test',
+    'trigger_eng008_completeness',
+    'run_eng008_complete_workflow',
     
     # ML training tasks
     'train_rule_based_models',

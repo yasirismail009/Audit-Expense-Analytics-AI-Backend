@@ -22,7 +22,7 @@ from uuid import uuid4
 from datetime import datetime
 from typing import Optional
 
-from .models import DataFile, Client, Engagement, CompletenessTestResult
+from .models import DataFile, Client, Engagement, CompletenessTestResult, SAPGLPosting, ProfitCenter
 from .serializers import CompletenessTestResultSerializer, CompletenessTestSummarySerializer
 from .file_processing_utils import FileReader, FileTypeDetector, DataProcessor
 
@@ -1294,17 +1294,157 @@ class CompletenessTestPagination(PageNumberPagination):
     max_page_size = 100
 
 
+def _clean_comprehensive_statistics(comprehensive_stats):
+    """
+    Clean comprehensive statistics to remove detailed arrays and keep only summary data
+    """
+    if not comprehensive_stats:
+        return None
+    
+    cleaned_stats = {}
+    
+    # Keep chart data with full arrays for charts
+    if 'chart_data' in comprehensive_stats:
+        chart_data = comprehensive_stats['chart_data']
+        cleaned_chart_data = {}
+        
+        # Keep top accounts data with full arrays for charting
+        if 'top_accounts' in chart_data:
+            top_accounts = chart_data['top_accounts']
+            cleaned_chart_data['top_accounts'] = {
+                'labels': top_accounts.get('labels', []),
+                'debit_amounts': top_accounts.get('debit_amounts', []),
+                'credit_amounts': top_accounts.get('credit_amounts', []),
+                'net_movements': top_accounts.get('net_movements', []),
+                # Add summary stats for quick reference
+                'total_accounts': len(top_accounts.get('labels', [])) if isinstance(top_accounts.get('labels'), list) else len(top_accounts.get('labels', '').split()) if isinstance(top_accounts.get('labels'), str) else 0,
+                'total_debit_amount': sum(top_accounts.get('debit_amounts', [])) if isinstance(top_accounts.get('debit_amounts'), list) else sum([float(x) for x in top_accounts.get('debit_amounts', '').split()]) if isinstance(top_accounts.get('debit_amounts'), str) else 0,
+                'total_credit_amount': sum(top_accounts.get('credit_amounts', [])) if isinstance(top_accounts.get('credit_amounts'), list) else sum([float(x) for x in top_accounts.get('credit_amounts', '').split()]) if isinstance(top_accounts.get('credit_amounts'), str) else 0,
+                'net_balance': sum(top_accounts.get('net_movements', [])) if isinstance(top_accounts.get('net_movements'), list) else sum([float(x) for x in top_accounts.get('net_movements', '').split()]) if isinstance(top_accounts.get('net_movements'), str) else 0
+            }
+        
+        # Keep chart metadata
+        if 'chart_metadata' in chart_data:
+            cleaned_chart_data['chart_metadata'] = chart_data['chart_metadata']
+        
+        # Keep monthly trends with full arrays for charting
+        if 'monthly_trends' in chart_data:
+            monthly_trends = chart_data['monthly_trends']
+            cleaned_chart_data['monthly_trends'] = {
+                'labels': monthly_trends.get('labels', []),
+                'amounts': monthly_trends.get('amounts', []),
+                'transaction_counts': monthly_trends.get('transaction_counts', []),
+                # Add summary stats for quick reference
+                'total_months': len(monthly_trends.get('labels', [])),
+                'total_amount': sum(monthly_trends.get('amounts', [])),
+                'total_transactions': sum(monthly_trends.get('transaction_counts', []))
+            }
+        
+        cleaned_stats['chart_data'] = cleaned_chart_data
+    
+    # Keep summary statistics
+    if 'summary_statistics' in comprehensive_stats:
+        cleaned_stats['summary_statistics'] = comprehensive_stats['summary_statistics']
+    
+    # Clean document statistics - remove account codes arrays
+    if 'document_statistics' in comprehensive_stats:
+        doc_stats = comprehensive_stats['document_statistics']
+        cleaned_stats['document_statistics'] = {
+            'gl_debit_total': doc_stats.get('gl_debit_total', 0),
+            'gl_credit_total': doc_stats.get('gl_credit_total', 0),
+            'gl_net_balance': doc_stats.get('gl_net_balance', 0),
+            'unique_accounts': doc_stats.get('unique_accounts', 0),
+            'total_gl_records': doc_stats.get('total_gl_records', 0),
+            'total_tb_records': doc_stats.get('total_tb_records', 0)
+        }
+    
+    # Clean enhanced statistics - remove detailed arrays
+    if 'enhanced_statistics' in comprehensive_stats:
+        enhanced_stats = comprehensive_stats['enhanced_statistics']
+        cleaned_enhanced = {}
+        
+        # Keep basic totals
+        if 'basic_totals' in enhanced_stats:
+            cleaned_enhanced['basic_totals'] = enhanced_stats['basic_totals']
+        
+        # Keep amount statistics
+        if 'amount_statistics' in enhanced_stats:
+            cleaned_enhanced['amount_statistics'] = enhanced_stats['amount_statistics']
+        
+        # Keep data quality metrics
+        if 'data_quality_metrics' in enhanced_stats:
+            cleaned_enhanced['data_quality_metrics'] = enhanced_stats['data_quality_metrics']
+        
+        # Keep per account statistics
+        if 'per_account_statistics' in enhanced_stats:
+            cleaned_enhanced['per_account_statistics'] = enhanced_stats['per_account_statistics']
+        
+        # Keep enhanced chart data with full arrays for charting
+        if 'chart_data_enhanced' in enhanced_stats:
+            chart_data_enhanced = enhanced_stats['chart_data_enhanced']
+            cleaned_enhanced['chart_data_enhanced'] = {}
+            
+            # Convert string data to arrays for each chart type
+            for chart_type, chart_data in chart_data_enhanced.items():
+                if isinstance(chart_data, dict):
+                    cleaned_chart = {}
+                    for key, value in chart_data.items():
+                        if isinstance(value, str) and value.strip():
+                            # Convert space-separated string to array
+                            string_array = value.split()
+                            # Try to convert to numbers if possible
+                            try:
+                                if key in ['total_amounts', 'transaction_counts', 'net_amounts', 'debit_totals', 'credit_totals']:
+                                    # Convert to float for numeric arrays
+                                    cleaned_chart[key] = [float(x) for x in string_array]
+                                else:
+                                    # Keep as strings for labels
+                                    cleaned_chart[key] = string_array
+                            except ValueError:
+                                # If conversion fails, keep as strings
+                                cleaned_chart[key] = string_array
+                        else:
+                            cleaned_chart[key] = value
+                    cleaned_enhanced['chart_data_enhanced'][chart_type] = cleaned_chart
+                else:
+                    cleaned_enhanced['chart_data_enhanced'][chart_type] = chart_data
+        
+        # Clean audit calculation statistics - remove detailed arrays
+        if 'audit_calculation_statistics' in enhanced_stats:
+            audit_stats = enhanced_stats['audit_calculation_statistics']
+            cleaned_audit = {}
+            
+            # Keep only summary data, remove detailed arrays
+            for key, value in audit_stats.items():
+                if isinstance(value, str) and value:  # Keep string summaries
+                    cleaned_audit[key] = value
+                elif isinstance(value, dict):  # Keep dict summaries
+                    cleaned_audit[key] = value
+            
+            cleaned_enhanced['audit_calculation_statistics'] = cleaned_audit
+        
+        cleaned_stats['enhanced_statistics'] = cleaned_enhanced
+    
+    return cleaned_stats
+
+
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_completeness_test_by_engagement(request, engagement_id):
     """
-    Get completeness test results for a specific engagement
+    Get completeness test results for a specific engagement - SINGLE RESULT WITH ENGAGEMENT DETAILS
     
     GET /api/completeness-test/engagement/{engagement_id}/
     
     Query Parameters:
     - summary: boolean (default: false) - Return summary only
     - latest: boolean (default: true) - Return only the latest test result
+    
+    Returns:
+    - Single test result (not array)
+    - Engagement details (name, client, fiscal year, status)
+    - Statistics and summary data only (no detailed verification listings)
+    - Step summaries with proper data extraction
     """
     try:
         # Get query parameters
@@ -1326,50 +1466,125 @@ def get_completeness_test_by_engagement(request, engagement_id):
         if latest_only:
             queryset = queryset.order_by('-test_timestamp')[:1]
         
-        # Choose serializer based on summary parameter
-        if summary_only:
-            serializer_class = CompletenessTestSummarySerializer
-        else:
-            serializer_class = CompletenessTestResultSerializer
-        
         # Convert queryset to list to avoid QuerySet serialization issues
         queryset_list = list(queryset)
         
-        # Serialize the results
-        serializer = serializer_class(queryset_list, many=True)
+        # Create cleaned results with only statistics
+        cleaned_results = []
+        for result in queryset_list:
+            # Extract only statistics and summary data
+            cleaned_result = {
+                'id': str(result.id),
+                'engagement_id': result.engagement.engagement_id,
+                'engagement_name': result.engagement.engagement_name,
+                'client_name': result.engagement.client.client_name,
+                'test_timestamp': result.test_timestamp,
+                'test_version': result.test_version,
+                
+                # File information (names only)
+                'gl_file_name': result.gl_file.file_name if result.gl_file else None,
+                'tb_file_name': result.tb_file.file_name if result.tb_file else None,
+                'coa_file_name': result.coa_file.file_name if result.coa_file else None,
+                
+                # Test results
+                'overall_status': result.overall_status,
+                'overall_explanation': result.overall_explanation,
+                'completeness_score': result.completeness_score,
+                
+                # Statistics only
+                'total_gl_records': result.total_gl_records,
+                'total_tb_records': result.total_tb_records,
+                'total_coa_records': result.total_coa_records,
+                'total_accounts_unified': result.total_accounts_unified,
+                'tests_passed': result.tests_passed,
+                'total_tests': result.total_tests,
+                'critical_issues_count': result.critical_issues_count,
+                'processing_duration': result.processing_duration,
+                
+                # Step summaries (statistics only) - using actual data structure
+                'step1_summary': {
+                    'status': 'PASS' if result.step1_file_completeness.get('passed', False) else 'FAIL' if result.step1_file_completeness else 'UNKNOWN',
+                    'passed': result.step1_file_completeness.get('passed', False) if result.step1_file_completeness else False,
+                    'description': result.step1_file_completeness.get('description', '') if result.step1_file_completeness else '',
+                    'explanation': result.step1_file_completeness.get('explanation', '') if result.step1_file_completeness else '',
+                    'gl_balance_status': 'PASS' if result.step1_file_completeness.get('gl_is_balanced', False) else 'FAIL' if result.step1_file_completeness else 'UNKNOWN',
+                    'data_volume_status': 'PASS' if result.step1_file_completeness.get('volume_check', False) else 'FAIL' if result.step1_file_completeness else 'UNKNOWN',
+                    'total_debit': result.step1_file_completeness.get('gl_debit_total', 0) if result.step1_file_completeness else 0,
+                    'total_credit': result.step1_file_completeness.get('gl_credit_total', 0) if result.step1_file_completeness else 0,
+                    'balance_difference': result.step1_file_completeness.get('gl_net_balance', 0) if result.step1_file_completeness else 0,
+                    'transaction_count': result.step1_file_completeness.get('transaction_count', 0) if result.step1_file_completeness else 0,
+                    'account_count': result.step1_file_completeness.get('account_count', 0) if result.step1_file_completeness else 0,
+                    'has_tb': result.step1_file_completeness.get('has_tb', False) if result.step1_file_completeness else False,
+                } if result.step1_file_completeness else None,
+                
+                'step2_summary': {
+                    'status': 'PASS' if result.step2_gl_tb_reconciliation.get('passed', False) else 'FAIL' if result.step2_gl_tb_reconciliation else 'UNKNOWN',
+                    'passed': result.step2_gl_tb_reconciliation.get('passed', False) if result.step2_gl_tb_reconciliation else False,
+                    'description': result.step2_gl_tb_reconciliation.get('description', '') if result.step2_gl_tb_reconciliation else '',
+                    'explanation': result.step2_gl_tb_reconciliation.get('explanation', '') if result.step2_gl_tb_reconciliation else '',
+                    'accounts_verified': result.step2_gl_tb_reconciliation.get('total_accounts_verified', 0) if result.step2_gl_tb_reconciliation else 0,
+                    'accounts_passed': result.step2_gl_tb_reconciliation.get('accounts_passed', 0) if result.step2_gl_tb_reconciliation else 0,
+                    'accounts_failed': result.step2_gl_tb_reconciliation.get('accounts_failed', 0) if result.step2_gl_tb_reconciliation else 0,
+                    'pass_rate': result.step2_gl_tb_reconciliation.get('pass_rate', 0) if result.step2_gl_tb_reconciliation else 0,
+                    'total_variance': result.step2_gl_tb_reconciliation.get('total_variance', 0) if result.step2_gl_tb_reconciliation else 0,
+                    'account_verifications_count': len(result.step2_gl_tb_reconciliation.get('account_verifications', [])) if result.step2_gl_tb_reconciliation else 0,
+                    'failed_accounts_count': len(result.step2_gl_tb_reconciliation.get('failed_accounts', [])) if result.step2_gl_tb_reconciliation else 0,
+                } if result.step2_gl_tb_reconciliation else None,
+                
+                # Comprehensive statistics (cleaned - statistics only)
+                'comprehensive_statistics': _clean_comprehensive_statistics(result.comprehensive_statistics) if result.comprehensive_statistics else None,
+                
+                'created_at': result.created_at,
+                'updated_at': result.updated_at
+            }
+            
+            # Add summary only if not summary_only
+            if not summary_only:
+                cleaned_result['test_summary'] = result.get_summary() if hasattr(result, 'get_summary') else None
+                cleaned_result['engagement_completeness_status'] = result.get_engagement_completeness_status() if hasattr(result, 'get_engagement_completeness_status') else None
+                cleaned_result['failed_tests'] = result.get_failed_tests() if hasattr(result, 'get_failed_tests') else None
+            
+            cleaned_results.append(cleaned_result)
         
-        # Remove account_verifications from the serialized data to reduce response size
-        serialized_data = serializer.data
-        for result in serialized_data:
-            if 'step2_gl_tb_reconciliation' in result and isinstance(result['step2_gl_tb_reconciliation'], dict):
-                if 'account_verifications' in result['step2_gl_tb_reconciliation']:
-                    # Remove the detailed account_verifications list but keep summary info
-                    step2_data = result['step2_gl_tb_reconciliation'].copy()
-                    account_verifications_count = len(step2_data.get('account_verifications', []))
-                    del step2_data['account_verifications']
-                    step2_data['account_verifications_count'] = account_verifications_count
-                    step2_data['account_verifications_note'] = f"Use /api/account-verifications/engagement/{engagement_id}/ to get detailed account verification data"
-                    result['step2_gl_tb_reconciliation'] = step2_data
+        # Get the latest result (single result, not array)
+        latest_result = queryset_list[0] if queryset_list else None
         
-        # Prepare response data
+        if not latest_result:
+            return Response({
+                'engagement_id': engagement_id,
+                'message': f'No completeness test results found for engagement {engagement_id}'
+            }, status=status.HTTP_200_OK)
+        
+        # Get engagement details
+        engagement = latest_result.engagement
+        
+        # Prepare single result response with engagement details
         response_data = {
             'engagement_id': engagement_id,
-            'total_tests': queryset.count() if not latest_only else 1,
-            'results': serialized_data
-        }
-        
-        # Add summary statistics if not summary_only
-        if not summary_only and queryset_list:
-            latest_result = queryset_list[0]  # Get first item from the list
-            response_data['summary'] = {
-                'latest_test_timestamp': latest_result.test_timestamp,
+            'engagement_name': engagement.engagement_name,
+            'client_name': engagement.client.client_name,
+            'client_id': engagement.client.id,
+            'fiscal_year': engagement.fiscal_year,
+            'engagement_status': engagement.status,
+            'engagement_created_at': engagement.created_at,
+            'engagement_updated_at': engagement.updated_at,
+            
+            # Test result (single object, not array)
+            'test_result': cleaned_results[0] if cleaned_results else None,
+            
+            # Summary statistics
+            'summary': {
+                'test_timestamp': latest_result.test_timestamp,
                 'overall_status': latest_result.overall_status,
                 'completeness_score': latest_result.completeness_score,
                 'tests_passed': latest_result.tests_passed,
                 'total_tests': latest_result.total_tests,
                 'critical_issues': latest_result.critical_issues_count,
                 'total_gl_records': latest_result.total_gl_records,
-                'total_tb_records': latest_result.total_tb_records
+                'total_tb_records': latest_result.total_tb_records,
+                'total_coa_records': latest_result.total_coa_records,
+                'processing_duration': latest_result.processing_duration
+            }
             }
         
         return Response(response_data, status=status.HTTP_200_OK)
@@ -1569,6 +1784,20 @@ class AccountVerificationsPagination(PageNumberPagination):
     page_size = 50
     page_size_query_param = 'page_size'
     max_page_size = 500
+
+
+class DocumentVerificationsPagination(PageNumberPagination):
+    """Custom pagination for document verifications"""
+    page_size = 50
+    page_size_query_param = 'page_size'
+    max_page_size = 500
+
+
+class ProfitCenterDataPagination(PageNumberPagination):
+    """Custom pagination for profit center data"""
+    page_size = 100
+    page_size_query_param = 'page_size'
+    max_page_size = 1000
 
 
 @api_view(['GET'])

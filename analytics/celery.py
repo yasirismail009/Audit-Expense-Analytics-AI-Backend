@@ -12,6 +12,10 @@ from celery.utils.log import get_task_logger
 # Set the default Django settings module for the 'celery' program.
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'analytics.settings')
 
+# Initialize Django
+import django
+django.setup()
+
 # Configure logging
 logger = get_task_logger(__name__)
 

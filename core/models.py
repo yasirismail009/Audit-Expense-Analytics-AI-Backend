@@ -579,8 +579,513 @@ class DataFile(BaseModel):
         return self.is_validated
 
 
+class ProfitCenter(BaseModel):
+    """
+    Master Profit Center/Cost Center table - Centralized profit center management
+    
+    This model serves as the master reference for all profit centers/cost centers across:
+    - SAPGLPosting (GL transactions profit_center field)
+    - ChartOfAccount (COA cost_center field - same as profit center)
+    
+    NOTE: Cost Center and Profit Center are the same data with different names:
+    - Cost Center = Profit Center (same entity, different naming convention)
+    - This model handles both naming conventions seamlessly
+    
+    Provides:
+    - Profit center/cost center validation and normalization
+    - Hierarchical profit center structure
+    - Profit center metadata and descriptions
+    - Cross-reference capabilities between GL and COA
+    - Unified management of both cost centers and profit centers
+    """
+    
+    # Profit center identification
+    profit_center_code = models.CharField(
+        max_length=10, 
+        unique=True, 
+        db_index=True,
+        help_text='Unique Profit Center Code (normalized)'
+    )
+    profit_center_name = models.CharField(
+        max_length=200, 
+        help_text='Profit Center Name/Description'
+    )
+    profit_center_short_text = models.CharField(
+        max_length=50, 
+        blank=True, 
+        help_text='Short Profit Center Text'
+    )
+    
+    # Profit center classification
+    profit_center_type = models.CharField(
+        max_length=50, 
+        blank=True, 
+        db_index=True,
+        help_text='Profit Center Type (e.g., Sales, Production, Service, Administrative)'
+    )
+    profit_center_group = models.CharField(
+        max_length=50, 
+        blank=True, 
+        db_index=True,
+        help_text='Profit Center Group (e.g., Revenue Centers, Cost Centers)'
+    )
+    
+    # Financial classification
+    revenue_center = models.BooleanField(
+        default=False, 
+        db_index=True,
+        help_text='Is this a Revenue Center?'
+    )
+    cost_center = models.BooleanField(
+        default=True, 
+        db_index=True,
+        help_text='Is this a Cost Center? (default True as most profit centers are cost centers)'
+    )
+    
+    # Profit center properties
+    profit_center_currency = models.CharField(
+        max_length=3, 
+        default='SAR', 
+        help_text='Profit Center Currency'
+    )
+    profit_center_status = models.CharField(
+        max_length=20, 
+        default='ACTIVE', 
+        choices=[
+            ('ACTIVE', 'Active'),
+            ('INACTIVE', 'Inactive'),
+            ('BLOCKED', 'Blocked'),
+        ],
+        db_index=True,
+        help_text='Profit Center Status'
+    )
+    
+    # Hierarchy and organization
+    parent_profit_center = models.ForeignKey(
+        'self', 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True,
+        related_name='child_profit_centers',
+        help_text='Parent Profit Center (for hierarchical structure)'
+    )
+    profit_center_level = models.IntegerField(
+        default=1, 
+        help_text='Profit Center Level in hierarchy (1=top level)'
+    )
+    
+    # Company and organizational context
+    company_code = models.CharField(
+        max_length=10, 
+        blank=True, 
+        db_index=True,
+        help_text='Company Code'
+    )
+    business_area = models.CharField(
+        max_length=10, 
+        blank=True, 
+        db_index=True,
+        help_text='Business Area'
+    )
+    segment = models.CharField(
+        max_length=10, 
+        blank=True, 
+        db_index=True,
+        help_text='Segment'
+    )
+    
+    # Manager and responsibility
+    responsible_person = models.CharField(
+        max_length=100, 
+        blank=True, 
+        help_text='Responsible Person/Manager'
+    )
+    department = models.CharField(
+        max_length=100, 
+        blank=True, 
+        help_text='Department'
+    )
+    
+    # Additional metadata
+    profit_center_description = models.TextField(
+        blank=True, 
+        help_text='Detailed Profit Center Description'
+    )
+    notes = models.TextField(
+        blank=True, 
+        help_text='Additional Notes'
+    )
+    
+    # Account relationships - One profit center can be in multiple accounts
+    gl_accounts = models.ManyToManyField(
+        'GLAccount',
+        through='ProfitCenterAccount',
+        related_name='profit_centers',
+        blank=True,
+        help_text='GL Accounts associated with this profit center'
+    )
+    
+    # Audit and tracking
+    created_from_file = models.ForeignKey(
+        DataFile, 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True,
+        help_text='Data file that created this profit center'
+    )
+    last_updated_from_file = models.ForeignKey(
+        DataFile, 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True,
+        related_name='updated_profit_centers',
+        help_text='Data file that last updated this profit center'
+    )
+    
+    class Meta:
+        db_table = 'profit_centers'
+        ordering = ['profit_center_code']
+        indexes = [
+            models.Index(fields=['profit_center_code']),
+            models.Index(fields=['profit_center_type']),
+            models.Index(fields=['profit_center_group']),
+            models.Index(fields=['revenue_center']),
+            models.Index(fields=['cost_center']),
+            models.Index(fields=['profit_center_status']),
+            models.Index(fields=['company_code']),
+            models.Index(fields=['business_area']),
+            models.Index(fields=['segment']),
+            models.Index(fields=['parent_profit_center']),
+        ]
+    
+    def __str__(self):
+        return f"{self.profit_center_code} - {self.profit_center_name}"
+    
+    def clean(self):
+        """Validate profit center code format and hierarchy"""
+        from django.core.exceptions import ValidationError
+        import re
+        
+        # Normalize profit center code
+        if self.profit_center_code:
+            # Remove any decimal points and trailing zeros
+            code_str = str(self.profit_center_code).strip()
+            if '.' in code_str:
+                try:
+                    float_val = float(code_str)
+                    if float_val.is_integer():
+                        self.profit_center_code = str(int(float_val))
+                    else:
+                        raise ValidationError({'profit_center_code': 'Profit center code cannot contain fractional values'})
+                except ValueError:
+                    raise ValidationError({'profit_center_code': 'Profit center code must be a valid number'})
+            
+            # Remove commas and spaces
+            self.profit_center_code = re.sub(r'[,\s]', '', self.profit_center_code)
+            
+            # Ensure it's not empty
+            if not self.profit_center_code:
+                raise ValidationError({'profit_center_code': 'Profit center code cannot be empty'})
+        
+        # Validate hierarchy
+        if self.parent_profit_center:
+            if self.parent_profit_center == self:
+                raise ValidationError({'parent_profit_center': 'Profit center cannot be its own parent'})
+            
+            # Set profit center level based on parent
+            self.profit_center_level = self.parent_profit_center.profit_center_level + 1
+    
+    def get_hierarchy_path(self):
+        """Get the full hierarchy path for this profit center"""
+        path = [self.profit_center_code]
+        current = self.parent_profit_center
+        while current:
+            path.insert(0, current.profit_center_code)
+            current = current.parent_profit_center
+        return ' > '.join(path)
+    
+    def get_all_descendants(self):
+        """Get all descendant profit centers"""
+        descendants = []
+        for child in self.child_profit_centers.all():
+            descendants.append(child)
+            descendants.extend(child.get_all_descendants())
+        return descendants
+    
+    @property
+    def cost_center_code(self):
+        """Alias for profit_center_code - Cost Center and Profit Center are the same"""
+        return self.profit_center_code
+    
+    @property
+    def cost_center_name(self):
+        """Alias for profit_center_name - Cost Center and Profit Center are the same"""
+        return self.profit_center_name
+    
+    @classmethod
+    def get_by_cost_center_code(cls, cost_center_code):
+        """Get profit center by cost center code (same as profit center code)"""
+        return cls.objects.filter(profit_center_code=cost_center_code).first()
+    
+    @classmethod
+    def get_by_profit_center_code(cls, profit_center_code):
+        """Get profit center by profit center code"""
+        return cls.objects.filter(profit_center_code=profit_center_code).first()
+    
+    @classmethod
+    def create_or_update_from_cost_center(cls, cost_center_code, cost_center_name, **kwargs):
+        """Create or update profit center from cost center data"""
+        profit_center, created = cls.objects.get_or_create(
+            profit_center_code=cost_center_code,
+            defaults={
+                'profit_center_name': cost_center_name,
+                'cost_center': True,  # Mark as cost center
+                **kwargs
+            }
+        )
+        if not created:
+            # Update existing record
+            profit_center.profit_center_name = cost_center_name
+            profit_center.cost_center = True
+            for key, value in kwargs.items():
+                setattr(profit_center, key, value)
+            profit_center.save()
+        return profit_center, created
+    
+    @classmethod
+    def create_or_update_from_profit_center(cls, profit_center_code, profit_center_name, **kwargs):
+        """Create or update profit center from profit center data"""
+        profit_center, created = cls.objects.get_or_create(
+            profit_center_code=profit_center_code,
+            defaults={
+                'profit_center_name': profit_center_name,
+                **kwargs
+            }
+        )
+        if not created:
+            # Update existing record
+            profit_center.profit_center_name = profit_center_name
+            for key, value in kwargs.items():
+                setattr(profit_center, key, value)
+            profit_center.save()
+        return profit_center, created
+    
+    def add_account(self, gl_account, is_primary=False, allocation_percentage=None, **kwargs):
+        """Add a GL account to this profit center"""
+        relationship, created = ProfitCenterAccount.objects.get_or_create(
+            profit_center=self,
+            gl_account=gl_account,
+            defaults={
+                'is_primary': is_primary,
+                'allocation_percentage': allocation_percentage,
+                **kwargs
+            }
+        )
+        if not created:
+            # Update existing relationship
+            relationship.is_primary = is_primary
+            relationship.allocation_percentage = allocation_percentage
+            for key, value in kwargs.items():
+                setattr(relationship, key, value)
+            relationship.save()
+        return relationship, created
+    
+    def remove_account(self, gl_account):
+        """Remove a GL account from this profit center"""
+        try:
+            relationship = ProfitCenterAccount.objects.get(
+                profit_center=self,
+                gl_account=gl_account
+            )
+            relationship.delete()
+            return True
+        except ProfitCenterAccount.DoesNotExist:
+            return False
+    
+    def get_primary_account(self):
+        """Get the primary GL account for this profit center"""
+        try:
+            return self.profitcenteraccount_set.get(is_primary=True).gl_account
+        except ProfitCenterAccount.DoesNotExist:
+            return None
+    
+    def get_all_accounts(self):
+        """Get all GL accounts associated with this profit center"""
+        return GLAccount.objects.filter(profit_centers=self)
+    
+    def get_account_count(self):
+        """Get the number of accounts associated with this profit center"""
+        return self.profitcenteraccount_set.count()
+
+
+class ProfitCenterAccount(BaseModel):
+    """
+    Through model for many-to-many relationship between ProfitCenter and GLAccount
+    
+    This allows one profit center to be associated with multiple accounts,
+    and one account to be associated with multiple profit centers.
+    """
+    
+    profit_center = models.ForeignKey(
+        ProfitCenter,
+        on_delete=models.CASCADE,
+        help_text='Profit Center'
+    )
+    gl_account = models.ForeignKey(
+        'GLAccount',
+        on_delete=models.CASCADE,
+        help_text='GL Account'
+    )
+    
+    # Relationship metadata
+    is_primary = models.BooleanField(
+        default=False,
+        help_text='Is this the primary profit center for this account?'
+    )
+    allocation_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text='Allocation percentage for this profit center-account relationship'
+    )
+    
+    # Context information
+    company_code = models.CharField(
+        max_length=10,
+        blank=True,
+        help_text='Company Code for this relationship'
+    )
+    business_area = models.CharField(
+        max_length=10,
+        blank=True,
+        help_text='Business Area for this relationship'
+    )
+    
+    # Additional metadata
+    notes = models.TextField(
+        blank=True,
+        help_text='Additional notes for this relationship'
+    )
+    
+    class Meta:
+        db_table = 'profit_center_accounts'
+        unique_together = [['profit_center', 'gl_account']]
+        indexes = [
+            models.Index(fields=['profit_center', 'gl_account']),
+            models.Index(fields=['is_primary']),
+            models.Index(fields=['company_code']),
+            models.Index(fields=['business_area']),
+        ]
+    
+    def __str__(self):
+        return f"{self.profit_center.profit_center_code} - {self.gl_account.account_code}"
+    
+    def clean(self):
+        """Validate allocation percentage and primary relationship"""
+        from django.core.exceptions import ValidationError
+        
+        # Validate allocation percentage
+        if self.allocation_percentage is not None:
+            if self.allocation_percentage < 0 or self.allocation_percentage > 100:
+                raise ValidationError({
+                    'allocation_percentage': 'Allocation percentage must be between 0 and 100'
+                })
+        
+        # Ensure only one primary profit center per account
+        if self.is_primary:
+            existing_primary = ProfitCenterAccount.objects.filter(
+                gl_account=self.gl_account,
+                is_primary=True
+            ).exclude(id=self.id)
+            
+            if existing_primary.exists():
+                raise ValidationError({
+                    'is_primary': 'Only one profit center can be primary for an account'
+                })
+
+
+def sync_profit_center_data():
+    """
+    Utility function to sync profit center data between GL and COA
+    
+    This function ensures that:
+    1. All unique profit_center codes from SAPGLPosting are in ProfitCenter table
+    2. All unique cost_center codes from ChartOfAccount are in ProfitCenter table
+    3. Both refer to the same ProfitCenter record (since they're the same data)
+    """
+    from django.db import transaction
+    
+    with transaction.atomic():
+        # Get all unique profit center codes from GL postings
+        gl_profit_centers = SAPGLPosting.objects.filter(
+            profit_center__isnull=False
+        ).exclude(
+            profit_center=''
+        ).values_list('profit_center', flat=True).distinct()
+        
+        # Get all unique cost center codes from Chart of Accounts
+        coa_cost_centers = ChartOfAccount.objects.filter(
+            cost_center__isnull=False
+        ).exclude(
+            cost_center=''
+        ).values_list('cost_center', flat=True).distinct()
+        
+        # Get all unique cost codes from GL Accounts
+        gl_cost_codes = GLAccount.objects.filter(
+            cost_code__isnull=False
+        ).exclude(
+            cost_code=''
+        ).values_list('cost_code', flat=True).distinct()
+        
+        # Combine and deduplicate (since they're the same data)
+        all_centers = set(gl_profit_centers) | set(coa_cost_centers) | set(gl_cost_codes)
+        
+        created_count = 0
+        updated_count = 0
+        
+        for center_code in all_centers:
+            if not center_code:
+                continue
+                
+            # Check if profit center already exists
+            profit_center = ProfitCenter.objects.filter(
+                profit_center_code=center_code
+            ).first()
+            
+            if not profit_center:
+                # Create new profit center
+                profit_center = ProfitCenter.objects.create(
+                    profit_center_code=center_code,
+                    profit_center_name=f"Profit Center {center_code}",
+                    cost_center=True,  # Mark as cost center since it's the same data
+                    profit_center_status='ACTIVE'
+                )
+                created_count += 1
+            else:
+                # Update existing profit center to ensure it's marked as cost center
+                if not profit_center.cost_center:
+                    profit_center.cost_center = True
+                    profit_center.save()
+                    updated_count += 1
+        
+        return {
+            'created_count': created_count,
+            'updated_count': updated_count,
+            'total_centers': len(all_centers)
+        }
+
+
 class GLAccount(BaseModel):
-    """Master GL Account table - Links TB, Chart of Accounts, and GL Listing data"""
+    """
+    GL Account table - Belongs to Engagement
+    
+    Each engagement has GL accounts with:
+    - Opening & Closing balances (from TB)
+    - Account name and classification
+    - Cost code (maps to Profit Center from GL listing)
+    - Type, Sub type, Sub sub type
+    """
     
     # Primary account identifier - NO DECIMALS ALLOWED
     account_code = models.CharField(
@@ -594,7 +1099,7 @@ class GLAccount(BaseModel):
     engagement = models.ForeignKey(
         Engagement, 
         on_delete=models.CASCADE, 
-        related_name='accounts',
+        related_name='gl_accounts',
         help_text='Engagement this account belongs to'
     )
     
@@ -604,8 +1109,22 @@ class GLAccount(BaseModel):
     
     # Company and organizational info
     company_code = models.CharField(max_length=10, blank=True, help_text='Company Code')
-    profit_center = models.CharField(max_length=10, blank=True, help_text='Profit Center')
-    cost_center = models.CharField(max_length=10, blank=True, help_text='Cost Center')
+    
+    # Cost code (maps to Profit Center from GL listing)
+    cost_code = models.CharField(
+        max_length=10, 
+        blank=True, 
+        db_index=True,
+        help_text='Cost Code (maps to Profit Center from GL listing)'
+    )
+    profit_center_ref = models.ForeignKey(
+        ProfitCenter, 
+        on_delete=models.PROTECT, 
+        null=True, 
+        blank=True, 
+        related_name='linked_gl_accounts',
+        help_text='Reference to Profit Center master record (cost_code field maps to profit center)'
+    )
     
     # Account properties
     is_active = models.BooleanField(default=True, help_text='Is Account Active')
@@ -688,13 +1207,22 @@ class GLAccount(BaseModel):
         super().save(*args, **kwargs)
     
     def __str__(self):
-        return f"{self.account_code} - {self.account_name}"
+        return f"{self.engagement.engagement_id} - {self.account_code} - {self.account_name}"
+    
+    def get_profit_center(self):
+        """Get the profit center for this account's cost code"""
+        if self.profit_center_ref:
+            return self.profit_center_ref
+        elif self.cost_code:
+            return ProfitCenter.objects.filter(profit_center_code=self.cost_code).first()
+        return None
     
     @classmethod
     def get_or_create_account(cls, engagement, account_code, account_name=None, **kwargs):
         """
         Get or create a GL Account with the given code for a specific engagement
         Updates existing account if new information is provided
+        Automatically links to ProfitCenter if cost_code is provided
         """
         account, created = cls.objects.get_or_create(
             engagement=engagement,
@@ -712,6 +1240,13 @@ class GLAccount(BaseModel):
                 if hasattr(account, key) and value:
                     setattr(account, key, value)
             account.save()
+        
+        # Auto-link to ProfitCenter if cost_code is provided
+        if account.cost_code and not account.profit_center_ref:
+            profit_center = ProfitCenter.objects.filter(profit_center_code=account.cost_code).first()
+            if profit_center:
+                account.profit_center_ref = profit_center
+                account.save()
         
         return account
     
@@ -818,6 +1353,14 @@ class SAPGLPosting(BaseModel):
         help_text='Reference to GL Account master record'
     )
     profit_center = models.CharField(max_length=10, blank=True, db_index=True, help_text='Profit Center')
+    profit_center_ref = models.ForeignKey(
+        ProfitCenter, 
+        on_delete=models.PROTECT, 
+        null=True, 
+        blank=True, 
+        related_name='gl_postings',
+        help_text='Reference to Profit Center master record'
+    )
     
     # User information
     user_name = models.CharField(max_length=50, db_index=True, help_text='User Name')
@@ -1248,6 +1791,14 @@ class ChartOfAccount(BaseModel):
     company = models.CharField(max_length=10, blank=True, help_text='Company')
     branch = models.CharField(max_length=50, blank=True, help_text='Branch')
     cost_center = models.CharField(max_length=10, blank=True, help_text='Cost Center')
+    profit_center_ref = models.ForeignKey(
+        ProfitCenter, 
+        on_delete=models.PROTECT, 
+        null=True, 
+        blank=True, 
+        related_name='chart_of_accounts',
+        help_text='Reference to Profit Center master record (cost_center field maps to profit center)'
+    )
     code = models.CharField(max_length=10, blank=True, help_text='Code')
     gl_account_long_text = models.CharField(max_length=200, blank=True, help_text='G/L Account Long Text')
     
@@ -1353,6 +1904,11 @@ class ChartOfAccount(BaseModel):
                 self.gl_account_ref.sub_type = self.sub_type
                 self.gl_account_ref.sub_sub_type = self.sub_sub_type
                 self.gl_account_ref.financial_statement_category = self.financial_statement
+                
+                # Also set cost_code from COA if not already set
+                if self.cost_center and not self.gl_account_ref.cost_code:
+                    self.gl_account_ref.cost_code = self.cost_center
+                
                 self.gl_account_ref.save()
         
         super().save(*args, **kwargs)

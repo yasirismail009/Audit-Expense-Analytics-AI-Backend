@@ -5,7 +5,11 @@ Contains all monitoring and system health-related Celery tasks for the analytics
 """
 
 from celery import shared_task, current_task
+from celery.utils.log import get_task_logger
 from django.utils import timezone
+
+# Set up logger
+logger = get_task_logger(__name__)
 from django.db import transaction
 from django.db.models import F, Q, Count, Sum, Avg, Min, Max
 import logging
@@ -96,12 +100,13 @@ def debug_task(self):
         return {"status": "error", "message": str(e)}
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, name='core.tasks.process_queued_jobs')
 def process_queued_jobs(self):
     """
     Process queued file processing jobs
     """
     try:
+        logger.info("process_queued_jobs task started")
         log_task_info("process_queued_jobs", "monitor", "Starting queued jobs processing")
         
         # Get queued jobs
@@ -185,7 +190,7 @@ def process_queued_jobs(self):
         return {"status": "error", "message": str(e)}
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, name='core.tasks.monitor_processing_jobs')
 def monitor_processing_jobs(self):
     """
     Monitor processing jobs and handle timeouts
@@ -269,7 +274,7 @@ def monitor_processing_jobs(self):
         return {"status": "error", "message": str(e)}
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, name='core.tasks.worker_health_check')
 def worker_health_check(self):
     """
     Perform worker health check
@@ -365,7 +370,7 @@ def worker_health_check(self):
         return {"status": "error", "message": str(e)}
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, name='core.tasks.monitor_worker_performance')
 def monitor_worker_performance(self):
     """
     Monitor worker performance and resource usage
