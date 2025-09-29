@@ -34,25 +34,56 @@ class FileReader:
         """
         # Handle both file objects and file path strings
         if isinstance(file_obj, str):
-            # It's a file path string
-            file_extension = file_obj.lower().split('.')[-1]
-            file_name = file_obj
+            # It's a file path string - use read_file_from_path
+            return FileReader.read_file_from_path(file_obj, chunk_size)
         else:
-            # It's a file object
+            # It's a file object - use the original logic
             file_extension = file_obj.name.lower().split('.')[-1]
             file_name = file_obj.name
+            
+            try:
+                if file_extension == 'csv':
+                    return FileReader._read_csv(file_obj, chunk_size)
+                elif file_extension in ['xlsx', 'xls', 'xlsb']:
+                    return FileReader._read_excel(file_obj, file_extension, chunk_size)
+                else:
+                    logger.error(f"Unsupported file extension: {file_extension}")
+                    return None
+            except Exception as e:
+                logger.error(f"Error reading file {file_name}: {e}")
+                return None
+    
+    @staticmethod
+    def read_file_from_path(file_path, chunk_size=None):
+        """
+        Read file from local path and return DataFrame
+        
+        Args:
+            file_path: Local file path string
+            chunk_size: If provided, return iterator of chunks instead of full DataFrame
+            
+        Returns:
+            pandas.DataFrame or Iterator[pandas.DataFrame]: File data
+        """
+        import os
+        
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            return None
+        
+        file_extension = file_path.lower().split('.')[-1]
         
         try:
             if file_extension == 'csv':
-                return FileReader._read_csv(file_obj, chunk_size)
+                return FileReader._read_csv(file_path, chunk_size)
             elif file_extension in ['xlsx', 'xls', 'xlsb']:
-                return FileReader._read_excel(file_obj, file_extension, chunk_size)
+                return FileReader._read_excel(file_path, file_extension, chunk_size)
             else:
-                raise ValueError(f"Unsupported file format: {file_extension}")
-                
+                logger.error(f"Unsupported file extension: {file_extension}")
+                return None
         except Exception as e:
-            logger.error(f"Error reading file {file_name}: {e}")
-            raise
+            logger.error(f"Error reading file from path {file_path}: {e}")
+            return None
     
     @staticmethod
     def _read_csv(file_obj, chunk_size=None):
@@ -426,8 +457,8 @@ class DataProcessor:
                 chunk_num += 1
                 logger.info(f"🔄 Processing chunk {chunk_num} ({len(chunk_df)} rows)...")
                 
-                # Process this chunk with individual saves
-                result = self.process_gl_data(chunk_df)
+                # Process this chunk using bulk loading for proper column mapping
+                result = self._process_gl_chunk_with_bulk_loading(chunk_df)
                 
                 total_processed += result['processed_count']
                 total_failed += result['failed_count']
@@ -444,6 +475,38 @@ class DataProcessor:
         except Exception as e:
             logger.error(f"❌ Chunked processing failed: {e}")
             raise
+    
+    def _process_gl_chunk_with_bulk_loading(self, chunk_df: pd.DataFrame) -> Dict[str, int]:
+        """
+        Process a single GL chunk using bulk loading for proper column mapping
+        """
+        try:
+            from .bulk_loading_utils import SQLAlchemyBulkLoader
+            
+            # Create bulk loader
+            bulk_loader = SQLAlchemyBulkLoader()
+            
+            # Use bulk loading with proper column mapping
+            result = bulk_loader.bulk_load_gl_with_pandas(chunk_df, str(self.data_file.id))
+            
+            if result['success']:
+                return {
+                    'processed_count': result['records_loaded'],
+                    'failed_count': 0
+                }
+            else:
+                logger.error(f"❌ Bulk loading failed: {result.get('error', 'Unknown error')}")
+                return {
+                    'processed_count': 0,
+                    'failed_count': len(chunk_df)
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ Error in bulk loading chunk: {e}")
+            return {
+                'processed_count': 0,
+                'failed_count': len(chunk_df)
+            }
     
     def process_gl_data(self, df: pd.DataFrame) -> Dict[str, int]:
         """
@@ -499,6 +562,46 @@ class DataProcessor:
         logger.info("🎯 GL DATA PROCESSING COMPLETED! 🎯")
         logger.info(f"📊 Final Results: {processed_count} processed, {failed_count} failed")
         logger.info("🎯" + "="*60)
+        
+        # PERFECT ML FLOW: GL Save → Completeness Test → Model Training → ML Recommendations
+        try:
+            from .tasks.perfect_flow_tasks import trigger_perfect_ml_flow
+            from django.db import connection
+            from .models import DataFile
+            
+            # Ensure database connection is closed before task execution
+            connection.close()
+            
+            # Get data file to determine engagement and version
+            data_file = DataFile.objects.get(id=self.data_file.id)
+            engagement = data_file.engagement
+            version = getattr(data_file, 'version', '1.0')
+            
+            logger.info("🚀 Starting PERFECT ML FLOW for ENG-008")
+            logger.info("📋 Flow: GL Save → Completeness Test → Model Training → ML Recommendations")
+            
+            # Trigger the perfect ML flow
+            flow_result = trigger_perfect_ml_flow.delay(
+                data_file_id=str(self.data_file.id),
+                engagement_id=str(engagement.id),
+                client_name=engagement.engagement_name
+            )
+            
+            logger.info(f"✅ PERFECT ML FLOW initiated successfully!")
+            logger.info(f"🔗 Flow Task ID: {flow_result.id}")
+            logger.info(f"📊 GL data saved for file: {self.data_file.file_name}")
+            logger.info(f"🎯 Engagement: {engagement.engagement_name} (ID: {engagement.engagement_id})")
+            logger.info(f"📋 Version: {version}")
+            logger.info("🔄 Flow will execute: Completeness → Training → Recommendations")
+            logger.info("📈 Models to be trained:")
+            logger.info("   - Trend Analysis Model (scikit-learn Isolation Forest)")
+            logger.info("   - Unusual Transaction Detection (scikit-learn Random Forest)")
+            logger.info("   - Completeness Prediction Model")
+            
+        except Exception as e:
+            logger.error(f"❌ Could not initiate perfect ML flow: {e}")
+            import traceback
+            logger.error(f"❌ Traceback: {traceback.format_exc()}")
         
         return {'processed_count': processed_count, 'failed_count': failed_count}
     
@@ -1101,7 +1204,14 @@ class DataProcessor:
                 sub_number=str(row.get('Sub Number', '')).strip(),
                 business_area=str(row.get('Business Area', '')).strip(),
                 segment=str(row.get('Segment', '')).strip(),
-                partner_business_area=str(row.get('Partner Business Area', '')).strip()
+                partner_business_area=str(row.get('Partner Business Area', '')).strip(),
+                # GL Account type information from Chart of Accounts
+                gl_account_type=gl_account_data.get('account_type', '') if gl_account_data else '',
+                gl_account_sub_type=gl_account_data.get('account_sub_type', '') if gl_account_data else '',
+                gl_account_sub_sub_type=gl_account_data.get('account_sub_sub_type', '') if gl_account_data else '',
+                gl_account_long_text=gl_account_data.get('account_long_text', '') if gl_account_data else '',
+                financial_statement=gl_account_data.get('financial_statement', '') if gl_account_data else '',
+                ref_to_fs=gl_account_data.get('ref_to_fs', '') if gl_account_data else ''
             )
             
             return posting

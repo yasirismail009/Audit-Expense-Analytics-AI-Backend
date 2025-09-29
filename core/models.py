@@ -392,6 +392,8 @@ class Engagement(BaseModel):
     engagement_id = models.CharField(max_length=100, unique=True, db_index=True, help_text='Unique engagement identifier')
     engagement_name = models.CharField(max_length=255, help_text='Descriptive engagement name')
     
+    # Engagement is unique per client + fiscal year (no versioning at engagement level)
+    
     # Client relationship
     client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name='engagements', help_text='Client for this engagement')
     
@@ -486,6 +488,10 @@ class DataFile(BaseModel):
     # Engagement relationship
     engagement = models.ForeignKey(Engagement, on_delete=models.CASCADE, related_name='data_files', help_text='Engagement this file belongs to')
     
+    # Version control - Multiple versions of same file type allowed per engagement
+    version = models.CharField(max_length=20, default='1.0', db_index=True, help_text='Version of the file (e.g., 1.0, 1.1, 2.0) - allows multiple test versions per engagement')
+    version_notes = models.TextField(blank=True, help_text='Notes about this version (changes, updates, retry reasons, etc.)')
+    
     # File type classification
     FILE_TYPE_CHOICES = [
         ('TB', 'Trial Balance'),
@@ -498,6 +504,9 @@ class DataFile(BaseModel):
     # File validation
     is_validated = models.BooleanField(default=False, help_text='Whether file structure has been validated')
     validation_errors = models.JSONField(default=list, help_text='List of validation errors found')
+    
+    # Local file storage
+    local_file_path = models.CharField(max_length=500, blank=True, help_text='Local file path where file is saved')
     
     # Legacy fields for backward compatibility (will be populated from engagement)
     legacy_engagement_id = models.CharField(max_length=100, editable=False, help_text='Legacy engagement ID (auto-populated)')
@@ -540,6 +549,8 @@ class DataFile(BaseModel):
             models.Index(fields=['status', 'uploaded_at']),
             models.Index(fields=['engagement', 'file_type']),
             models.Index(fields=['file_type', 'status']),
+            models.Index(fields=['engagement', 'version']),  # For version queries
+            models.Index(fields=['engagement', 'file_type', 'version']),  # For specific file type + version queries
             models.Index(fields=['legacy_engagement_id', 'legacy_fiscal_year'], name='datafile_legacy_idx'),
         ]
     
@@ -1089,7 +1100,7 @@ class GLAccount(BaseModel):
     
     # Primary account identifier - NO DECIMALS ALLOWED
     account_code = models.CharField(
-        max_length=10, 
+        max_length=50, 
         db_index=True, 
         help_text='GL Account Code (no decimal or fractional values allowed)',
         validators=[],  # Custom validator will be added below
@@ -1340,7 +1351,7 @@ class SAPGLPosting(BaseModel):
     
     # Account information - NO DECIMAL ACCOUNT NUMBERS
     gl_account = models.CharField(
-        max_length=10, 
+        max_length=50, 
         db_index=True, 
         help_text='G/L Account (legacy field, no decimal values allowed)'
     )
@@ -1375,14 +1386,14 @@ class SAPGLPosting(BaseModel):
     posting_period = models.IntegerField(db_index=True, help_text='Posting Period')
     
     # Additional fields
-    text = models.CharField(max_length=100, blank=True, help_text='Text')
-    segment = models.CharField(max_length=10, blank=True, db_index=True, help_text='Segment')
-    clearing_document = models.CharField(max_length=20, blank=True, help_text='Clearing Document')
-    offsetting_account = models.CharField(max_length=10, blank=True, help_text='Offsetting Account')
-    invoice_reference = models.CharField(max_length=20, blank=True, help_text='Invoice Reference')
-    sales_document = models.CharField(max_length=20, blank=True, help_text='Sales Document')
-    assignment = models.CharField(max_length=20, blank=True, help_text='Assignment')
-    year_month = models.CharField(max_length=7, blank=True, help_text='Year/Month')
+    text = models.CharField(max_length=100, blank=True, null=True, help_text='Text')
+    segment = models.CharField(max_length=10, blank=True, null=True, db_index=True, help_text='Segment')
+    clearing_document = models.CharField(max_length=20, blank=True, null=True, help_text='Clearing Document')
+    offsetting_account = models.CharField(max_length=50, blank=True, null=True, help_text='Offsetting Account')
+    invoice_reference = models.CharField(max_length=20, blank=True, null=True, help_text='Invoice Reference')
+    sales_document = models.CharField(max_length=20, blank=True, null=True, help_text='Sales Document')
+    assignment = models.CharField(max_length=20, blank=True, null=True, help_text='Assignment')
+    year_month = models.CharField(max_length=7, blank=True, null=True, help_text='Year/Month')
     
     # Additional transaction currency fields
     amount_transaction_currency = models.DecimalField(
@@ -1392,7 +1403,7 @@ class SAPGLPosting(BaseModel):
         blank=True,
         help_text='Amount in transaction currency'
     )
-    transaction_currency = models.CharField(max_length=3, blank=True, help_text='Transaction currency code')
+    transaction_currency = models.CharField(max_length=3, blank=True, null=True, help_text='Transaction currency code')
     exchange_rate = models.DecimalField(
         max_digits=15, 
         decimal_places=6, 
@@ -1402,20 +1413,28 @@ class SAPGLPosting(BaseModel):
     )
     
     # Additional posting fields
-    posting_key = models.CharField(max_length=10, blank=True, help_text='Posting Key')
-    reference_document = models.CharField(max_length=20, blank=True, help_text='Reference Document')
-    document_header_text = models.CharField(max_length=200, blank=True, help_text='Document Header Text')
-    company_code = models.CharField(max_length=10, blank=True, help_text='Company Code')
+    posting_key = models.CharField(max_length=10, blank=True, null=True, help_text='Posting Key')
+    reference_document = models.CharField(max_length=20, blank=True, null=True, help_text='Reference Document')
+    document_header_text = models.CharField(max_length=200, blank=True, null=True, help_text='Document Header Text')
+    company_code = models.CharField(max_length=10, blank=True, null=True, help_text='Company Code')
     fiscal_period = models.IntegerField(null=True, blank=True, help_text='Fiscal Period')
     
     # Cost center and organizational fields
-    cost_center = models.CharField(max_length=10, blank=True, help_text='Cost Center')
-    wbs_element = models.CharField(max_length=20, blank=True, help_text='WBS Element')
-    order_number = models.CharField(max_length=20, blank=True, help_text='Order Number')
-    asset_number = models.CharField(max_length=20, blank=True, help_text='Asset Number')
-    sub_number = models.CharField(max_length=10, blank=True, help_text='Sub Number')
-    business_area = models.CharField(max_length=10, blank=True, help_text='Business Area')
-    partner_business_area = models.CharField(max_length=10, blank=True, help_text='Partner Business Area')
+    cost_center = models.CharField(max_length=10, blank=True, null=True, help_text='Cost Center')
+    wbs_element = models.CharField(max_length=20, blank=True, null=True, help_text='WBS Element')
+    order_number = models.CharField(max_length=20, blank=True, null=True, help_text='Order Number')
+    asset_number = models.CharField(max_length=20, blank=True, null=True, help_text='Asset Number')
+    sub_number = models.CharField(max_length=10, blank=True, null=True, help_text='Sub Number')
+    business_area = models.CharField(max_length=10, blank=True, null=True, help_text='Business Area')
+    partner_business_area = models.CharField(max_length=10, blank=True, null=True, help_text='Partner Business Area')
+    
+    # GL Account type information - from Chart of Accounts
+    gl_account_type = models.CharField(max_length=50, blank=True, null=True, db_index=True, help_text='GL Account Type (from Chart of Accounts)')
+    gl_account_sub_type = models.CharField(max_length=50, blank=True, null=True, db_index=True, help_text='GL Account Sub Type (from Chart of Accounts)')
+    gl_account_sub_sub_type = models.CharField(max_length=50, blank=True, null=True, db_index=True, help_text='GL Account Sub Sub Type (from Chart of Accounts)')
+    gl_account_long_text = models.CharField(max_length=200, blank=True, null=True, help_text='GL Account Long Text (from Chart of Accounts)')
+    financial_statement = models.CharField(max_length=50, blank=True, null=True, help_text='Financial Statement (from Chart of Accounts)')
+    ref_to_fs = models.CharField(max_length=50, blank=True, null=True, help_text='Reference to Financial Statement (from Chart of Accounts)')
     
     class Meta:
         db_table = 'sap_gl_postings'
@@ -1436,6 +1455,11 @@ class SAPGLPosting(BaseModel):
             models.Index(fields=['posting_date', 'amount_local_currency']),
             # Text search
             models.Index(fields=['text']),
+            # GL Account type indexes
+            models.Index(fields=['gl_account_type']),
+            models.Index(fields=['gl_account_sub_type']),
+            models.Index(fields=['gl_account_sub_sub_type']),
+            models.Index(fields=['financial_statement']),
         ]
     
     def clean(self):
@@ -1788,9 +1812,9 @@ class ChartOfAccount(BaseModel):
         related_name='chart_of_accounts',
         help_text='Reference to GL Account master record'
     )
-    company = models.CharField(max_length=10, blank=True, help_text='Company')
-    branch = models.CharField(max_length=50, blank=True, help_text='Branch')
-    cost_center = models.CharField(max_length=10, blank=True, help_text='Cost Center')
+    company = models.CharField(max_length=10, blank=True, null=True, help_text='Company')
+    branch = models.CharField(max_length=50, blank=True, null=True, help_text='Branch')
+    cost_center = models.CharField(max_length=10, blank=True, null=True, help_text='Cost Center')
     profit_center_ref = models.ForeignKey(
         ProfitCenter, 
         on_delete=models.PROTECT, 
@@ -1799,13 +1823,13 @@ class ChartOfAccount(BaseModel):
         related_name='chart_of_accounts',
         help_text='Reference to Profit Center master record (cost_center field maps to profit center)'
     )
-    code = models.CharField(max_length=10, blank=True, help_text='Code')
-    gl_account_long_text = models.CharField(max_length=200, blank=True, help_text='G/L Account Long Text')
+    code = models.CharField(max_length=10, blank=True, null=True, help_text='Code')
+    gl_account_long_text = models.CharField(max_length=200, blank=True, null=True, help_text='G/L Account Long Text')
     
     # Financial statement classification
-    ref_to_fs = models.CharField(max_length=10, blank=True, help_text='Reference to Financial Statement')
-    financial_statement = models.CharField(max_length=50, blank=True, help_text='Financial Statement')
-    ref_to_note = models.CharField(max_length=20, blank=True, help_text='Reference to Note')
+    ref_to_fs = models.CharField(max_length=10, blank=True, null=True, help_text='Reference to Financial Statement')
+    financial_statement = models.CharField(max_length=50, blank=True, null=True, help_text='Financial Statement')
+    ref_to_note = models.CharField(max_length=20, blank=True, null=True, help_text='Reference to Note')
     
     # Period data
     fiscal_year = models.IntegerField(null=True, blank=True, help_text='Fiscal Year')
@@ -2513,6 +2537,10 @@ class CompletenessTestResult(BaseModel):
     test_timestamp = models.DateTimeField(auto_now_add=True, help_text='When the completeness test was performed')
     test_version = models.CharField(max_length=20, default='3.0.0', help_text='Version of completeness test algorithm')
     
+    # Version control for test results - Links to specific data file version
+    data_version = models.CharField(max_length=20, default='1.0', db_index=True, help_text='Version of the data files used in this test (e.g., 1.0, 1.1, 2.0) - allows multiple test runs per engagement')
+    version_notes = models.TextField(blank=True, help_text='Notes about this test version (retry reasons, fixes applied, etc.)')
+    
     # Files included in the test
     gl_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='gl_completeness_tests', null=True, blank=True, help_text='GL file tested')
     tb_file = models.ForeignKey(DataFile, on_delete=models.CASCADE, related_name='tb_completeness_tests', null=True, blank=True, help_text='TB file tested')
@@ -2541,6 +2569,17 @@ class CompletenessTestResult(BaseModel):
     step6_account_linking = models.JSONField(default=dict, help_text='Account linking validation across TB, GL, COA')
     step7_transaction_gaps = models.JSONField(default=dict, help_text='Transaction gap detection results')
     
+    # Document verification results - dedicated fields
+    total_documents = models.IntegerField(default=0, help_text='Total number of documents found')
+    balanced_documents = models.IntegerField(default=0, help_text='Number of balanced documents')
+    unbalanced_documents = models.IntegerField(default=0, help_text='Number of unbalanced documents')
+    document_balance_rate = models.FloatField(default=0.0, help_text='Percentage of balanced documents')
+    total_document_variance = models.DecimalField(max_digits=20, decimal_places=2, default=0, help_text='Total variance across all documents')
+    average_document_variance = models.DecimalField(max_digits=20, decimal_places=2, default=0, help_text='Average variance per document')
+    transactions_with_documents = models.IntegerField(default=0, help_text='Number of transactions with document numbers')
+    transactions_without_documents = models.IntegerField(default=0, help_text='Number of transactions without document numbers')
+    no_document_transaction_count = models.IntegerField(default=0, help_text='Count of transactions with no document numbers')
+    
     # Enhanced summary statistics
     total_gl_records = models.IntegerField(help_text='Total GL posting records analyzed')
     total_tb_records = models.IntegerField(null=True, blank=True, help_text='Total TB records analyzed')
@@ -2561,8 +2600,12 @@ class CompletenessTestResult(BaseModel):
     class Meta:
         db_table = 'completeness_test_results'
         ordering = ['-test_timestamp']
+        unique_together = [
+            ['engagement', 'data_version'],  # Same engagement can't have duplicate versions
+        ]
         indexes = [
             models.Index(fields=['engagement', 'test_timestamp'], name='completeness_eng_time_idx'),
+            models.Index(fields=['engagement', 'data_version']),  # For version queries
             models.Index(fields=['legacy_engagement_id', 'overall_status'], name='completeness_legacy_idx'),
             models.Index(fields=['overall_status', 'completeness_score'], name='completeness_status_score_idx'),
             models.Index(fields=['test_timestamp'], name='completeness_time_idx'),

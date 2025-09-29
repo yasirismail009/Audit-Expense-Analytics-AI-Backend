@@ -18,9 +18,10 @@ import hashlib
 import threading
 import tempfile
 import os
+import pandas as pd
 from uuid import uuid4
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 
 from .models import DataFile, Client, Engagement, CompletenessTestResult, SAPGLPosting, ProfitCenter
 from .serializers import CompletenessTestResultSerializer, CompletenessTestSummarySerializer
@@ -149,7 +150,10 @@ class FileUploadView(generics.CreateAPIView):
             'fiscal_year': request.data.get('fiscal_year', 2025),
             'audit_start_date': request.data.get('audit_start_date'),
             'audit_end_date': request.data.get('audit_end_date'),
-            'description': request.data.get('description', '')
+            'description': request.data.get('description', ''),
+            # Version control fields
+            'version': request.data.get('version', '1.0'),
+            'version_notes': request.data.get('version_notes', '')
         }
         
         # Validate required fields
@@ -186,7 +190,11 @@ class FileUploadView(generics.CreateAPIView):
         # Get or create client with better duplicate handling
         client = self._get_or_create_client(metadata)
         
-        # Get or create engagement (unique per client + fiscal year)
+        # Get or create engagement (one engagement, multiple test versions)
+        version = metadata.get('version', '1.0')
+        version_notes = metadata.get('version_notes', '')
+        
+        # Get or create the main engagement (unique per client + fiscal year)
         engagement, created = Engagement.objects.get_or_create(
             client=client,
             fiscal_year=int(metadata['fiscal_year']),
@@ -294,19 +302,25 @@ class FileUploadView(generics.CreateAPIView):
             file_hash.update(chunk)
         file_obj.seek(0)  # Reset file pointer
         
-        # Create new DataFile record (multiple files of same type now allowed per engagement)
+        # Extract version information from metadata
+        version = metadata.get('version', '1.0')
+        version_notes = metadata.get('version_notes', '')
+        
+        # Create new DataFile record with version (multiple versions allowed per engagement)
         data_file = DataFile.objects.create(
             file_name=file_obj.name,
             file_size=file_obj.size,
             file_hash=file_hash.hexdigest(),
             engagement=engagement,
             file_type=file_type,
+            version=version,  # Each file version is tracked separately
+            version_notes=version_notes,
             status='PENDING',
             is_validated=False,
             validation_errors=[]
         )
         
-        logger.info(f"Created DataFile record: {data_file.id} for engagement {engagement.engagement_id}")
+        logger.info(f"Created DataFile record: {data_file.id} for engagement {engagement.engagement_id} (version: {version})")
         return data_file
     
     def _create_success_response(self, results, engagement):
@@ -366,37 +380,31 @@ class FileUploadView(generics.CreateAPIView):
         - If NO COA file: Process GL directly
         """
         import threading
-        import tempfile
-        import os
         
-        # Save files with real names to avoid "read of closed file" error
-        real_files = {}
-        temp_dir = os.path.join(settings.MEDIA_ROOT, 'temp_uploads')
-        os.makedirs(temp_dir, exist_ok=True)
-        
+        # Create data file records and save files locally first
+        data_files = {}
         try:
             for file_type, file_obj in files.items():
                 if file_type in ['chart_of_accounts', 'gl_accounts']:
-                    # Save file with real name
-                    real_file_name = file_obj.name
-                    real_file_path = os.path.join(temp_dir, real_file_name)
+                    # Create data file record first
+                    new_file_type = 'COA' if file_type == 'chart_of_accounts' else 'GL'
+                    data_file = self._create_data_file_record(file_obj, engagement, new_file_type, metadata)
                     
-                    file_obj.seek(0)
-                    with open(real_file_path, 'wb') as f:
-                        for chunk in file_obj.chunks():
-                            f.write(chunk)
+                    # Save file locally in organized folder structure
+                    self._save_file_locally(data_file, file_obj, new_file_type)
                     
-                    real_files[file_type] = real_file_path
-                    logger.info(f"💾 Saved {file_type} file with real name: {real_file_name}")
+                    # Store the data file for background processing
+                    data_files[file_type] = data_file
+                    
+                    logger.info(f"💾 Saved {file_type} file locally: {data_file.local_file_path}")
             
-            # Start single background thread for all processing (OUTSIDE the loop!)
-            if real_files:  # Only start thread if there are files to process
-                logger.info(f"🚀 Starting background processing for {len(real_files)} files")
-                logger.info(f"📁 Files to process: {list(real_files.keys())}")
+            # Start single background thread for all processing
+            if data_files:  # Only start thread if there are files to process
+                logger.info(f"🚀 Starting background processing for {len(data_files)} files")
                 
                 thread = threading.Thread(
-                    target=self._process_files_sequentially,
-                    args=(real_files, engagement, metadata, results)
+                    target=self._process_data_files_from_local,
+                    args=(data_files, engagement, metadata, results)
                 )
                 thread.daemon = True
                 thread.start()
@@ -406,14 +414,227 @@ class FileUploadView(generics.CreateAPIView):
                 logger.info("ℹ️ No files to process in background")
                 
         except Exception as e:
-            # Clean up temp files on error
-            for temp_path in real_files.values():
-                try:
-                    os.unlink(temp_path)
-                except:
-                    pass
             logger.error(f"❌ Error setting up background processing: {e}")
             raise e
+    
+    def _process_data_files_from_local(self, data_files, engagement, metadata, results):
+        """
+        Process data files from local paths in background thread:
+        - If COA file exists: COA first, then GL only if COA succeeds
+        - If NO COA file: GL processes directly
+        """
+        coa_success = False
+        
+        try:
+            # Step 1: Process COA files if they exist
+            if 'chart_of_accounts' in data_files:
+                logger.info("🎯" + "="*60)
+                logger.info("🎯 STEP 1: PROCESSING CHART OF ACCOUNTS 🎯")
+                logger.info("🎯" + "="*60)
+                
+                data_file = data_files['chart_of_accounts']
+                
+                try:
+                    # Process from local file
+                    result = self._process_file_from_local_path(data_file, 'COA')
+                    coa_success = result.get('status') == 'completed'
+                    
+                    logger.info(f"✅ COA processing completed: {result.get('message', 'Success')}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ COA processing failed: {e}")
+                    coa_success = False
+            
+            # Step 2: Process GL files (only if COA succeeded or no COA file)
+            if 'gl_accounts' in data_files and (coa_success or 'chart_of_accounts' not in data_files):
+                logger.info("🎯" + "="*60)
+                logger.info("🎯 STEP 2: PROCESSING GL ACCOUNTS 🎯")
+                logger.info("🎯" + "="*60)
+                
+                data_file = data_files['gl_accounts']
+                
+                try:
+                    # Process from local file
+                    result = self._process_file_from_local_path(data_file, 'GL')
+                    
+                    logger.info(f"✅ GL processing completed: {result.get('message', 'Success')}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ GL processing failed: {e}")
+            else:
+                logger.info("⏭️ Skipping GL processing - COA processing failed or no GL file")
+            
+            logger.info("🎯" + "="*60)
+            logger.info("🎯 SINGLE THREAD PROCESSING COMPLETED! 🎯")
+            logger.info("🎯" + "="*60)
+            
+        except Exception as e:
+            logger.error(f"❌ Background processing failed: {e}")
+    
+    def _process_files_with_local_saving(self, files, engagement, metadata, results):
+        """
+        Process files in single background thread using local file saving:
+        - If COA file exists: COA first, then GL only if COA succeeds
+        - If NO COA file: GL processes directly
+        """
+        coa_success = False
+        
+        try:
+            # Step 1: Process COA files if they exist
+            if 'chart_of_accounts' in files:
+                logger.info("🎯" + "="*60)
+                logger.info("🎯 STEP 1: PROCESSING CHART OF ACCOUNTS 🎯")
+                logger.info("🎯" + "="*60)
+                
+                file_obj = files['chart_of_accounts']
+                
+                try:
+                    # Create data file record
+                    data_file = self._create_data_file_record(file_obj, engagement, 'COA', metadata)
+                    
+                    # Save file locally
+                    self._save_file_locally(data_file, file_obj, 'COA')
+                    
+                    # Process from local file (don't pass file_obj as it might be closed)
+                    result = self._process_file_from_local_path(data_file, 'COA')
+                    coa_success = result.get('status') == 'completed'
+                    
+                    logger.info(f"✅ COA processing completed: {result.get('message', 'Success')}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ COA processing failed: {e}")
+                    coa_success = False
+            
+            # Step 2: Process GL files (only if COA succeeded or no COA file)
+            if 'gl_accounts' in files and (coa_success or 'chart_of_accounts' not in files):
+                logger.info("🎯" + "="*60)
+                logger.info("🎯 STEP 2: PROCESSING GL ACCOUNTS 🎯")
+                logger.info("🎯" + "="*60)
+                
+                file_obj = files['gl_accounts']
+                
+                try:
+                    # Create data file record
+                    data_file = self._create_data_file_record(file_obj, engagement, 'GL', metadata)
+                    
+                    # Save file locally
+                    self._save_file_locally(data_file, file_obj, 'GL')
+                    
+                    # Process from local file (don't pass file_obj as it might be closed)
+                    result = self._process_file_from_local_path(data_file, 'GL')
+                    
+                    logger.info(f"✅ GL processing completed: {result.get('message', 'Success')}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ GL processing failed: {e}")
+            else:
+                logger.info("⏭️ Skipping GL processing - COA processing failed or no GL file")
+            
+            logger.info("🎯" + "="*60)
+            logger.info("🎯 SINGLE THREAD PROCESSING COMPLETED! 🎯")
+            logger.info("🎯" + "="*60)
+            
+        except Exception as e:
+            logger.error(f"❌ Background processing failed: {e}")
+    
+    def _process_file_from_local_path(self, data_file: DataFile, file_type: str):
+        """
+        Process file from local path (for background processing)
+        """
+        try:
+            # Update data file status to processing
+            data_file.status = 'PROCESSING'
+            data_file.save()
+            
+            # Read from the saved local file
+            file_reader = FileReader()
+            df = file_reader.read_file_from_path(data_file.local_file_path)
+            
+            if df is None or df.empty:
+                raise Exception("File is empty or could not be read")
+            
+            # Process the data
+            processor = DataProcessor(data_file)
+            
+            if file_type == 'COA':
+                # Use bulk loading for COA files to handle field length issues
+                result = self._process_coa_with_bulk_loading(data_file, df)
+                message = f"Chart of Accounts processed: {result['processed_count']} records"
+            elif file_type == 'GL':
+                # Use chunked processing for GL files to handle large datasets
+                result = processor.process_gl_data_chunked(data_file.local_file_path, chunk_size=25000)
+                message = f"General Ledger processed: {result['processed_count']} records"
+            else:
+                raise Exception(f"Unsupported file type: {file_type}")
+            
+            # Update data file with results
+            data_file.status = 'COMPLETED'
+            data_file.total_records = result['processed_count'] + result['failed_count']
+            data_file.processed_records = result['processed_count']
+            data_file.failed_records = result['failed_count']
+            data_file.processed_at = timezone.now()
+            data_file.save()
+            
+            logger.info(f"Successfully processed {file_type} file {data_file.file_name} from local path: {result}")
+            
+            return {
+                'file_type': file_type,
+                'file_id': str(data_file.id),
+                'file_name': data_file.file_name,
+                'file_size': data_file.file_size,
+                'status': 'completed',
+                'total_records': data_file.total_records,
+                'processed_records': data_file.processed_records,
+                'failed_records': data_file.failed_records,
+                'message': message
+            }
+            
+        except Exception as e:
+            # Update data file status to failed
+            data_file.status = 'FAILED'
+            data_file.save()
+            
+            logger.error(f"Error processing {file_type} file from local path: {e}")
+            
+            return {
+                'file_type': file_type,
+                'file_id': str(data_file.id),
+                'file_name': data_file.file_name,
+                'status': 'failed',
+                'error': str(e)
+            }
+    
+    def _process_coa_with_bulk_loading(self, data_file: DataFile, df: pd.DataFrame) -> Dict[str, int]:
+        """
+        Process COA data using bulk loading to handle field length issues
+        """
+        try:
+            from .bulk_loading_utils import SQLAlchemyBulkLoader
+            
+            # Create bulk loader
+            bulk_loader = SQLAlchemyBulkLoader()
+            
+            # Use bulk loading for COA data
+            result = bulk_loader.bulk_load_coa_with_pandas(df, str(data_file.id))
+            
+            if result['success']:
+                return {
+                    'processed_count': result['records_loaded'],
+                    'failed_count': 0
+                }
+            else:
+                logger.error(f"❌ COA bulk loading failed: {result.get('error', 'Unknown error')}")
+                return {
+                    'processed_count': 0,
+                    'failed_count': len(df)
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ Error in COA bulk loading: {e}")
+            return {
+                'processed_count': 0,
+                'failed_count': len(df)
+            }
     
     def _process_files_sequentially(self, real_files, engagement, metadata, results):
         """
@@ -850,23 +1071,8 @@ class FileUploadView(generics.CreateAPIView):
             logger.error(f"Background processing failed for GL file {data_file.file_name}: {e}")
             
         finally:
-            # 🗑️ Clean up temporary file after GL processing completion
-            try:
-                if os.path.exists(file_path):
-                    file_size = os.path.getsize(file_path)
-                    os.unlink(file_path)
-                    logger.info(f"🗑️ Cleaned up GL temp file: {file_path} ({file_size:,} bytes)")
-                else:
-                    logger.info(f"🗑️ GL temp file already cleaned up: {file_path}")
-            except Exception as cleanup_error:
-                logger.error(f"❌ Error cleaning up GL temp file {file_path}: {cleanup_error}")
-            
-            # 🧹 Clean up all engagement temp files after GL processing completion
-            try:
-                self._cleanup_engagement_temp_files(data_file.engagement)
-                logger.info(f"🧹 Engagement temp files cleanup completed for: {data_file.engagement.engagement_id}")
-            except Exception as cleanup_error:
-                logger.error(f"❌ Error cleaning up engagement temp files: {cleanup_error}")
+            # Files are now saved locally and not cleaned up
+            logger.info(f"💾 GL file saved locally: {data_file.local_file_path}")
     
     def _process_gl_coa_file_with_threading(self, data_file: DataFile, file_obj_or_path, file_type: str):
         """
@@ -1030,13 +1236,8 @@ class FileUploadView(generics.CreateAPIView):
             logger.error(f"Background processing failed for {file_type} file {data_file.file_name}: {e}")
             
         finally:
-            # Clean up temp file
-            try:
-                if os.path.exists(file_path):
-                    os.unlink(file_path)
-                    logger.info(f"Cleaned up temp file: {file_path}")
-            except Exception as cleanup_error:
-                logger.error(f"Error cleaning up temp file {file_path}: {cleanup_error}")
+            # Files are now saved locally and not cleaned up
+            logger.info(f"💾 File saved locally and preserved")
     
     def _process_gl_file_sync(self, data_file: DataFile, file_obj):
         """Process GL Listing file synchronously for better reliability"""
@@ -1045,9 +1246,12 @@ class FileUploadView(generics.CreateAPIView):
             data_file.status = 'PROCESSING'
             data_file.save()
             
-            # Read the file directly from memory
+            # Save file locally first, then read from local file
+            self._save_file_locally(data_file, file_obj, 'GL')
+            
+            # Read from the saved local file
             file_reader = FileReader()
-            df = file_reader.read_file(file_obj)
+            df = file_reader.read_file_from_path(data_file.local_file_path)
             
             if df is None or df.empty:
                 raise Exception("File is empty or could not be read")
@@ -1110,6 +1314,47 @@ class FileUploadView(generics.CreateAPIView):
             logger.error(f"Error processing GL file {data_file.file_name}: {e}")
             raise e
     
+    def _save_file_locally(self, data_file: DataFile, file_obj, file_type: str):
+        """
+        Save uploaded file locally in organized folder structure:
+        engagement_name/version/files/
+        """
+        import os
+        from django.conf import settings
+        
+        try:
+            # Create folder structure: engagement_name/version/
+            engagement_name = data_file.engagement.client.client_name.replace(' ', '_').replace('/', '_')
+            version = data_file.version
+            local_base_path = os.path.join(settings.MEDIA_ROOT, 'local_files', engagement_name, version)
+            
+            # Create directories if they don't exist
+            os.makedirs(local_base_path, exist_ok=True)
+            
+            # Generate safe filename
+            safe_filename = file_obj.name.replace(' ', '_').replace('/', '_')
+            
+            # Save file to local folder
+            local_file_path = os.path.join(local_base_path, safe_filename)
+            
+            # Reset file pointer to beginning
+            file_obj.seek(0)
+            
+            # Write file content
+            with open(local_file_path, 'wb') as local_file:
+                for chunk in file_obj.chunks():
+                    local_file.write(chunk)
+            
+            # Store local file path in data_file
+            data_file.local_file_path = local_file_path
+            data_file.save()
+            
+            logger.info(f"💾 File saved locally: {local_file_path}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to save file locally: {e}")
+            # Don't raise exception - continue with processing even if local save fails
+    
     def _process_file_sync(self, data_file: DataFile, file_obj, file_type: str):
         """
         Process TB and COA files synchronously during upload
@@ -1121,9 +1366,12 @@ class FileUploadView(generics.CreateAPIView):
             data_file.status = 'PROCESSING'
             data_file.save()
             
-            # Read the file directly from memory
+            # Save file locally first, then read from local file
+            self._save_file_locally(data_file, file_obj, file_type)
+            
+            # Read from the saved local file
             file_reader = FileReader()
-            df = file_reader.read_file(file_obj)
+            df = file_reader.read_file_from_path(data_file.local_file_path)
             
             if df is None or df.empty:
                 raise Exception("File is empty or could not be read")
@@ -1196,91 +1444,7 @@ class FileUploadView(generics.CreateAPIView):
             logger.error(f"Error processing {file_type} file {data_file.file_name}: {e}")
             raise e
 
-    def _cleanup_engagement_temp_files(self, engagement):
-        """
-        Clean up all temporary files for a specific engagement after GL processing completion
-        
-        This function removes:
-        1. Files in temp_uploads/ directory that belong to this engagement
-        2. Any orphaned temporary files older than 1 hour
-        
-        Args:
-            engagement: Engagement object to clean up temp files for
-        """
-        if not engagement:
-            logger.warning("No engagement provided for temp file cleanup")
-            return
-            
-        logger.info(f"🧹 Starting temp file cleanup for engagement: {engagement.engagement_id}")
-        
-        try:
-            from django.conf import settings
-            import glob
-            from datetime import datetime, timedelta
-            
-            temp_dir = getattr(settings, 'FILE_UPLOAD_TEMP_DIR', os.path.join(settings.BASE_DIR, 'temp_uploads'))
-            
-            if not os.path.exists(temp_dir):
-                logger.info(f"Temp directory {temp_dir} does not exist, nothing to clean")
-                return
-            
-            cleaned_count = 0
-            total_size = 0
-            
-            # Get all data files for this engagement
-            engagement_files = engagement.data_files.all()
-            engagement_file_names = [df.file_name for df in engagement_files]
-            
-            logger.info(f"📋 Found {len(engagement_file_names)} files for engagement {engagement.engagement_id}")
-            
-            # Clean up files in temp_uploads directory
-            temp_files = glob.glob(os.path.join(temp_dir, "*"))
-            
-            for temp_file_path in temp_files:
-                try:
-                    if not os.path.isfile(temp_file_path):
-                        continue
-                        
-                    file_name = os.path.basename(temp_file_path)
-                    file_size = os.path.getsize(temp_file_path)
-                    file_age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(temp_file_path))
-                    
-                    should_delete = False
-                    reason = ""
-                    
-                    # Check if this file belongs to the current engagement
-                    # Look for engagement-related patterns or older files
-                    if any(eng_name in file_name for eng_name in engagement_file_names):
-                        should_delete = True
-                        reason = f"belongs to engagement {engagement.engagement_id}"
-                    elif file_age > timedelta(hours=1):
-                        should_delete = True
-                        reason = f"older than 1 hour (age: {file_age})"
-                    elif file_name.startswith('tmp') and file_name.endswith(('.xlsx', '.csv', '.xls')):
-                        # Clean up temporary upload files that are old
-                        if file_age > timedelta(minutes=30):
-                            should_delete = True
-                            reason = f"temporary upload file older than 30 minutes"
-                    
-                    if should_delete:
-                        os.unlink(temp_file_path)
-                        cleaned_count += 1
-                        total_size += file_size
-                        logger.info(f"🗑️  Deleted temp file: {file_name} ({file_size} bytes) - {reason}")
-                        
-                except Exception as file_error:
-                    logger.error(f"❌ Error deleting temp file {temp_file_path}: {file_error}")
-                    continue
-            
-            # Summary log
-            if cleaned_count > 0:
-                logger.info(f"✅ Temp cleanup completed for engagement {engagement.engagement_id}")
-                logger.info(f"📊 Cleaned {cleaned_count} files, freed {total_size:,} bytes ({total_size/1024/1024:.2f} MB)")
-            else:
-                logger.info(f"🔍 No temp files to clean for engagement {engagement.engagement_id}")
-                
-        except Exception as e:
-            logger.error(f"❌ Error during temp file cleanup for engagement {engagement.engagement_id}: {e}")
+    # File cleanup method removed - files are now saved locally and preserved
 
 
 # ============================================================================
@@ -1788,7 +1952,7 @@ class AccountVerificationsPagination(PageNumberPagination):
 
 class DocumentVerificationsPagination(PageNumberPagination):
     """Custom pagination for document verifications"""
-    page_size = 50
+    page_size = 10
     page_size_query_param = 'page_size'
     max_page_size = 500
 
@@ -2038,3 +2202,997 @@ def get_account_verifications_by_engagement(request, engagement_id):
 
 
 
+
+
+# ============================================================================
+# DOCUMENT VERIFICATIONS API VIEW
+# ============================================================================
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_document_verifications_by_engagement(request, engagement_id):
+    """
+    Get document verifications for a specific engagement with enhanced pagination
+    
+    Returns both successful (balanced) and failed (unbalanced) document verifications
+    from CompletenessTestResult data with comprehensive statistics, filtering options, 
+    and robust pagination.
+    
+    GET /api/document-verifications/engagement/{engagement_id}/
+    
+    Data Source:
+    - Uses document verification data stored in CompletenessTestResult.comprehensive_statistics
+    - Falls back to summary statistics from CompletenessTestResult fields if detailed data unavailable
+    - No direct SAPGLPosting queries for better performance and consistency
+    
+    Query Parameters:
+    - page: Page number for pagination (default: 1)
+    - page_size: Number of results per page (default: 50, max: 500)
+    - unbalanced_only: boolean (default: false) - true=unbalanced documents only, false=all documents
+    - latest: boolean (default: true) - Return only from latest test result
+    - document_number: Filter by specific document number
+    - min_variance: Filter by minimum balance variance
+    - sort_by: Sort field (document_number, net_balance, transaction_count, account_count, balance_variance)
+    - sort_order: Sort order (asc, desc) - default: desc for variance, asc for document_number
+    
+    Response includes:
+    - summary_statistics: Overall document verification statistics from CompletenessTestResult
+    - document_verification_summary: Separate counts for successful and failed verifications
+    - filtered_results: Information about applied filters
+    - pagination: Comprehensive pagination metadata with navigation info
+    - results: Array of document verification details with status indicators
+    
+    Performance Benefits:
+    - Uses pre-calculated CompletenessTestResult data (no real-time SAPGLPosting queries)
+    - Faster response times for large datasets
+    - Consistent data with completeness test results
+    - Automatic page size validation (1-500 range)
+    - Page number validation and bounds checking
+    """
+    try:
+        # Get query parameters
+        unbalanced_only = request.query_params.get('unbalanced_only', 'false').lower() == 'true'
+        latest_only = request.query_params.get('latest', 'true').lower() == 'true'
+        document_number_filter = request.query_params.get('document_number', '').strip()
+        min_variance = request.query_params.get('min_variance')
+        sort_by = request.query_params.get('sort_by', 'transaction_count')
+        sort_order = request.query_params.get('sort_order', 'desc')
+        
+        # Convert min_variance to float if provided
+        if min_variance:
+            try:
+                min_variance = float(min_variance)
+            except ValueError:
+                min_variance = None
+        
+        # Get the latest completeness test result for the engagement
+        test_result = CompletenessTestResult.objects.filter(
+            engagement__engagement_id=engagement_id
+        ).order_by('-test_timestamp').first()
+        
+        if not test_result:
+            return Response({
+                'engagement_id': engagement_id,
+                'message': f'No completeness test results found for engagement {engagement_id}'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Extract document verification data from CompletenessTestResult
+        logger.info(f"Document verifications debug for {engagement_id}:")
+        logger.info(f"  Using document verification data from CompletenessTestResult")
+        logger.info(f"  Total Documents: {test_result.total_documents}")
+        logger.info(f"  Balanced Documents: {test_result.balanced_documents}")
+        logger.info(f"  Unbalanced Documents: {test_result.unbalanced_documents}")
+        
+        # Extract document verification results from comprehensive_statistics
+        document_verifications = []
+        comprehensive_stats = test_result.comprehensive_statistics or {}
+        
+        # Check for document verification data in the correct locations based on our analysis
+        document_verifications = []
+        
+        # First, check if document_verification_results is directly in comprehensive_statistics
+        if 'document_verification_results' in comprehensive_stats:
+            document_verifications = comprehensive_stats['document_verification_results']
+            logger.info(f"  Found {len(document_verifications)} document verifications in comprehensive_statistics")
+        else:
+            # Check enhanced_statistics.audit_calculation_statistics.document_balance_verification
+            enhanced_stats = comprehensive_stats.get('enhanced_statistics', {})
+            audit_stats = enhanced_stats.get('audit_calculation_statistics', {})
+            doc_balance_verification = audit_stats.get('document_balance_verification', {})
+            
+            if doc_balance_verification:
+                logger.info(f"  Found document balance verification data in enhanced_statistics")
+                logger.info(f"  Document verification data: {doc_balance_verification}")
+                
+                # Create a more informative response since we have verification data but no detailed document list
+            return Response({
+                'engagement_id': engagement_id,
+                    'test_id': str(test_result.id),
+                    'test_timestamp': test_result.test_timestamp,
+                    'message': 'Document verification summary available, but detailed document list not stored in completeness test results',
+                    'summary_statistics': {
+                        'total_documents': test_result.total_documents,
+                        'balanced_documents': test_result.balanced_documents,
+                        'unbalanced_documents': test_result.unbalanced_documents,
+                        'balance_rate_percentage': round(test_result.document_balance_rate * 100, 2),
+                        'total_variance': float(test_result.total_document_variance),
+                        'average_variance': float(test_result.average_document_variance)
+                    },
+                    'document_verification_summary': {
+                        'successful_verifications': {
+                            'count': test_result.balanced_documents,
+                            'percentage': round(test_result.document_balance_rate * 100, 2),
+                            'status': 'PASSED'
+                        },
+                        'failed_verifications': {
+                            'count': test_result.unbalanced_documents,
+                            'percentage': round((1 - test_result.document_balance_rate) * 100, 2),
+                            'status': 'FAILED',
+                            'total_variance': float(test_result.total_document_variance),
+                            'average_variance': float(test_result.average_document_variance)
+                        }
+                    },
+                    'verification_details': {
+                        'verification_rule': doc_balance_verification.get('verification_rule', ''),
+                        'verification_passed': doc_balance_verification.get('verification_passed', False),
+                        'critical_issues': doc_balance_verification.get('critical_issues', 0),
+                        'recommendation': doc_balance_verification.get('recommendation', '')
+                    },
+                    'data_availability': {
+                        'detailed_document_list': False,
+                        'summary_statistics': True,
+                        'verification_results': True,
+                        'note': 'Detailed document verification list is not stored in CompletenessTestResult. Only summary statistics are available.'
+                    },
+                    'results': []
+                }, status=status.HTTP_200_OK)
+        
+        # If no detailed document verification data is available, return summary only
+        if not document_verifications:
+            logger.warning(f"  No detailed document verification data found in CompletenessTestResult")
+            logger.info(f"  Available comprehensive_statistics keys: {list(comprehensive_stats.keys())}")
+            
+            return Response({
+                'engagement_id': engagement_id,
+                'test_id': str(test_result.id),
+                'test_timestamp': test_result.test_timestamp,
+                'message': 'Document verification data not available in completeness test results',
+                'summary_statistics': {
+                    'total_documents': test_result.total_documents,
+                    'balanced_documents': test_result.balanced_documents,
+                    'unbalanced_documents': test_result.unbalanced_documents,
+                    'balance_rate_percentage': round(test_result.document_balance_rate * 100, 2),
+                    'total_variance': float(test_result.total_document_variance),
+                    'average_variance': float(test_result.average_document_variance)
+                },
+                'document_verification_summary': {
+                    'successful_verifications': {
+                        'count': test_result.balanced_documents,
+                        'percentage': round(test_result.document_balance_rate * 100, 2),
+                        'status': 'PASSED'
+                    },
+                    'failed_verifications': {
+                        'count': test_result.unbalanced_documents,
+                        'percentage': round((1 - test_result.document_balance_rate) * 100, 2),
+                        'status': 'FAILED',
+                        'total_variance': float(test_result.total_document_variance),
+                        'average_variance': float(test_result.average_document_variance)
+                    }
+                },
+                'results': []
+            }, status=status.HTTP_200_OK)
+        
+        # Ensure document_verifications is a list
+        if not isinstance(document_verifications, list):
+            document_verifications = []
+        
+        # Separate balanced and unbalanced documents
+        balanced_documents = [v for v in document_verifications if v.get('is_balanced', True)]
+        unbalanced_documents = [v for v in document_verifications if not v.get('is_balanced', True)]
+        
+        # Apply filters
+        filtered_verifications = document_verifications.copy()
+        
+        if unbalanced_only:
+            # Return only unbalanced documents
+            filtered_verifications = unbalanced_documents.copy()
+        elif unbalanced_only is False:
+            # Return only balanced/successful documents
+            filtered_verifications = balanced_documents.copy()
+        
+        if document_number_filter:
+            filtered_verifications = [v for v in filtered_verifications 
+                                    if document_number_filter.lower() in v.get('document_number', '').lower()]
+        
+        if min_variance is not None:
+            filtered_verifications = [v for v in filtered_verifications 
+                                    if v.get('balance_variance', 0) >= min_variance]
+        
+        # Apply sorting
+        if sort_by in ['document_number', 'net_balance', 'transaction_count', 'account_count', 'balance_variance']:
+            try:
+                reverse = sort_order.lower() == 'desc'
+                if sort_by == 'document_number':
+                    filtered_verifications.sort(key=lambda x: x.get(sort_by, ''), reverse=reverse)
+                else:
+                    filtered_verifications.sort(key=lambda x: float(x.get(sort_by, 0)), reverse=reverse)
+            except (ValueError, TypeError):
+                # If sorting fails, keep original order
+                pass
+        
+        # Add computed fields for better display
+        for verification in filtered_verifications:
+            verification['balance_variance_abs'] = abs(verification.get('balance_variance', 0))
+            verification['variance_formatted'] = f"{verification.get('balance_variance_abs', 0):,.2f}"
+            verification['status'] = 'BALANCED' if verification.get('is_balanced', True) else 'UNBALANCED'
+        
+        # Use statistics from CompletenessTestResult (more accurate than recalculating)
+        total_documents = test_result.total_documents
+        total_balanced = test_result.balanced_documents
+        total_unbalanced = test_result.unbalanced_documents
+        balance_rate = test_result.document_balance_rate * 100  # Convert to percentage
+        total_variance = float(test_result.total_document_variance)
+        average_variance = float(test_result.average_document_variance)
+        
+        # If we have detailed document verification data, use it for filtering and sorting
+        if document_verifications:
+            # Recalculate from detailed data for consistency
+            calculated_balanced = len([v for v in document_verifications if v.get('is_balanced', True)])
+            calculated_unbalanced = len([v for v in document_verifications if not v.get('is_balanced', True)])
+            
+            # Use calculated values if they differ significantly from stored values
+            if abs(calculated_balanced - total_balanced) > 5 or abs(calculated_unbalanced - total_unbalanced) > 5:
+                logger.warning(f"Document count mismatch: stored({total_balanced}/{total_unbalanced}) vs calculated({calculated_balanced}/{calculated_unbalanced})")
+                total_balanced = calculated_balanced
+                total_unbalanced = calculated_unbalanced
+                total_documents = total_balanced + total_unbalanced
+                balance_rate = (total_balanced / total_documents * 100) if total_documents > 0 else 0
+        
+        # Apply pagination
+        paginator = DocumentVerificationsPagination()
+        
+        # Get pagination parameters from request
+        page_number = request.query_params.get('page', 1)
+        page_size = request.query_params.get('page_size', paginator.page_size)
+        
+        # Ensure page_size is within limits
+        try:
+            page_size = int(page_size)
+            if page_size > paginator.max_page_size:
+                page_size = paginator.max_page_size
+            elif page_size < 1:
+                page_size = paginator.page_size
+        except (ValueError, TypeError):
+            page_size = paginator.page_size
+        
+        # Calculate pagination manually for better control
+        total_items = len(filtered_verifications)
+        total_pages = (total_items + page_size - 1) // page_size  # Ceiling division
+        
+        try:
+            page_number = int(page_number)
+            if page_number < 1:
+                page_number = 1
+            elif page_number > total_pages and total_pages > 0:
+                page_number = total_pages
+        except (ValueError, TypeError):
+            page_number = 1
+        
+        # Calculate start and end indices
+        start_index = (page_number - 1) * page_size
+        end_index = start_index + page_size
+        
+        # Get the page data
+        page_data = filtered_verifications[start_index:end_index]
+        
+        # Create pagination metadata
+        pagination_info = {
+            'current_page': page_number,
+            'page_size': page_size,
+            'total_pages': total_pages,
+            'total_items': total_items,
+            'has_next': page_number < total_pages,
+            'has_previous': page_number > 1,
+            'next_page': page_number + 1 if page_number < total_pages else None,
+            'previous_page': page_number - 1 if page_number > 1 else None,
+            'start_index': start_index + 1 if total_items > 0 else 0,
+            'end_index': min(end_index, total_items)
+        }
+        
+        # Always return paginated response with comprehensive metadata
+        response_data = {
+            'engagement_id': engagement_id,
+            'test_id': str(test_result.id),
+            'test_timestamp': test_result.test_timestamp,
+        'summary_statistics': {
+            'total_documents': total_documents,
+            'balanced_documents': total_balanced,
+            'unbalanced_documents': total_unbalanced,
+            'balance_rate_percentage': round(balance_rate, 2),
+            'total_variance': round(total_variance, 2),
+            'average_variance': round(average_variance, 2)
+        },
+        'document_verification_summary': {
+            'successful_verifications': {
+                'count': total_balanced,
+                'percentage': round(balance_rate, 2),
+                'status': 'PASSED'
+            },
+            'failed_verifications': {
+                'count': total_unbalanced,
+                'percentage': round(100 - balance_rate, 2),
+                'status': 'FAILED',
+                'total_variance': round(total_variance, 2),
+                'average_variance': round(average_variance, 2)
+            }
+        },
+        'filtered_results': {
+            'total_filtered': len(filtered_verifications),
+        'filters_applied': {
+            'unbalanced_only': unbalanced_only,
+            'document_number': document_number_filter,
+            'min_variance': min_variance,
+            'sort_by': sort_by,
+            'sort_order': sort_order
+            }
+        },
+        'pagination': pagination_info,
+        'results': page_data
+        }
+        
+        return Response(response_data, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        logger.error(f"Error retrieving document verifications for engagement {engagement_id}: {e}")
+        return Response({
+            'error': 'Internal server error',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ============================================================================
+# PROFIT CENTER DATA API VIEW
+# ============================================================================
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_profit_center_data_by_engagement(request, engagement_id):
+    """
+    Get profit center data for a specific engagement with pagination
+    
+    GET /api/profit-center-data/engagement/{engagement_id}/
+    
+    Query Parameters:
+    - page: Page number for pagination
+    - page_size: Number of results per page (max 1000)
+    - profit_center_code: Filter by specific profit center code
+    - profit_center_type: Filter by profit center type
+    - revenue_center: boolean - Filter revenue centers only
+    - cost_center: boolean - Filter cost centers only
+    - status: Filter by status (ACTIVE, INACTIVE, BLOCKED)
+    - sort_by: Sort field (profit_center_code, profit_center_name, total_amount, transaction_count)
+    - sort_order: Sort order (asc, desc) - default: asc for code, desc for amounts
+    """
+    try:
+        # Get query parameters
+        profit_center_code_filter = request.query_params.get('profit_center_code', '').strip()
+        profit_center_type_filter = request.query_params.get('profit_center_type', '').strip()
+        revenue_center_only = request.query_params.get('revenue_center', 'false').lower() == 'true'
+        cost_center_only = request.query_params.get('cost_center', 'false').lower() == 'true'
+        status_filter = request.query_params.get('status', '').strip()
+        sort_by = request.query_params.get('sort_by', 'profit_center_code')
+        sort_order = request.query_params.get('sort_order', 'asc')
+        
+        # Get the engagement
+        try:
+            engagement = Engagement.objects.get(engagement_id=engagement_id)
+        except Engagement.DoesNotExist:
+            return Response({
+                'engagement_id': engagement_id,
+                'message': f'Engagement {engagement_id} not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Get GL postings for this engagement to calculate profit center statistics
+        gl_postings = SAPGLPosting.objects.filter(
+            data_file__engagement=engagement
+        ).exclude(profit_center='').exclude(profit_center__isnull=True)
+        
+        # Group by profit center
+        profit_center_analysis = {}
+        for posting in gl_postings:
+            pc_code = posting.profit_center
+            if pc_code not in profit_center_analysis:
+                profit_center_analysis[pc_code] = {
+                    'debit_total': 0,
+                    'credit_total': 0,
+                    'transaction_count': 0,
+                    'accounts': set(),
+                    'users': set(),
+                    'document_count': set(),
+                    'posting_dates': set()
+                }
+            
+            # Add amounts (positive=debit, negative=credit)
+            amount = float(posting.amount_local_currency or 0)
+            if amount > 0:
+                profit_center_analysis[pc_code]['debit_total'] += amount
+            else:
+                profit_center_analysis[pc_code]['credit_total'] += abs(amount)
+            
+            profit_center_analysis[pc_code]['transaction_count'] += 1
+            profit_center_analysis[pc_code]['accounts'].add(posting.gl_account)
+            profit_center_analysis[pc_code]['users'].add(posting.user_name)
+            if posting.document_number:
+                profit_center_analysis[pc_code]['document_count'].add(posting.document_number)
+            if posting.posting_date:
+                profit_center_analysis[pc_code]['posting_dates'].add(str(posting.posting_date))
+        
+        # Get profit center master data
+        profit_centers = ProfitCenter.objects.all()
+        
+        # Apply filters
+        if profit_center_code_filter:
+            profit_centers = profit_centers.filter(profit_center_code__icontains=profit_center_code_filter)
+        
+        if profit_center_type_filter:
+            profit_centers = profit_centers.filter(profit_center_type__icontains=profit_center_type_filter)
+        
+        if revenue_center_only:
+            profit_centers = profit_centers.filter(revenue_center=True)
+        
+        if cost_center_only:
+            profit_centers = profit_centers.filter(cost_center=True)
+        
+        if status_filter:
+            profit_centers = profit_centers.filter(profit_center_status=status_filter)
+        
+        # Create profit center data with statistics
+        profit_center_data = []
+        for pc in profit_centers:
+            pc_stats = profit_center_analysis.get(pc.profit_center_code, {
+                'debit_total': 0,
+                'credit_total': 0,
+                'transaction_count': 0,
+                'accounts': set(),
+                'users': set(),
+                'document_count': set(),
+                'posting_dates': set()
+            })
+            
+            net_amount = pc_stats['debit_total'] - pc_stats['credit_total']
+            
+            pc_data = {
+                'id': str(pc.id),
+                'profit_center_code': pc.profit_center_code,
+                'profit_center_name': pc.profit_center_name,
+                'profit_center_short_text': pc.profit_center_short_text,
+                'profit_center_type': pc.profit_center_type,
+                'profit_center_group': pc.profit_center_group,
+                'revenue_center': pc.revenue_center,
+                'cost_center': pc.cost_center,
+                'profit_center_currency': pc.profit_center_currency,
+                'profit_center_status': pc.profit_center_status,
+                'company_code': pc.company_code,
+                'business_area': pc.business_area,
+                'segment': pc.segment,
+                'responsible_person': pc.responsible_person,
+                'department': pc.department,
+                'parent_profit_center': pc.parent_profit_center.profit_center_code if pc.parent_profit_center else None,
+                'profit_center_level': pc.profit_center_level,
+                'created_at': pc.created_at,
+                'updated_at': pc.updated_at,
+                
+                # Statistics from GL postings
+                'debit_total': round(pc_stats['debit_total'], 2),
+                'credit_total': round(pc_stats['credit_total'], 2),
+                'net_amount': round(net_amount, 2),
+                'transaction_count': pc_stats['transaction_count'],
+                'account_count': len(pc_stats['accounts']),
+                'accounts': list(pc_stats['accounts']),
+                'user_count': len(pc_stats['users']),
+                'users': list(pc_stats['users']),
+                'document_count': len(pc_stats['document_count']),
+                'posting_dates': list(pc_stats['posting_dates']),
+                'has_activity': pc_stats['transaction_count'] > 0
+            }
+            
+            profit_center_data.append(pc_data)
+        
+        # Apply sorting
+        if sort_by in ['profit_center_code', 'profit_center_name', 'debit_total', 'credit_total', 'net_amount', 'transaction_count']:
+            try:
+                reverse = sort_order.lower() == 'desc'
+                if sort_by in ['profit_center_code', 'profit_center_name']:
+                    profit_center_data.sort(key=lambda x: x.get(sort_by, ''), reverse=reverse)
+                else:
+                    profit_center_data.sort(key=lambda x: float(x.get(sort_by, 0)), reverse=reverse)
+            except (ValueError, TypeError):
+                # If sorting fails, keep original order
+                pass
+        
+        # Apply pagination
+        paginator = ProfitCenterDataPagination()
+        page = paginator.paginate_queryset(profit_center_data, request)
+        
+        if page is not None:
+            response_data = {
+                'engagement_id': engagement_id,
+                'engagement_name': engagement.engagement_name,
+                'total_profit_centers': len(profit_center_data),
+                'filters_applied': {
+                    'profit_center_code': profit_center_code_filter,
+                    'profit_center_type': profit_center_type_filter,
+                    'revenue_center_only': revenue_center_only,
+                    'cost_center_only': cost_center_only,
+                    'status': status_filter,
+                    'sort_by': sort_by,
+                    'sort_order': sort_order
+                },
+                'results': page
+            }
+            return paginator.get_paginated_response(response_data)
+        
+        # If no pagination, return all results
+        return Response({
+            'engagement_id': engagement_id,
+            'engagement_name': engagement.engagement_name,
+            'total_profit_centers': len(profit_center_data),
+            'filters_applied': {
+                'profit_center_code': profit_center_code_filter,
+                'profit_center_type': profit_center_type_filter,
+                'revenue_center_only': revenue_center_only,
+                'cost_center_only': cost_center_only,
+                'status': status_filter,
+                'sort_by': sort_by,
+                'sort_order': sort_order
+            },
+            'results': profit_center_data
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        logger.error(f"Error retrieving profit center data for engagement {engagement_id}: {e}")
+        return Response({
+            'error': 'Internal server error',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_profit_center_data_by_account(request, account_id):
+    """
+    Get profit center data for a specific GL account with pagination
+    
+    GET /api/profit-center-data/account/{account_id}/
+    
+    Returns profit centers that have transactions with the specified GL account,
+    including GL account type, sub type, and sub sub type information.
+    
+    Query Parameters:
+    - page: Page number for pagination
+    - page_size: Number of results per page (max 1000)
+    - profit_center_code: Filter by specific profit center code
+    - profit_center_type: Filter by profit center type
+    - revenue_center: boolean - Filter revenue centers only
+    - cost_center: boolean - Filter cost centers only
+    - status: Filter by status (ACTIVE, INACTIVE, BLOCKED)
+    - sort_by: Sort field (profit_center_code, profit_center_name, total_amount, transaction_count)
+    - sort_order: Sort order (asc, desc) - default: asc for code, desc for amounts
+    
+    Response includes:
+    - GL account information (type, sub type, sub sub type)
+    - Profit centers with activity for this GL account
+    - Transaction statistics specific to this GL account
+    """
+    try:
+        # Get query parameters
+        profit_center_code_filter = request.query_params.get('profit_center_code', '').strip()
+        profit_center_type_filter = request.query_params.get('profit_center_type', '').strip()
+        revenue_center_only = request.query_params.get('revenue_center', 'false').lower() == 'true'
+        cost_center_only = request.query_params.get('cost_center', 'false').lower() == 'true'
+        status_filter = request.query_params.get('status', '').strip()
+        sort_by = request.query_params.get('sort_by', 'profit_center_code')
+        sort_order = request.query_params.get('sort_order', 'asc')
+        
+        # Get GL postings for this specific account
+        gl_postings = SAPGLPosting.objects.filter(
+            gl_account=account_id
+        ).exclude(profit_center='').exclude(profit_center__isnull=True)
+        
+        # Get GL account information
+        try:
+            from core.models import GLAccount, ChartOfAccount
+            gl_account = GLAccount.objects.get(account_code=account_id)
+            
+            # Get type information from GL account
+            account_type = gl_account.account_type
+            sub_type = gl_account.sub_type
+            sub_sub_type = gl_account.sub_sub_type
+            
+            # If type information is empty, try to get it from Chart of Accounts
+            if not account_type or not sub_type or not sub_sub_type:
+                try:
+                    coa_account = ChartOfAccount.objects.filter(
+                        account=account_id
+                    ).first()
+                    
+                    if coa_account:
+                        account_type = account_type or coa_account.type
+                        sub_type = sub_type or coa_account.sub_type
+                        sub_sub_type = sub_sub_type or coa_account.sub_sub_type
+                except Exception as e:
+                    logger.warning(f"Could not fetch Chart of Accounts data for account {account_id}: {e}")
+            
+            gl_account_info = {
+                'account_code': gl_account.account_code,
+                'account_name': gl_account.account_name,
+                'account_type': account_type,
+                'sub_type': sub_type,
+                'sub_sub_type': sub_sub_type,
+                'financial_statement_category': gl_account.financial_statement_category,
+                'balance_sheet_category': gl_account.balance_sheet_category,
+                'income_statement_category': gl_account.income_statement_category,
+                'currency': gl_account.currency,
+                'is_active': gl_account.is_active,
+                'opening_balance': float(gl_account.opening_balance) if gl_account.opening_balance else None,
+                'closing_balance': float(gl_account.closing_balance) if gl_account.closing_balance else None
+            }
+        except GLAccount.DoesNotExist:
+            # Try to get basic info from Chart of Accounts if GL account doesn't exist
+            try:
+                from core.models import ChartOfAccount
+                coa_account = ChartOfAccount.objects.filter(account=account_id).first()
+                if coa_account:
+                    gl_account_info = {
+                        'account_code': coa_account.account,
+                        'account_name': coa_account.gl_account_long_text or f'Account {coa_account.account}',
+                        'account_type': coa_account.type,
+                        'sub_type': coa_account.sub_type,
+                        'sub_sub_type': coa_account.sub_sub_type,
+                        'financial_statement_category': None,
+                        'balance_sheet_category': None,
+                        'income_statement_category': None,
+                        'currency': 'SAR',
+                        'is_active': True,
+                        'opening_balance': None,
+                        'closing_balance': None
+                    }
+                else:
+                    gl_account_info = {
+                        'account_code': account_id,
+                        'account_name': f'Account {account_id}',
+                        'account_type': 'Unknown',
+                        'sub_type': None,
+                        'sub_sub_type': None,
+                        'financial_statement_category': None,
+                        'balance_sheet_category': None,
+                        'income_statement_category': None,
+                        'currency': 'SAR',
+                        'is_active': True,
+                        'opening_balance': None,
+                        'closing_balance': None
+                    }
+            except Exception as e:
+                logger.warning(f"Could not fetch Chart of Accounts data for account {account_id}: {e}")
+                gl_account_info = {
+                    'account_code': account_id,
+                    'account_name': f'Account {account_id}',
+                    'account_type': 'Unknown',
+                    'sub_type': None,
+                    'sub_sub_type': None,
+                    'financial_statement_category': None,
+                    'balance_sheet_category': None,
+                    'income_statement_category': None,
+                    'currency': 'SAR',
+                    'is_active': True,
+                    'opening_balance': None,
+                    'closing_balance': None
+                }
+        
+        if not gl_postings.exists():
+            return Response({
+                'account_id': account_id,
+                'message': f'No profit center data found for account {account_id}'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Group by profit center for this account
+        profit_center_analysis = {}
+        for posting in gl_postings:
+            pc_code = posting.profit_center
+            if pc_code not in profit_center_analysis:
+                profit_center_analysis[pc_code] = {
+                    'debit_total': 0,
+                    'credit_total': 0,
+                    'transaction_count': 0,
+                    'users': set(),
+                    'document_count': set(),
+                    'posting_dates': set()
+                }
+            
+            # Add amounts (positive=debit, negative=credit)
+            amount = float(posting.amount_local_currency or 0)
+            if amount > 0:
+                profit_center_analysis[pc_code]['debit_total'] += amount
+            else:
+                profit_center_analysis[pc_code]['credit_total'] += abs(amount)
+            
+            profit_center_analysis[pc_code]['transaction_count'] += 1
+            profit_center_analysis[pc_code]['users'].add(posting.user_name)
+            if posting.document_number:
+                profit_center_analysis[pc_code]['document_count'].add(posting.document_number)
+            if posting.posting_date:
+                profit_center_analysis[pc_code]['posting_dates'].add(str(posting.posting_date))
+        
+        # Get profit center master data for the profit centers that have activity with this account
+        profit_center_codes = list(profit_center_analysis.keys())
+        profit_centers = ProfitCenter.objects.filter(profit_center_code__in=profit_center_codes)
+        
+        # Apply filters
+        if profit_center_code_filter:
+            profit_centers = profit_centers.filter(profit_center_code__icontains=profit_center_code_filter)
+        
+        if profit_center_type_filter:
+            profit_centers = profit_centers.filter(profit_center_type__icontains=profit_center_type_filter)
+        
+        if revenue_center_only:
+            profit_centers = profit_centers.filter(revenue_center=True)
+        
+        if cost_center_only:
+            profit_centers = profit_centers.filter(cost_center=True)
+        
+        if status_filter:
+            profit_centers = profit_centers.filter(profit_center_status=status_filter)
+        
+        # Create profit center data with statistics
+        profit_center_data = []
+        for pc in profit_centers:
+            pc_stats = profit_center_analysis.get(pc.profit_center_code, {
+                'debit_total': 0,
+                'credit_total': 0,
+                'transaction_count': 0,
+                'users': set(),
+                'document_count': set(),
+                'posting_dates': set()
+            })
+            
+            net_amount = pc_stats['debit_total'] - pc_stats['credit_total']
+            
+            pc_data = {
+                'id': str(pc.id),
+                'profit_center_code': pc.profit_center_code,
+                'profit_center_name': pc.profit_center_name,
+                'profit_center_short_text': pc.profit_center_short_text,
+                'profit_center_type': pc.profit_center_type,
+                'profit_center_group': pc.profit_center_group,
+                'revenue_center': pc.revenue_center,
+                'cost_center': pc.cost_center,
+                'profit_center_currency': pc.profit_center_currency,
+                'profit_center_status': pc.profit_center_status,
+                'company_code': pc.company_code,
+                'business_area': pc.business_area,
+                'segment': pc.segment,
+                'responsible_person': pc.responsible_person,
+                'department': pc.department,
+                'parent_profit_center': pc.parent_profit_center.profit_center_code if pc.parent_profit_center else None,
+                'profit_center_level': pc.profit_center_level,
+                'created_at': pc.created_at,
+                'updated_at': pc.updated_at,
+                
+                # Statistics from GL postings for this account
+                'debit_total': round(pc_stats['debit_total'], 2),
+                'credit_total': round(pc_stats['credit_total'], 2),
+                'net_amount': round(net_amount, 2),
+                'transaction_count': pc_stats['transaction_count'],
+                'user_count': len(pc_stats['users']),
+                'users': list(pc_stats['users']),
+                'document_count': len(pc_stats['document_count']),
+                'posting_dates': list(pc_stats['posting_dates']),
+                'has_activity': pc_stats['transaction_count'] > 0
+            }
+            
+            profit_center_data.append(pc_data)
+        
+        # Apply sorting
+        if sort_by in ['profit_center_code', 'profit_center_name', 'debit_total', 'credit_total', 'net_amount', 'transaction_count']:
+            try:
+                reverse = sort_order.lower() == 'desc'
+                if sort_by in ['profit_center_code', 'profit_center_name']:
+                    profit_center_data.sort(key=lambda x: x.get(sort_by, ''), reverse=reverse)
+                else:
+                    profit_center_data.sort(key=lambda x: float(x.get(sort_by, 0)), reverse=reverse)
+            except (ValueError, TypeError):
+                # If sorting fails, keep original order
+                pass
+        
+        # Apply pagination
+        paginator = ProfitCenterDataPagination()
+        page = paginator.paginate_queryset(profit_center_data, request)
+        
+        if page is not None:
+            response_data = {
+                'account_id': account_id,
+                'gl_account_info': gl_account_info,
+                'total_profit_centers': len(profit_center_data),
+                'filters_applied': {
+                    'profit_center_code': profit_center_code_filter,
+                    'profit_center_type': profit_center_type_filter,
+                    'revenue_center_only': revenue_center_only,
+                    'cost_center_only': cost_center_only,
+                    'status': status_filter,
+                    'sort_by': sort_by,
+                    'sort_order': sort_order
+                },
+                'results': page
+            }
+            return paginator.get_paginated_response(response_data)
+        
+        # If no pagination, return all results
+        return Response({
+            'account_id': account_id,
+            'gl_account_info': gl_account_info,
+            'total_profit_centers': len(profit_center_data),
+            'filters_applied': {
+                'profit_center_code': profit_center_code_filter,
+                'profit_center_type': profit_center_type_filter,
+                'revenue_center_only': revenue_center_only,
+                'cost_center_only': cost_center_only,
+                'status': status_filter,
+                'sort_by': sort_by,
+                'sort_order': sort_order
+            },
+            'results': profit_center_data
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        logger.error(f"Error retrieving profit center data for account {account_id}: {e}")
+        return Response({
+            'error': 'Internal server error',
+            'details': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ============================================================================
+# VERSION MANAGEMENT API VIEWS
+# ============================================================================
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_engagement_versions(request, engagement_id):
+    """
+    Get all versions for a specific engagement
+    
+    GET /api/engagement/{engagement_id}/versions/
+    """
+    try:
+        # Get the engagement
+        engagement = Engagement.objects.get(engagement_id=engagement_id)
+        
+        # Get all data files for this engagement grouped by version
+        data_files = DataFile.objects.filter(engagement=engagement).order_by('-version', '-uploaded_at')
+        
+        # Group files by version
+        versions = {}
+        for file in data_files:
+            version = file.version
+            if version not in versions:
+                versions[version] = {
+                    'version': version,
+                    'version_notes': file.version_notes,
+                    'uploaded_at': file.uploaded_at,
+                    'files': []
+                }
+            versions[version]['files'].append({
+                'id': str(file.id),
+                'file_name': file.file_name,
+                'file_type': file.file_type,
+                'status': file.status,
+                'total_records': file.total_records,
+                'processed_records': file.processed_records,
+                'failed_records': file.failed_records
+            })
+        
+        # Get completeness tests for this engagement
+        completeness_tests = CompletenessTestResult.objects.filter(engagement=engagement).order_by('-test_timestamp')
+        
+        return Response({
+            'engagement_id': engagement_id,
+            'engagement_name': engagement.engagement_name,
+            'total_versions': len(versions),
+            'versions': list(versions.values()),
+            'completeness_tests': [
+                {
+                    'id': str(test.id),
+                    'data_version': test.data_version,
+                    'version_notes': test.version_notes,
+                    'test_timestamp': test.test_timestamp,
+                    'overall_status': test.overall_status,
+                    'completeness_score': test.completeness_score
+                }
+                for test in completeness_tests
+            ]
+        }, status=status.HTTP_200_OK)
+        
+    except Engagement.DoesNotExist:
+        return Response({
+            'engagement_id': engagement_id,
+            'message': f'Engagement {engagement_id} not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        logger.error(f"Error getting engagement versions: {e}")
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_files_by_version(request, engagement_id, version):
+    """
+    Get all files for a specific engagement version
+    
+    GET /api/engagement/{engagement_id}/version/{version}/files/
+    """
+    try:
+        # Get the engagement
+        engagement = Engagement.objects.get(engagement_id=engagement_id)
+        
+        # Get all data files for this engagement and version
+        data_files = DataFile.objects.filter(
+            engagement=engagement,
+            version=version
+        ).order_by('file_type', 'uploaded_at')
+        
+        if not data_files.exists():
+            return Response({
+                'engagement_id': engagement_id,
+                'version': version,
+                'message': f'No files found for version {version}'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Get completeness test for this version
+        completeness_test = CompletenessTestResult.objects.filter(
+            engagement=engagement,
+            data_version=version
+        ).order_by('-test_timestamp').first()
+        
+        files_data = []
+        for file in data_files:
+            files_data.append({
+                'id': str(file.id),
+                'file_name': file.file_name,
+                'file_type': file.file_type,
+                'file_size': file.file_size,
+                'status': file.status,
+                'total_records': file.total_records,
+                'processed_records': file.processed_records,
+                'failed_records': file.failed_records,
+                'uploaded_at': file.uploaded_at,
+                'processed_at': file.processed_at,
+                'error_message': file.error_message
+            })
+        
+        return Response({
+            'engagement_id': engagement_id,
+            'version': version,
+            'version_notes': data_files.first().version_notes,
+            'total_files': len(files_data),
+            'files': files_data,
+            'completeness_test': {
+                'id': str(completeness_test.id),
+                'test_timestamp': completeness_test.test_timestamp,
+                'overall_status': completeness_test.overall_status,
+                'completeness_score': completeness_test.completeness_score,
+                'version_notes': completeness_test.version_notes
+            } if completeness_test else None
+        }, status=status.HTTP_200_OK)
+        
+    except Engagement.DoesNotExist:
+        return Response({
+            'engagement_id': engagement_id,
+            'message': f'Engagement {engagement_id} not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        logger.error(f"Error getting files by version: {e}")
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

@@ -206,6 +206,8 @@ class SAPGLPostingSerializer(serializers.ModelSerializer):
             'id', 'data_file', 'engagement_name', 'client_name', 'file_type',
             'document_number', 'document_type', 'amount_local_currency', 'local_currency',
             'gl_account', 'gl_account_ref', 'gl_account_name', 'account_type',
+            'gl_account_type', 'gl_account_sub_type', 'gl_account_sub_sub_type', 'gl_account_long_text',
+            'financial_statement', 'ref_to_fs',
             'profit_center', 'user_name', 'posting_date', 'document_date', 'entry_date',
             'fiscal_year', 'posting_period', 'text', 'segment', 'clearing_document',
             'offsetting_account', 'invoice_reference', 'sales_document', 'assignment', 'year_month',
@@ -342,6 +344,8 @@ class DataFileSerializer(serializers.ModelSerializer):
             'id', 'file_name', 'file_size', 'file_hash', 'engagement', 'engagement_name',
             'file_type', 'file_type_display', 'is_validated', 'validation_errors',
             'client_name', 'company_name', 'fiscal_year', 'audit_start_date', 'audit_end_date',
+            'version', 'version_notes',  # Version control fields
+            'local_file_path',  # Local file storage
             'total_records', 'processed_records', 'failed_records', 'status',
             'uploaded_at', 'processed_at', 'error_message', 'min_date', 
             'max_date', 'min_amount', 'max_amount', 'validation_status',
@@ -1337,10 +1341,15 @@ class CompletenessTestResultSerializer(serializers.ModelSerializer):
         model = CompletenessTestResult
         fields = [
             'id', 'engagement', 'engagement_name', 'client_name', 'test_timestamp', 'test_version',
+            'data_version', 'version_notes',  # Version control fields
             'gl_file', 'tb_file', 'coa_file', 'gl_file_name', 'tb_file_name', 'coa_file_name',
             'overall_status', 'status_display', 'overall_explanation', 'completeness_score',
             # Enhanced test steps
             'step1_file_completeness', 'step2_gl_tb_reconciliation',
+            # Document verification fields
+            'total_documents', 'balanced_documents', 'unbalanced_documents', 'document_balance_rate',
+            'total_document_variance', 'average_document_variance', 'transactions_with_documents',
+            'transactions_without_documents', 'no_document_transaction_count',
             # Enhanced statistics
             'total_gl_records', 'total_tb_records', 'total_coa_records', 'total_accounts_unified',
             'tests_passed', 'total_tests', 'critical_issues_count', 'comprehensive_statistics',

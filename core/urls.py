@@ -36,5 +36,9 @@ urlpatterns = [
     path('document-verifications/engagement/<str:engagement_id>/', views.get_document_verifications_by_engagement, name='document-verifications-by-engagement'),
     
     # Profit Center Data APIs
-    path('profit-center-data/engagement/<str:engagement_id>/', views.get_profit_center_data_by_engagement, name='profit-center-data-by-engagement'),
+    path('profit-center-data/account/<str:account_id>/', views.get_profit_center_data_by_account, name='profit-center-data-by-account'),
+    
+    # Version Management APIs
+    path('engagement/<str:engagement_id>/versions/', views.get_engagement_versions, name='engagement-versions'),
+    path('engagement/<str:engagement_id>/version/<str:version>/files/', views.get_files_by_version, name='files-by-version'),
 ] 

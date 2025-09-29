@@ -452,10 +452,15 @@ def run_gl_completeness_analysis(self, data_file_id):
         enhanced_stats_start = timezone.now()
         
         # Calculate additional statistics
-        enhanced_statistics = _calculate_enhanced_statistics(
+        enhanced_stats_result = _calculate_enhanced_statistics(
             gl_postings, trial_balance_records, coa_records, 
             gl_account_totals, account_verifications
         )
+        
+        # Extract enhanced statistics and document verification data
+        enhanced_statistics = enhanced_stats_result['enhanced_statistics']
+        document_verification_data = enhanced_stats_result['document_verification_data']
+        document_verification_results = enhanced_stats_result.get('document_verification_results', [])
         
         enhanced_stats_duration = (timezone.now() - enhanced_stats_start).total_seconds()
         logger.info(f"📊 Enhanced statistics calculated in {enhanced_stats_duration:.2f}s")
@@ -481,7 +486,8 @@ def run_gl_completeness_analysis(self, data_file_id):
             'enhanced_statistics': enhanced_statistics,
             'chart_data': chart_data,
             'monthly_trends': chart_data.get('monthly_trends', {}),
-            'top_accounts': chart_data.get('top_accounts', {})
+            'top_accounts': chart_data.get('top_accounts', {}),
+            'document_verification_results': document_verification_results
         }
         
         # Prepare completeness results
@@ -511,35 +517,66 @@ def run_gl_completeness_analysis(self, data_file_id):
             }
         }
         
-        # Save to database
+        # Document verification data is now extracted from the enhanced statistics result
+        # No need to redefine - it's already available from the function return
+        
+        # Save to database - use get_or_create to handle duplicate versions
         try:
-            test_result = CompletenessTestResult.objects.create(
+            test_result, created = CompletenessTestResult.objects.get_or_create(
                 engagement=data_file.engagement,
-                gl_file=data_file,
-                tb_file=None,  # We'll find TB file later
-                coa_file=None,  # We'll find COA file later  
-                overall_status=overall_status,
-                overall_explanation=overall_explanation,
-                completeness_score=completeness_score,
-                step1_file_completeness=step1_completeness,
-                step2_gl_tb_reconciliation=step2_account_verification,
-                step3_debit_credit_balance={},  # Not used in 2-step
-                step4_account_coverage={},      # Not used in 2-step
-                step5_coa_hierarchy_validation={},  # Not used in 2-step
-                step6_account_linking={},       # Not used in 2-step
-                step7_transaction_gaps={},      # Not used in 2-step
-                total_gl_records=transaction_count,
-                total_tb_records=trial_balance_records.count(),
-                total_coa_records=coa_records.count() if coa_records.exists() else 0,
-                total_accounts_unified=account_count,
-                tests_passed=2 if all_steps_passed else (1 if step1_completeness_passed else 0),
-                total_tests=2,
-                critical_issues_count=balance_equation_failed_count if not step2_account_verification_passed else 0,
-                comprehensive_statistics=comprehensive_statistics,
-                processing_duration=processing_duration
+                data_version=getattr(data_file, 'version', '1.0'),
+                defaults={
+                    'gl_file': data_file,
+                    'tb_file': None,  # We'll find TB file later
+                    'coa_file': None,  # We'll find COA file later  
+                    'version_notes': getattr(data_file, 'version_notes', ''),  # Use the version notes from the data file
+                    'overall_status': overall_status,
+                    'overall_explanation': overall_explanation,
+                    'completeness_score': completeness_score,
+                    'step1_file_completeness': step1_completeness,
+                    'step2_gl_tb_reconciliation': step2_account_verification,
+                    'step3_debit_credit_balance': {},  # Not used in 2-step
+                    'step4_account_coverage': {},      # Not used in 2-step
+                    'step5_coa_hierarchy_validation': {},  # Not used in 2-step
+                    'step6_account_linking': {},       # Not used in 2-step
+                    'step7_transaction_gaps': {},      # Not used in 2-step
+                    # Document verification fields
+                    **document_verification_data,
+                    'total_gl_records': transaction_count,
+                    'total_tb_records': trial_balance_records.count(),
+                    'total_coa_records': coa_records.count() if coa_records.exists() else 0,
+                    'total_accounts_unified': account_count,
+                    'tests_passed': 2 if all_steps_passed else (1 if step1_completeness_passed else 0),
+                    'total_tests': 2,
+                    'critical_issues_count': balance_equation_failed_count if not step2_account_verification_passed else 0,
+                    'comprehensive_statistics': comprehensive_statistics,
+                    'processing_duration': processing_duration
+                }
             )
             
-            logger.info(f"💾 Completeness test result saved to database (ID: {test_result.id})")
+            if created:
+                logger.info(f"💾 New completeness test result created (ID: {test_result.id})")
+            else:
+                # Update existing record with new results
+                test_result.overall_status = overall_status
+                test_result.overall_explanation = overall_explanation
+                test_result.completeness_score = completeness_score
+                test_result.step1_file_completeness = step1_completeness
+                test_result.step2_gl_tb_reconciliation = step2_account_verification
+                test_result.total_gl_records = transaction_count
+                test_result.total_tb_records = trial_balance_records.count()
+                test_result.total_coa_records = coa_records.count() if coa_records.exists() else 0
+                test_result.total_accounts_unified = account_count
+                test_result.tests_passed = 2 if all_steps_passed else (1 if step1_completeness_passed else 0)
+                test_result.total_tests = 2
+                test_result.critical_issues_count = balance_equation_failed_count if not step2_account_verification_passed else 0
+                test_result.comprehensive_statistics = comprehensive_statistics
+                test_result.processing_duration = processing_duration
+                # Update document verification data
+                for key, value in document_verification_data.items():
+                    setattr(test_result, key, value)
+                test_result.save()
+                logger.info(f"💾 Existing completeness test result updated (ID: {test_result.id})")
             
         except Exception as db_error:
             logger.error(f"Failed to save completeness test result: {db_error}")
@@ -729,6 +766,8 @@ def run_completeness_test(self, data_file_id):
             gl_file=gl_file,
             tb_file=tb_file,
             coa_file=coa_file,
+            data_version=gl_file.version if gl_file else '1.0',  # Use GL file version as primary
+            version_notes=gl_file.version_notes if gl_file else '',  # Use GL file version notes
             overall_status=completeness_results.get('overall_status', 'FAIL'),
             overall_explanation=completeness_results.get('explanation', ''),
             completeness_score=completeness_results.get('completeness_score', 0),
@@ -1409,28 +1448,16 @@ def _calculate_enhanced_statistics(gl_postings, trial_balance_records, coa_recor
             'average_transactions_per_profit_center': round(len(gl_postings) / total_profit_centers, 2) if total_profit_centers > 0 else 0
         },
         'audit_calculation_statistics': {
-            'document_verification': {
-                'total_documents': total_documents,
-                'balanced_documents': balanced_documents,
-                'unbalanced_documents': unbalanced_documents,
-                'document_balance_rate': round(document_balance_rate, 3),
-                'total_document_variance': round(total_document_variance, 2),
-                'average_document_variance': round(average_document_variance, 2),
-                'transactions_with_documents': len(transactions_with_documents),
-                'transactions_without_documents': no_document_transactions,
-                'no_document_transaction_count': no_document_count
-            },
+            # Document verification data removed - now saved in dedicated fields only
             'account_linkage_analysis': account_linkage_stats,
             'document_balance_verification': {
                 'verification_rule': 'Each document must have Debit Total = Credit Total (within 0.01 tolerance). Transactions without document numbers are tracked separately.',
                 'verification_passed': document_balance_rate >= 0.95,  # 95% of documents should be balanced
                 'critical_issues': unbalanced_documents + no_document_transactions,
                 'recommendation': f'Review {unbalanced_documents} unbalanced documents and {no_document_transactions} transactions without document numbers' if (unbalanced_documents > 0 or no_document_transactions > 0) else 'All documents are properly balanced'
-            },
-            'document_details': document_verification_results[:20],  # Top 20 documents by transaction count
-            'unbalanced_documents': [d for d in document_verification_results if not d['is_balanced']][:10],  # Top 10 unbalanced documents
-            'no_document_transactions': transactions_without_documents,  # All transactions without document numbers
-            'transactions_with_documents': transactions_with_documents[:10]  # Top 10 transactions with documents
+            }
+            # Note: document_details, unbalanced_documents, no_document_transactions, transactions_with_documents
+            # are now saved in dedicated fields only, not in JSON
         }
     }
     
@@ -1445,7 +1472,22 @@ def _calculate_enhanced_statistics(gl_postings, trial_balance_records, coa_recor
     logger.info(f"   ❌ Unbalanced Documents: {unbalanced_documents}")
     logger.info(f"   📊 Document Balance Rate: {document_balance_rate:.1%}")
     
-    return enhanced_statistics
+    # Return both enhanced statistics and document verification data
+    return {
+        'enhanced_statistics': enhanced_statistics,
+        'document_verification_data': {
+            'total_documents': total_documents,
+            'balanced_documents': balanced_documents,
+            'unbalanced_documents': unbalanced_documents,
+            'document_balance_rate': document_balance_rate,
+            'total_document_variance': total_document_variance,
+            'average_document_variance': average_document_variance,
+            'transactions_with_documents': len(transactions_with_documents),
+            'transactions_without_documents': no_document_transactions,
+            'no_document_transaction_count': no_document_count
+        },
+        'document_verification_results': document_verification_results
+    }
 
 
 @shared_task(bind=True, name='core.tasks.trigger_eng008_completeness')
